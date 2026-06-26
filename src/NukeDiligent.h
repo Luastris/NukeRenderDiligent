@@ -18,6 +18,7 @@ public:
 	~NukeDiligent();
 
 	void setShaderSource(const char* name, const char* source) override;
+	uint64_t createShaderPipeline(const char* vs, const char* ps) override;
 	int  init(const WindowDesc& desc) override;
 	int  render() override;
 	void renderObject(Mesh* mesh, Material* mat,

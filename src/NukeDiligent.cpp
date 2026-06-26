@@ -80,13 +80,21 @@ struct NukeDiligent::Impl
 	std::unordered_map<uint64_t, RT> rts;
 	uint64_t rtCounter = 0;
 
-	// --- 3D world pipeline ---
-	RefCntAutoPtr<IPipelineState>         worldPSO;
-	RefCntAutoPtr<IShaderResourceBinding> worldSRB;
-	RefCntAutoPtr<IBuffer>                worldCB;     // VS: WVP + World
-	RefCntAutoPtr<IBuffer>                worldMatCB;  // PS: material color + flags
-	IShaderResourceVariable*              worldTexVar = nullptr;   // PS "g_Tex" (dynamic)
+	// --- 3D world pipelines (one per shader; all share the layout + CBs + white fallback) ---
+	struct WorldPipe
+	{
+		RefCntAutoPtr<IPipelineState>         pso;
+		RefCntAutoPtr<IShaderResourceBinding> srb;
+		IShaderResourceVariable*              texVar = nullptr;   // PS "g_Tex" (dynamic)
+	};
+	std::unordered_map<uint64_t, WorldPipe> worldPipes;   // shader handle -> pipeline
+	uint64_t                              defaultWorldHandle = 0;   // builtin "world" pipeline
+	uint64_t                              nextShaderHandle   = 1;   // handles handed to the engine
+	RefCntAutoPtr<IBuffer>                worldCB;     // VS: WVP + World   (shared)
+	RefCntAutoPtr<IBuffer>                worldMatCB;  // PS: material color + flags (shared)
 	RefCntAutoPtr<ITexture>               whiteTex;    // 1x1 fallback when a material has no texture
+	// Build a world-type PSO (fixed layout/CBs) from VS+PS source; store it under a handle.
+	uint64_t MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg);
 	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; };
 	std::unordered_map<Mesh*, MeshGPU>          meshCache;
 	std::unordered_map<Texture*, RefCntAutoPtr<ITexture>> texCache;   // engine Texture -> GPU texture
@@ -192,59 +200,16 @@ void NukeDiligent::Impl::CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT d
 
 void NukeDiligent::Impl::CreateWorldPipeline()
 {
-	ShaderCreateInfo sci;
-	sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
-	std::string vsSrc = shaderSource("world.vs");
-	std::string psSrc = shaderSource("world.ps");
-	RefCntAutoPtr<IShader> vs, ps;
-	sci.Desc = {"World VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); device->CreateShader(sci, &vs);
-	sci.Desc = {"World PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); device->CreateShader(sci, &ps);
-
-	GraphicsPipelineStateCreateInfo ci;
-	ci.PSODesc.Name = "World PSO";
-	auto& gp = ci.GraphicsPipeline;
-	gp.NumRenderTargets             = 1;
-	gp.RTVFormats[0]                = TEX_FORMAT_RGBA8_UNORM;
-	gp.DSVFormat                    = TEX_FORMAT_D32_FLOAT;
-	gp.PrimitiveTopology            = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-	gp.RasterizerDesc.CullMode      = CULL_MODE_NONE;
-	gp.DepthStencilDesc.DepthEnable = True;
-	LayoutElement layout[] = {
-		{0, 0, 3, VT_FLOAT32}, // position -> vertex buffer slot 0
-		{1, 1, 3, VT_FLOAT32}, // normal   -> vertex buffer slot 1
-		{2, 2, 2, VT_FLOAT32}, // uv       -> vertex buffer slot 2
-	};
-	gp.InputLayout.NumElements    = 3;
-	gp.InputLayout.LayoutElements = layout;
-
-	// Pixel shader samples a per-material texture (dynamic) with a linear-wrap sampler.
-	ShaderResourceVariableDesc vars[] = {{SHADER_TYPE_PIXEL, "g_Tex", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}};
-	ci.PSODesc.ResourceLayout.Variables    = vars;
-	ci.PSODesc.ResourceLayout.NumVariables = 1;
-	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
-	samp.AddressU = TEXTURE_ADDRESS_WRAP; samp.AddressV = TEXTURE_ADDRESS_WRAP; samp.AddressW = TEXTURE_ADDRESS_WRAP;
-	ImmutableSamplerDesc immSamp[] = {{SHADER_TYPE_PIXEL, "g_Tex", samp}};
-	ci.PSODesc.ResourceLayout.ImmutableSamplers    = immSamp;
-	ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
-
-	ci.pVS = vs; ci.pPS = ps;
-	device->CreateGraphicsPipelineState(ci, &worldPSO);
-
+	// Shared constant buffers (bound as static vars on EVERY world PSO).
 	BufferDesc cbd;
 	cbd.Name = "World CB"; cbd.Size = sizeof(float4x4) * 2; cbd.Usage = USAGE_DYNAMIC;
 	cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(cbd, nullptr, &worldCB);
-	worldPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB")->Set(worldCB);
 
-	// Material CB (PS): color (rgba) + params (x = hasTexture).
 	BufferDesc mcbd;
 	mcbd.Name = "World MatCB"; mcbd.Size = sizeof(float) * 8; mcbd.Usage = USAGE_DYNAMIC;
 	mcbd.BindFlags = BIND_UNIFORM_BUFFER; mcbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(mcbd, nullptr, &worldMatCB);
-	worldPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL, "MatCB")->Set(worldMatCB);
-
-	worldPSO->CreateShaderResourceBinding(&worldSRB, true);
-	worldTexVar = worldSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 
 	// 1x1 white fallback texture (bound when a material has no texture).
 	uint32_t white = 0xFFFFFFFFu;
@@ -253,6 +218,68 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	TextureSubResData wsr; wsr.pData = &white; wsr.Stride = 4;
 	TextureData wdat; wdat.pSubResources = &wsr; wdat.NumSubresources = 1;
 	device->CreateTexture(wd, &wdat, &whiteTex);
+
+	// Built-in "world" pipeline from the engine shaders.
+	defaultWorldHandle = MakeWorldPSO(shaderSource("world.vs"), shaderSource("world.ps"), "World");
+}
+
+uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg)
+{
+	if (vsSrc.empty() || psSrc.empty()) return 0;
+	ShaderCreateInfo sci;
+	sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	RefCntAutoPtr<IShader> vs, ps;
+	sci.Desc = {dbg, SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); device->CreateShader(sci, &vs);
+	sci.Desc = {dbg, SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); device->CreateShader(sci, &ps);
+	if (!vs || !ps) return 0;
+
+	GraphicsPipelineStateCreateInfo ci;
+	ci.PSODesc.Name = dbg;
+	auto& gp = ci.GraphicsPipeline;
+	gp.NumRenderTargets             = 1;
+	gp.RTVFormats[0]                = TEX_FORMAT_RGBA8_UNORM;
+	gp.DSVFormat                    = TEX_FORMAT_D32_FLOAT;
+	gp.PrimitiveTopology            = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+	gp.RasterizerDesc.CullMode      = CULL_MODE_NONE;
+	gp.DepthStencilDesc.DepthEnable = True;
+	// Per-pixel transparency: straight-alpha blend (PS outputs alpha = material.a * texture.a).
+	auto& rt0 = gp.BlendDesc.RenderTargets[0];
+	rt0.BlendEnable    = True;
+	rt0.SrcBlend       = BLEND_FACTOR_SRC_ALPHA;
+	rt0.DestBlend      = BLEND_FACTOR_INV_SRC_ALPHA;
+	rt0.BlendOp        = BLEND_OPERATION_ADD;
+	rt0.SrcBlendAlpha  = BLEND_FACTOR_ONE;
+	rt0.DestBlendAlpha = BLEND_FACTOR_INV_SRC_ALPHA;
+	rt0.BlendOpAlpha   = BLEND_OPERATION_ADD;
+	LayoutElement layout[] = {
+		{0, 0, 3, VT_FLOAT32}, // position
+		{1, 1, 3, VT_FLOAT32}, // normal
+		{2, 2, 2, VT_FLOAT32}, // uv
+	};
+	gp.InputLayout.NumElements    = 3;
+	gp.InputLayout.LayoutElements = layout;
+
+	ShaderResourceVariableDesc vars[] = {{SHADER_TYPE_PIXEL, "g_Tex", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}};
+	ci.PSODesc.ResourceLayout.Variables    = vars;
+	ci.PSODesc.ResourceLayout.NumVariables = 1;
+	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
+	samp.AddressU = TEXTURE_ADDRESS_WRAP; samp.AddressV = TEXTURE_ADDRESS_WRAP; samp.AddressW = TEXTURE_ADDRESS_WRAP;
+	ImmutableSamplerDesc immSamp[] = {{SHADER_TYPE_PIXEL, "g_Tex", samp}};
+	ci.PSODesc.ResourceLayout.ImmutableSamplers    = immSamp;
+	ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+	ci.pVS = vs; ci.pPS = ps;
+
+	WorldPipe wp;
+	device->CreateGraphicsPipelineState(ci, &wp.pso);
+	if (!wp.pso) { cout << "[NukeDiligent]\tPSO build failed for shader '" << dbg << "'" << endl; return 0; }
+	if (auto* v = wp.pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))    v->Set(worldCB);
+	if (auto* m = wp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB")) m->Set(worldMatCB);
+	wp.pso->CreateShaderResourceBinding(&wp.srb, true);
+	wp.texVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
+
+	uint64_t h = nextShaderHandle++;
+	worldPipes[h] = std::move(wp);
+	return h;
 }
 
 ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
@@ -336,6 +363,12 @@ NukeDiligent::~NukeDiligent() { delete m_impl; }
 void NukeDiligent::setShaderSource(const char* name, const char* source)
 {
 	if (name && source) m_impl->shaderSrc[name] = source;
+}
+
+uint64_t NukeDiligent::createShaderPipeline(const char* vs, const char* ps)
+{
+	if (!vs || !ps) return 0;
+	return m_impl->MakeWorldPSO(vs, ps, "Shader");   // world-type PSO (layout/CBs) from custom VS+PS
 }
 
 int NukeDiligent::init(const WindowDesc& desc)
@@ -472,7 +505,7 @@ int NukeDiligent::render()
 void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
                                 const float pos[3], const float quat[4], const float scale[3])
 {
-	if (!mesh || !m_impl->worldPSO || mesh->numVerts <= 0) return;
+	if (!mesh || mesh->numVerts <= 0 || m_impl->worldPipes.empty()) return;
 	if (!mesh->vertexArray || !mesh->normalArray)   // immutable buffers need init data
 	{
 		std::cout << "[NukeDiligent]\tmesh '" << mesh->name << "' has null vertex/normal data (numVerts="
@@ -524,15 +557,22 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 		for (int i = 0; i < 4; ++i) mb->color[i] = col[i];
 		mb->params[0] = srv ? 1.0f : 0.0f; mb->params[1] = mb->params[2] = mb->params[3] = 0.0f;
 	}
-	if (m_impl->worldTexVar)
-		m_impl->worldTexVar->Set(srv ? srv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	// Pick the pipeline for this material's shader (fallback to the built-in "world" pipeline).
+	uint64_t h = (mat && mat->shader && mat->shader->rendererHandle) ? mat->shader->rendererHandle
+	                                                                  : m_impl->defaultWorldHandle;
+	auto pit = m_impl->worldPipes.find(h);
+	if (pit == m_impl->worldPipes.end()) pit = m_impl->worldPipes.find(m_impl->defaultWorldHandle);
+	if (pit == m_impl->worldPipes.end()) return;
+	Impl::WorldPipe& wp = pit->second;
+	if (wp.texVar)
+		wp.texVar->Set(srv ? srv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
 
 	IDeviceContext* ctx = m_impl->context;
 	IBuffer* vbs[]    = { g.pos, g.nrm, g.uv };
 	Uint64   offs[]   = { 0, 0, 0 };
 	ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
-	ctx->SetPipelineState(m_impl->worldPSO);
-	ctx->CommitShaderResources(m_impl->worldSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ctx->SetPipelineState(wp.pso);
+	ctx->CommitShaderResources(wp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
 	ctx->Draw(da);
 }
