@@ -91,7 +91,8 @@ struct NukeDiligent::Impl
 	uint64_t                              defaultWorldHandle = 0;   // builtin "world" pipeline
 	uint64_t                              nextShaderHandle   = 1;   // handles handed to the engine
 	RefCntAutoPtr<IBuffer>                worldCB;     // VS: WVP + World   (shared)
-	RefCntAutoPtr<IBuffer>                worldMatCB;  // PS: material color + flags (shared)
+	RefCntAutoPtr<IBuffer>                worldMatCB;  // PS: color + params + custom shader props (shared)
+	static const uint32_t                 kMatCBBytes = 256;   // MatCB capacity (color/params + props)
 	RefCntAutoPtr<ITexture>               whiteTex;    // 1x1 fallback when a material has no texture
 	// Build a world-type PSO (fixed layout/CBs) from VS+PS source; store it under a handle.
 	uint64_t MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg);
@@ -207,7 +208,7 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	device->CreateBuffer(cbd, nullptr, &worldCB);
 
 	BufferDesc mcbd;
-	mcbd.Name = "World MatCB"; mcbd.Size = sizeof(float) * 8; mcbd.Usage = USAGE_DYNAMIC;
+	mcbd.Name = "World MatCB"; mcbd.Size = kMatCBBytes; mcbd.Usage = USAGE_DYNAMIC;
 	mcbd.BindFlags = BIND_UNIFORM_BUFFER; mcbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(mcbd, nullptr, &worldMatCB);
 
@@ -551,12 +552,6 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 		for (int i = 0; i < 4; ++i) col[i] = mat->color[i];
 		if (mat->diff) srv = m_impl->GetTexSRV(mat->diff);
 	}
-	{
-		struct MatData { float color[4]; float params[4]; };
-		MapHelper<MatData> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
-		for (int i = 0; i < 4; ++i) mb->color[i] = col[i];
-		mb->params[0] = srv ? 1.0f : 0.0f; mb->params[1] = mb->params[2] = mb->params[3] = 0.0f;
-	}
 	// Pick the pipeline for this material's shader (fallback to the built-in "world" pipeline).
 	uint64_t h = (mat && mat->shader && mat->shader->rendererHandle) ? mat->shader->rendererHandle
 	                                                                  : m_impl->defaultWorldHandle;
@@ -564,6 +559,29 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	if (pit == m_impl->worldPipes.end()) pit = m_impl->worldPipes.find(m_impl->defaultWorldHandle);
 	if (pit == m_impl->worldPipes.end()) return;
 	Impl::WorldPipe& wp = pit->second;
+
+	// Material constant buffer: standard color @0 + params @16, then the shader's custom props at
+	// their engine-parsed offsets (Shader::props). The renderer consumes the schema the engine
+	// parsed from the shader source — it never reads shader files itself.
+	{
+		MapHelper<Uint8> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		Uint8* p = mb;
+		memset(p, 0, Impl::kMatCBBytes);
+		memcpy(p + 0, col, sizeof(float) * 4);
+		float prm[4] = { srv ? 1.0f : 0.0f, 0, 0, 0 };
+		memcpy(p + 16, prm, sizeof(float) * 4);
+		if (mat && mat->shader)
+			for (const nuke::ShaderProp& sp : mat->shader->props)
+			{
+				// Value from the material INSTANCE's prop map (data only — no engine symbols linked);
+				// unset -> the shader's HLSL default.
+				auto pv = mat->props.find(sp.name);
+				const float* v = (pv != mat->props.end()) ? pv->second.data() : sp.def;
+				uint32_t bytes = (uint32_t)sp.components * sizeof(float);
+				if (sp.offset + bytes <= Impl::kMatCBBytes) memcpy(p + sp.offset, v, bytes);
+			}
+	}
+
 	if (wp.texVar)
 		wp.texVar->Set(srv ? srv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
 
