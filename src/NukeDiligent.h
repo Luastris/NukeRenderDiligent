@@ -1,0 +1,56 @@
+#pragma once
+// Diligent-based renderer implementing the engine's abstract iRender interface.
+// Lives in its own DLL (NukeRenderDiligent) and is loaded as a render module.
+// Depends ONLY on the iRender interface (no engine singletons), so the engine
+// core can stay a static library.
+
+#include <render/irender.h>
+#include <boost/function.hpp>
+
+using namespace nuke;   // iRender / Mesh / Material / NukeCameraDesc live in namespace nuke
+
+struct GLFWwindow;
+
+class NukeDiligent : public iRender
+{
+public:
+	NukeDiligent();
+	~NukeDiligent();
+
+	void setShaderSource(const char* name, const char* source) override;
+	int  init(const WindowDesc& desc) override;
+	int  render() override;
+	void renderObject(Mesh* mesh, Material* mat,
+	                  const float pos[3], const float quat[4], const float scale[3]) override;
+	void loop() override;
+	void deinit() override;
+	void update() override;
+	char* getEngine() override;
+	char* getVersion() override;
+	void setOnGUI(bst::function<void(void)> cb) override;
+	void setOnRender(bst::function<void(void)> cb) override;
+	void setOnClose(bst::function<void()> cb) override;
+
+	// Neutral UI seam (generic 2D draw; no ImGui types here).
+	uint64_t createTexture2D(const void* rgbaPixels, int width, int height) override;
+	void     destroyTexture2D(uint64_t handle) override;
+	void     renderDrawLists(const NukeUIDrawData& data) override;
+	uint64_t createRenderTarget(int w, int h) override;
+	void     resizeRenderTarget(uint64_t id, int w, int h) override;
+	uint64_t getRenderTargetTexture(uint64_t id) override;
+	void     beginCamera(const NukeCameraDesc& cam) override;
+	void     endCamera() override;
+	void     getViewProj(float* view16, float* proj16) override;
+
+	void keyboard(int key, int scancode, int action, int mods) override;
+	void mouseMove(double xpos, double ypos) override;
+	void mouseClick(int button, int action, int mods) override;
+	void setCursorMode(int mode) override;
+	void rawMouse(double xpos, double ypos) override;
+	void mouseEnterLeave(int entered) override;
+
+private:
+	struct Impl;          // PImpl: keeps Diligent types out of this header
+	Impl*       m_impl   = nullptr;
+	GLFWwindow* m_window = nullptr;
+};
