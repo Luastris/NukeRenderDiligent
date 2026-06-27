@@ -810,6 +810,7 @@ void NukeDiligent::mouseClick(int, int, int) {}
 void NukeDiligent::setCursorMode(int) {}
 void NukeDiligent::rawMouse(double, double) {}
 void NukeDiligent::mouseEnterLeave(int) {}
+void NukeDiligent::setWindowTitle(const char* title) { if (m_window && title) glfwSetWindowTitle(m_window, title); }
 
 // ---- Neutral UI seam: generic 2D draw (no ImGui types) ----
 

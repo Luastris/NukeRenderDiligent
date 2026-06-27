@@ -24,6 +24,7 @@ public:
 	void renderObject(Mesh* mesh, Material* mat,
 	                  const float pos[3], const float quat[4], const float scale[3]) override;
 	void renderSelectionOutline(Mesh* mesh, const float pos[3], const float quat[4], const float scale[3]) override;
+	void setWindowTitle(const char* title) override;
 	void loop() override;
 	void deinit() override;
 	void update() override;
