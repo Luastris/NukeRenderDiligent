@@ -98,8 +98,25 @@ struct NukeDiligent::Impl
 	uint64_t MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg);
 	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; };
 	std::unordered_map<Mesh*, MeshGPU>          meshCache;
+	MeshGPU* GetMeshGPU(Mesh* mesh);   // get-or-build the GPU vertex buffers (pos/nrm/uv) for a mesh
 	std::unordered_map<Texture*, RefCntAutoPtr<ITexture>> texCache;   // engine Texture -> GPU texture
 	float4x4 curView, curProj;   // set in beginCamera, used in renderObject
+
+	// Selection outline (editor): post-process. Pass 1 renders the selected mesh into a mask RT;
+	// pass 2 is a fullscreen edge-detect that draws a CONSTANT-pixel-thickness border around the mask
+	// (independent of distance/size, works for any geometry incl. flat planes).
+	RefCntAutoPtr<IPipelineState>         outlineMaskPSO, outlineEdgePSO;
+	RefCntAutoPtr<IShaderResourceBinding> outlineMaskSRB, outlineEdgeSRB;
+	IShaderResourceVariable*              outlineEdgeMaskVar = nullptr;   // edge PS "g_Mask" (dynamic)
+	RefCntAutoPtr<ITexture>               outlineMaskTex;
+	ITextureView*                         outlineMaskRTV = nullptr;
+	ITextureView*                         outlineMaskSRV = nullptr;
+	int                                   outlineMaskW = 0, outlineMaskH = 0;
+	RefCntAutoPtr<IBuffer>                outlineEdgeCB;      // texel size + thickness
+	ITextureView*                         curRTV = nullptr;   // current camera color target (outline rebind)
+	int                                   curRTW = 0, curRTH = 0;
+	void BuildOutlinePipelines();
+	void EnsureOutlineMask(int w, int h);
 
 	// Shader sources pushed by the engine (the renderer does NO file IO). name -> HLSL.
 	std::unordered_map<std::string, std::string> shaderSrc;
@@ -222,6 +239,107 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 
 	// Built-in "world" pipeline from the engine shaders.
 	defaultWorldHandle = MakeWorldPSO(shaderSource("world.vs"), shaderSource("world.ps"), "World");
+
+	BuildOutlinePipelines();   // selection outline (stencil mark + scaled draw)
+}
+
+// Selection-outline pipelines: (1) MASK = render the mesh flat into an RGBA8 mask (alpha=1);
+// (2) EDGE = fullscreen edge-detect over the mask, drawing a constant-pixel-thickness border.
+void NukeDiligent::Impl::BuildOutlinePipelines()
+{
+	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+
+	// --- mask pipeline (mesh -> mask RT) ---
+	std::string mvs = shaderSource("outline.vs"), mps = shaderSource("outline.ps");
+	if (!mvs.empty() && !mps.empty())
+	{
+		RefCntAutoPtr<IShader> vs, ps;
+		sci.Desc = {"Outline Mask VS", SHADER_TYPE_VERTEX, true}; sci.Source = mvs.c_str(); device->CreateShader(sci, &vs);
+		sci.Desc = {"Outline Mask PS", SHADER_TYPE_PIXEL, true};  sci.Source = mps.c_str(); device->CreateShader(sci, &ps);
+		if (vs && ps)
+		{
+			GraphicsPipelineStateCreateInfo ci;
+			ci.PSODesc.Name = "Outline Mask PSO";
+			auto& gp = ci.GraphicsPipeline;
+			gp.NumRenderTargets             = 1;
+			gp.RTVFormats[0]                = TEX_FORMAT_RGBA8_UNORM;
+			gp.DSVFormat                    = TEX_FORMAT_UNKNOWN;   // no depth
+			gp.PrimitiveTopology            = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+			gp.RasterizerDesc.CullMode      = CULL_MODE_NONE;
+			gp.DepthStencilDesc.DepthEnable = False;
+			LayoutElement layout[] = { {0, 0, 3, VT_FLOAT32}, {1, 1, 3, VT_FLOAT32}, {2, 2, 2, VT_FLOAT32} };
+			gp.InputLayout.NumElements    = 3;
+			gp.InputLayout.LayoutElements = layout;
+			ci.pVS = vs; ci.pPS = ps;
+			device->CreateGraphicsPipelineState(ci, &outlineMaskPSO);
+			if (outlineMaskPSO)
+			{
+				if (auto* v = outlineMaskPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB")) v->Set(worldCB);
+				outlineMaskPSO->CreateShaderResourceBinding(&outlineMaskSRB, true);
+			}
+		}
+	}
+
+	// --- edge pipeline (fullscreen mask -> camera RT) ---
+	std::string evs = shaderSource("outline_edge.vs"), eps = shaderSource("outline_edge.ps");
+	if (!evs.empty() && !eps.empty())
+	{
+		// constants buffer (texel size + thickness)
+		BufferDesc cbd; cbd.Name = "Outline EdgeCB"; cbd.Size = sizeof(float) * 4;
+		cbd.Usage = USAGE_DYNAMIC; cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
+		device->CreateBuffer(cbd, nullptr, &outlineEdgeCB);
+
+		RefCntAutoPtr<IShader> vs, ps;
+		sci.Desc = {"Outline Edge VS", SHADER_TYPE_VERTEX, true}; sci.Source = evs.c_str(); device->CreateShader(sci, &vs);
+		sci.Desc = {"Outline Edge PS", SHADER_TYPE_PIXEL, true};  sci.Source = eps.c_str(); device->CreateShader(sci, &ps);
+		if (vs && ps)
+		{
+			GraphicsPipelineStateCreateInfo ci;
+			ci.PSODesc.Name = "Outline Edge PSO";
+			auto& gp = ci.GraphicsPipeline;
+			gp.NumRenderTargets             = 1;
+			gp.RTVFormats[0]                = TEX_FORMAT_RGBA8_UNORM;
+			gp.DSVFormat                    = TEX_FORMAT_UNKNOWN;
+			gp.PrimitiveTopology            = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+			gp.RasterizerDesc.CullMode      = CULL_MODE_NONE;
+			gp.DepthStencilDesc.DepthEnable = False;
+			gp.InputLayout.NumElements      = 0;   // fullscreen triangle from SV_VertexID, no VB
+			ShaderResourceVariableDesc vars[] = {{SHADER_TYPE_PIXEL, "g_Mask", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}};
+			ci.PSODesc.ResourceLayout.Variables    = vars;
+			ci.PSODesc.ResourceLayout.NumVariables = 1;
+			SamplerDesc samp; samp.MinFilter = FILTER_TYPE_POINT; samp.MagFilter = FILTER_TYPE_POINT; samp.MipFilter = FILTER_TYPE_POINT;
+			samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP; samp.AddressW = TEXTURE_ADDRESS_CLAMP;
+			ImmutableSamplerDesc imm[] = {{SHADER_TYPE_PIXEL, "g_Mask", samp}};
+			ci.PSODesc.ResourceLayout.ImmutableSamplers    = imm;
+			ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+			ci.pVS = vs; ci.pPS = ps;
+			device->CreateGraphicsPipelineState(ci, &outlineEdgePSO);
+			if (outlineEdgePSO)
+			{
+				if (auto* c = outlineEdgePSO->GetStaticVariableByName(SHADER_TYPE_PIXEL, "EdgeCB")) c->Set(outlineEdgeCB);
+				outlineEdgePSO->CreateShaderResourceBinding(&outlineEdgeSRB, true);
+				if (outlineEdgeSRB) outlineEdgeMaskVar = outlineEdgeSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Mask");
+			}
+		}
+	}
+}
+
+// Lazily (re)create the selection mask RT to match the current camera target size.
+void NukeDiligent::Impl::EnsureOutlineMask(int w, int h)
+{
+	if (w <= 0 || h <= 0) return;
+	if (outlineMaskTex && outlineMaskW == w && outlineMaskH == h) return;
+	outlineMaskRTV = nullptr; outlineMaskSRV = nullptr; outlineMaskTex.Release();
+	TextureDesc td; td.Name = "Outline Mask"; td.Type = RESOURCE_DIM_TEX_2D;
+	td.Width = (Uint32)w; td.Height = (Uint32)h;
+	td.Format = TEX_FORMAT_RGBA8_UNORM; td.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+	device->CreateTexture(td, nullptr, &outlineMaskTex);
+	if (outlineMaskTex)
+	{
+		outlineMaskRTV = outlineMaskTex->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+		outlineMaskSRV = outlineMaskTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+		outlineMaskW = w; outlineMaskH = h;
+	}
 }
 
 uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg)
@@ -503,35 +621,43 @@ int NukeDiligent::render()
 	return 1;
 }
 
-void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
-                                const float pos[3], const float quat[4], const float scale[3])
+NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 {
-	if (!mesh || mesh->numVerts <= 0 || m_impl->worldPipes.empty()) return;
-	if (!mesh->vertexArray || !mesh->normalArray)   // immutable buffers need init data
+	if (!mesh || mesh->numVerts <= 0) return nullptr;
+	auto it = meshCache.find(mesh);
+	if (it == meshCache.end())
 	{
-		std::cout << "[NukeDiligent]\tmesh '" << mesh->name << "' has null vertex/normal data (numVerts="
-		          << mesh->numVerts << ") — skipping" << std::endl;
-		return;
-	}
-
-	// Build (and cache) GPU vertex buffers for this mesh: positions + normals + uv.
-	auto it = m_impl->meshCache.find(mesh);
-	if (it == m_impl->meshCache.end())
-	{
-		Impl::MeshGPU g; g.numVerts = mesh->numVerts;
+		if (!mesh->vertexArray || !mesh->normalArray)   // immutable buffers need init data
+		{
+			std::cout << "[NukeDiligent]\tmesh '" << mesh->name << "' has null vertex/normal data (numVerts="
+			          << mesh->numVerts << ") — skipping" << std::endl;
+			return nullptr;
+		}
+		// Build (and cache) GPU vertex buffers for this mesh: positions + normals + uv.
+		MeshGPU g; g.numVerts = mesh->numVerts;
 		const Uint64 sz3 = (Uint64)mesh->numVerts * 3 * sizeof(float);
 		const Uint64 sz2 = (Uint64)mesh->numVerts * 2 * sizeof(float);
 		BufferDesc bd; bd.BindFlags = BIND_VERTEX_BUFFER; bd.Usage = USAGE_IMMUTABLE;
-		bd.Size = sz3; bd.Name = "mesh pos"; BufferData pdat{mesh->vertexArray, sz3}; m_impl->device->CreateBuffer(bd, &pdat, &g.pos);
-		bd.Size = sz3; bd.Name = "mesh nrm"; BufferData ndat{mesh->normalArray, sz3}; m_impl->device->CreateBuffer(bd, &ndat, &g.nrm);
+		bd.Size = sz3; bd.Name = "mesh pos"; BufferData pdat{mesh->vertexArray, sz3}; device->CreateBuffer(bd, &pdat, &g.pos);
+		bd.Size = sz3; bd.Name = "mesh nrm"; BufferData ndat{mesh->normalArray, sz3}; device->CreateBuffer(bd, &ndat, &g.nrm);
 		std::vector<float> zeroUV;
 		const float* uvSrc = mesh->uvArray;
 		if (!uvSrc) { zeroUV.assign((size_t)mesh->numVerts * 2, 0.0f); uvSrc = zeroUV.data(); }   // mesh has no UVs
-		bd.Size = sz2; bd.Name = "mesh uv"; BufferData udat{uvSrc, sz2}; m_impl->device->CreateBuffer(bd, &udat, &g.uv);
-		it = m_impl->meshCache.emplace(mesh, std::move(g)).first;
+		bd.Size = sz2; bd.Name = "mesh uv"; BufferData udat{uvSrc, sz2}; device->CreateBuffer(bd, &udat, &g.uv);
+		it = meshCache.emplace(mesh, std::move(g)).first;
 	}
-	Impl::MeshGPU& g = it->second;
-	if (!g.pos || !g.nrm || !g.uv) return;
+	MeshGPU& g = it->second;
+	if (!g.pos || !g.nrm || !g.uv) return nullptr;
+	return &g;
+}
+
+void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
+                                const float pos[3], const float quat[4], const float scale[3])
+{
+	if (m_impl->worldPipes.empty()) return;
+	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
+	if (!gp) return;
+	Impl::MeshGPU& g = *gp;
 
 	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
 	               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
@@ -593,6 +719,58 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	ctx->CommitShaderResources(wp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
 	ctx->Draw(da);
+}
+
+void NukeDiligent::renderSelectionOutline(Mesh* mesh, const float pos[3], const float quat[4], const float scale[3])
+{
+	if (!m_impl->outlineMaskPSO || !m_impl->outlineEdgePSO || !m_impl->curRTV) return;
+	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
+	if (!gp) return;
+	Impl::MeshGPU& g = *gp;
+	m_impl->EnsureOutlineMask(m_impl->curRTW, m_impl->curRTH);
+	if (!m_impl->outlineMaskRTV || !m_impl->outlineMaskSRV) return;
+
+	IDeviceContext* ctx = m_impl->context;
+
+	// --- pass 1: render the selected mesh into the mask RT (alpha = 1 over the object) ---
+	{
+		float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
+		               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
+		               * float4x4::Translation(pos[0], pos[1], pos[2]);
+		float4x4 wvp = world * m_impl->curView * m_impl->curProj;
+		struct CBData { float4x4 wvp; float4x4 world; };
+		{ MapHelper<CBData> cb(ctx, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD); cb->wvp = wvp; cb->world = world; }
+
+		const float zero[4] = { 0, 0, 0, 0 };
+		ctx->SetRenderTargets(1, &m_impl->outlineMaskRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->ClearRenderTarget(m_impl->outlineMaskRTV, zero, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		IBuffer* vbs[]  = { g.pos, g.nrm, g.uv };
+		Uint64   offs[] = { 0, 0, 0 };
+		ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+		ctx->SetPipelineState(m_impl->outlineMaskPSO);
+		ctx->CommitShaderResources(m_impl->outlineMaskSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
+		ctx->Draw(da);
+	}
+
+	// --- pass 2: fullscreen edge-detect over the mask -> draw the border into the camera RT ---
+	{
+		struct EdgeData { float texel[4]; };
+		{
+			MapHelper<EdgeData> cb(ctx, m_impl->outlineEdgeCB, MAP_WRITE, MAP_FLAG_DISCARD);
+			cb->texel[0] = (m_impl->curRTW > 0) ? 1.0f / m_impl->curRTW : 0.0f;
+			cb->texel[1] = (m_impl->curRTH > 0) ? 1.0f / m_impl->curRTH : 0.0f;
+			cb->texel[2] = 2.0f;   // outline thickness in pixels (constant on screen)
+			cb->texel[3] = 0.0f;
+		}
+		ctx->SetRenderTargets(1, &m_impl->curRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->SetVertexBuffers(0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+		if (m_impl->outlineEdgeMaskVar) m_impl->outlineEdgeMaskVar->Set(m_impl->outlineMaskSRV);
+		ctx->SetPipelineState(m_impl->outlineEdgePSO);
+		ctx->CommitShaderResources(m_impl->outlineEdgeSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawAttribs fs{3, DRAW_FLAG_VERIFY_STATES};
+		ctx->Draw(fs);
+	}
 }
 
 void NukeDiligent::loop()
@@ -704,6 +882,7 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 		rtv = it->second.rtv; dsv = it->second.dsv; w = it->second.w; h = it->second.h;
 	}
 	if (!rtv) return;
+	m_impl->curRTV = rtv; m_impl->curRTW = w; m_impl->curRTH = h;   // for the selection-outline pass
 
 	IDeviceContext* ctx = m_impl->context;
 	ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
