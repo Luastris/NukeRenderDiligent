@@ -33,6 +33,10 @@ public:
 	void bindRenderTarget(uint64_t rtId) override;
 	void invalidateTexture(Texture* t) override;
 	void setLights(const NukeLight* lights, int count) override;
+	int  shadowPassCount() override;
+	void beginShadowPass(int pass) override;
+	void renderShadowObject(Mesh* mesh, const float pos[3], const float quat[4], const float scale[3], Material* mat) override;
+	void endShadowPass() override;
 	void loop() override;
 	void deinit() override;
 	void update() override;
