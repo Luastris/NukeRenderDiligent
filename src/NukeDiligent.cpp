@@ -811,6 +811,9 @@ void NukeDiligent::setCursorMode(int) {}
 void NukeDiligent::rawMouse(double, double) {}
 void NukeDiligent::mouseEnterLeave(int) {}
 void NukeDiligent::setWindowTitle(const char* title) { if (m_window && title) glfwSetWindowTitle(m_window, title); }
+bool NukeDiligent::isWindowFocused() { return m_window && glfwGetWindowAttrib(m_window, GLFW_FOCUSED) != 0; }
+bool NukeDiligent::isWindowMaximized() { return m_window && glfwGetWindowAttrib(m_window, GLFW_MAXIMIZED) != 0; }
+void NukeDiligent::setWindowMaximized(bool m) { if (!m_window) return; if (m) glfwMaximizeWindow(m_window); else glfwRestoreWindow(m_window); }
 
 // ---- Neutral UI seam: generic 2D draw (no ImGui types) ----
 

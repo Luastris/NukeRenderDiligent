@@ -25,6 +25,9 @@ public:
 	                  const float pos[3], const float quat[4], const float scale[3]) override;
 	void renderSelectionOutline(Mesh* mesh, const float pos[3], const float quat[4], const float scale[3]) override;
 	void setWindowTitle(const char* title) override;
+	bool isWindowFocused() override;
+	bool isWindowMaximized() override;
+	void setWindowMaximized(bool maximized) override;
 	void loop() override;
 	void deinit() override;
 	void update() override;
