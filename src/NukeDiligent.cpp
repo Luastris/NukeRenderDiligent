@@ -73,19 +73,32 @@ struct NukeDiligent::Impl
 	// --- render targets (cameras draw into these; the UI can sample them) ---
 	struct RT
 	{
-		RefCntAutoPtr<ITexture> color, depth;
-		ITextureView* rtv = nullptr;
-		ITextureView* dsv = nullptr;
-		ITextureView* srv = nullptr;
+		RefCntAutoPtr<ITexture> color, depth;     // single-sample: color = resolve dest (SRV); depth unused if MSAA
+		RefCntAutoPtr<ITexture> colorMS, depthMS; // multisampled render targets (when samples > 1)
+		ITextureView* rtv = nullptr;              // bound RTV (MS when samples>1, else color)
+		ITextureView* dsv = nullptr;              // bound DSV (MS when samples>1)
+		ITextureView* srv = nullptr;              // resolved single-sample SRV (shown by the UI)
 		int w = 0, h = 0;
 	};
 	std::unordered_map<uint64_t, RT> rts;
 	uint64_t rtCounter = 0;
 
+	// --- MSAA --------------------------------------------------------------------------------------
+	Uint8 samples = 4;                 // hardware multisample count for all geometry passes (1 = off)
+	int   pendingSamples = -1;         // requested sample count; applied at the START of render() (never mid-frame)
+	RT    backbufferMS;                // MS color+depth for camera target 0 (Player), resolved to the backbuffer
+	// Resolve bookkeeping for the current camera pass (set in beginCamera, consumed in endCamera).
+	bool      curMSAA = false;
+	ITexture* curResolveSrc = nullptr; // MS color to resolve from
+	ITexture* curResolveDst = nullptr; // single-sample destination
+	void EnsureBackbufferMS(int w, int h);
+
 	// --- 3D world pipelines (one per shader; all share the layout + CBs + white fallback) ---
 	struct WorldPipe
 	{
-		RefCntAutoPtr<IPipelineState>         pso;
+		RefCntAutoPtr<IPipelineState>         pso;        // opaque (blend off, depth write on)
+		RefCntAutoPtr<IPipelineState>         psoBlend;   // transparent: alpha blend, depth test on / write off
+		RefCntAutoPtr<IPipelineState>         psoAdd;     // additive: add blend, depth write off
 		RefCntAutoPtr<IShaderResourceBinding> srb;
 		IShaderResourceVariable*              texVar  = nullptr;  // PS "g_Tex"        (base color, dynamic)
 		IShaderResourceVariable*              normVar = nullptr;  // PS "g_Normal"     (normal map, dynamic)
@@ -94,6 +107,7 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              emVar   = nullptr;  // PS "g_Emissive"   (dynamic)
 		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
+		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on an MSAA change)
 	};
 	std::unordered_map<uint64_t, WorldPipe> worldPipes;   // shader handle -> pipeline
 	uint64_t                              defaultWorldHandle = 0;   // builtin "world" pipeline
@@ -152,6 +166,8 @@ struct NukeDiligent::Impl
 	void CreateShadowResources();
 	// Build a world-type PSO (fixed layout/CBs) from VS+PS source; store it under a handle.
 	uint64_t MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg);
+	bool     BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg);
+	void     RebuildForMSAA();   // rebuild all sample-count-dependent pipelines + targets after `samples` changes
 	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; };
 	std::unordered_map<Mesh*, MeshGPU>          meshCache;
 	MeshGPU* GetMeshGPU(Mesh* mesh);   // get-or-build the GPU vertex buffers (pos/nrm/uv) for a mesh
@@ -312,6 +328,17 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	TextureData ndat; ndat.pSubResources = &nsr; ndat.NumSubresources = 1;
 	device->CreateTexture(wd, &ndat, &flatNormTex);
 
+	// Clamp the requested MSAA to what the device supports for BOTH color (RGBA8) and depth (D32),
+	// stepping 8->4->2->1. SampleCounts is a bitmask where the bit value equals the sample count.
+	{
+		Uint32 colorSC = (Uint32)device->GetTextureFormatInfoExt(TEX_FORMAT_RGBA8_UNORM).SampleCounts;
+		Uint32 depthSC = (Uint32)device->GetTextureFormatInfoExt(TEX_FORMAT_D32_FLOAT).SampleCounts;
+		Uint32 want = samples;
+		while (want > 1 && !((colorSC & want) && (depthSC & want))) want >>= 1;
+		samples = (Uint8)(want < 1 ? 1 : want);
+		std::cout << "[NukeDiligent]\tMSAA samples = " << (int)samples << std::endl;
+	}
+
 	// Built-in "world" pipeline from the engine shaders.
 	defaultWorldHandle = MakeWorldPSO(shaderSource("world.vs"), shaderSource("world.ps"), "World");
 
@@ -324,6 +351,9 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 // (2) EDGE = fullscreen edge-detect over the mask, drawing a constant-pixel-thickness border.
 void NukeDiligent::Impl::BuildOutlinePipelines()
 {
+	// rebuild-safe (MSAA change re-calls this) — release prior objects so Create doesn't assert.
+	outlineMaskPSO.Release(); outlineMaskSRB.Release();
+	outlineEdgePSO.Release(); outlineEdgeSRB.Release(); outlineEdgeCB.Release();
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 
 	// --- mask pipeline (mesh -> mask RT) ---
@@ -380,6 +410,7 @@ void NukeDiligent::Impl::BuildOutlinePipelines()
 			gp.PrimitiveTopology            = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 			gp.RasterizerDesc.CullMode      = CULL_MODE_NONE;
 			gp.DepthStencilDesc.DepthEnable = False;
+			gp.SmplDesc.Count               = samples;   // MSAA: edge composites into the MS camera target
 			gp.InputLayout.NumElements      = 0;   // fullscreen triangle from SV_VertexID, no VB
 			ShaderResourceVariableDesc vars[] = {{SHADER_TYPE_PIXEL, "g_Mask", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}};
 			ci.PSODesc.ResourceLayout.Variables    = vars;
@@ -419,15 +450,17 @@ void NukeDiligent::Impl::EnsureOutlineMask(int w, int h)
 	}
 }
 
-uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg)
+// Build (or REBUILD) the 3 blend-variant PSOs + SRB into `wp` using the current `samples`. Used by both
+// MakeWorldPSO (first build) and setMSAA (rebuild in place so material->shader handles stay valid).
+bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg)
 {
-	if (vsSrc.empty() || psSrc.empty()) return 0;
+	if (vsSrc.empty() || psSrc.empty()) return false;
 	ShaderCreateInfo sci;
 	sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	RefCntAutoPtr<IShader> vs, ps;
 	sci.Desc = {dbg, SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); device->CreateShader(sci, &vs);
 	sci.Desc = {dbg, SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); device->CreateShader(sci, &ps);
-	if (!vs || !ps) return 0;
+	if (!vs || !ps) return false;
 
 	GraphicsPipelineStateCreateInfo ci;
 	ci.PSODesc.Name = dbg;
@@ -438,15 +471,9 @@ uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::s
 	gp.PrimitiveTopology            = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 	gp.RasterizerDesc.CullMode      = CULL_MODE_NONE;
 	gp.DepthStencilDesc.DepthEnable = True;
-	// Per-pixel transparency: straight-alpha blend (PS outputs alpha = material.a * texture.a).
-	auto& rt0 = gp.BlendDesc.RenderTargets[0];
-	rt0.BlendEnable    = True;
-	rt0.SrcBlend       = BLEND_FACTOR_SRC_ALPHA;
-	rt0.DestBlend      = BLEND_FACTOR_INV_SRC_ALPHA;
-	rt0.BlendOp        = BLEND_OPERATION_ADD;
-	rt0.SrcBlendAlpha  = BLEND_FACTOR_ONE;
-	rt0.DestBlendAlpha = BLEND_FACTOR_INV_SRC_ALPHA;
-	rt0.BlendOpAlpha   = BLEND_OPERATION_ADD;
+	gp.SmplDesc.Count               = samples;   // MSAA: must match the (MS) camera target
+	// Opaque base state: blend off, depth write on. The transparent/additive variants below flip blend +
+	// depth write (the engine sorts those back-to-front so straight-alpha blending composites correctly).
 	LayoutElement layout[] = {
 		{0, 0, 3, VT_FLOAT32}, // position
 		{1, 1, 3, VT_FLOAT32}, // normal
@@ -473,12 +500,42 @@ uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::s
 	ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;                      // attached to the shadow SRV instead
 	ci.pVS = vs; ci.pPS = ps;
 
-	WorldPipe wp;
+	auto setStatics = [&](IPipelineState* pso) {
+		if (auto* v = pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))      v->Set(worldCB);
+		if (auto* m = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB"))   m->Set(worldMatCB);
+		if (auto* f = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "FrameCB")) f->Set(worldFrameCB);
+	};
+
+	// Release any previous objects first (rebuild path) — Diligent asserts on Create over a non-null ref.
+	wp.pso.Release(); wp.psoBlend.Release(); wp.psoAdd.Release(); wp.srb.Release();
+
+	// 1) Opaque — blend off, depth write on (base ci as configured above).
 	device->CreateGraphicsPipelineState(ci, &wp.pso);
-	if (!wp.pso) { cout << "[NukeDiligent]\tPSO build failed for shader '" << dbg << "'" << endl; return 0; }
-	if (auto* v = wp.pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))      v->Set(worldCB);
-	if (auto* m = wp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB"))   m->Set(worldMatCB);
-	if (auto* f = wp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "FrameCB")) f->Set(worldFrameCB);
+	if (!wp.pso) { cout << "[NukeDiligent]\tPSO build failed for shader '" << dbg << "'" << endl; return false; }
+	setStatics(wp.pso);
+
+	// 2) Transparent — straight-alpha blend, depth test on but NO depth write (sorted back-to-front by engine).
+	{
+		auto& rt = ci.GraphicsPipeline.BlendDesc.RenderTargets[0];
+		rt.BlendEnable = True;
+		rt.SrcBlend = BLEND_FACTOR_SRC_ALPHA; rt.DestBlend = BLEND_FACTOR_INV_SRC_ALPHA; rt.BlendOp = BLEND_OPERATION_ADD;
+		rt.SrcBlendAlpha = BLEND_FACTOR_ONE;  rt.DestBlendAlpha = BLEND_FACTOR_INV_SRC_ALPHA; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
+		ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = False;
+		ci.PSODesc.Name = "World (blend)";
+		device->CreateGraphicsPipelineState(ci, &wp.psoBlend);
+		if (wp.psoBlend) setStatics(wp.psoBlend);
+	}
+	// 3) Additive — src*a + dst, depth write off.
+	{
+		auto& rt = ci.GraphicsPipeline.BlendDesc.RenderTargets[0];
+		rt.BlendEnable = True;
+		rt.SrcBlend = BLEND_FACTOR_SRC_ALPHA; rt.DestBlend = BLEND_FACTOR_ONE; rt.BlendOp = BLEND_OPERATION_ADD;
+		rt.SrcBlendAlpha = BLEND_FACTOR_ONE;  rt.DestBlendAlpha = BLEND_FACTOR_ONE; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
+		ci.PSODesc.Name = "World (add)";
+		device->CreateGraphicsPipelineState(ci, &wp.psoAdd);
+		if (wp.psoAdd) setStatics(wp.psoAdd);
+	}
+
 	wp.pso->CreateShaderResourceBinding(&wp.srb, true);
 	wp.texVar  = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 	wp.normVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
@@ -487,10 +544,31 @@ uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::s
 	wp.emVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Emissive");
 	wp.shadowVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Shadow");
 	wp.cubeVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ShadowCube");
+	return true;
+}
 
+uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg)
+{
+	WorldPipe wp;
+	wp.vsSrc = vsSrc; wp.psSrc = psSrc; wp.dbg = dbg;   // kept so setMSAA can rebuild this pipeline
+	if (!BuildWorldPipe(wp, vsSrc, psSrc, dbg)) return 0;
 	uint64_t h = nextShaderHandle++;
 	worldPipes[h] = std::move(wp);
 	return h;
+}
+
+// After `samples` changes, rebuild everything whose PSO sample count or texture sample count depends on it:
+// all world pipelines (in place, so material->shader handles stay valid), the sky + outline-edge PSOs, the
+// MS backbuffer, and every render target. Shadow maps / outline mask / UI are single-sample and untouched.
+void NukeDiligent::Impl::RebuildForMSAA()
+{
+	for (auto& kv : worldPipes)
+		BuildWorldPipe(kv.second, kv.second.vsSrc, kv.second.psSrc, kv.second.dbg.c_str());
+	CreateSkyResources();
+	BuildOutlinePipelines();
+	backbufferMS = RT{};   // recreated on next target-0 camera
+	for (auto& kv : rts)
+		if (kv.second.w > 0 && kv.second.h > 0) kv.second = MakeRT(kv.second.w, kv.second.h);
 }
 
 void NukeDiligent::Impl::CreateShadowResources()
@@ -595,6 +673,7 @@ void NukeDiligent::Impl::CreateShadowResources()
 
 void NukeDiligent::Impl::CreateSkyResources()
 {
+	skyPSO.Release(); skySRB.Release(); skyCB.Release();   // rebuild-safe (MSAA change re-calls this)
 	std::string vs = shaderSource("sky.vs"), ps = shaderSource("sky.ps");
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tsky shaders missing" << endl; return; }
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
@@ -615,6 +694,7 @@ void NukeDiligent::Impl::CreateSkyResources()
 	gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
 	gp.DepthStencilDesc.DepthEnable = False;
 	gp.DepthStencilDesc.DepthWriteEnable = False;
+	gp.SmplDesc.Count = samples;   // MSAA: sky draws into the MS camera target
 	gp.InputLayout.NumElements = 0;   // fullscreen triangle from SV_VertexID
 	ShaderResourceVariableDesc svars[] = {
 		{SHADER_TYPE_PIXEL, "g_StarTex", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
@@ -753,22 +833,52 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 NukeDiligent::Impl::RT NukeDiligent::Impl::MakeRT(int w, int h)
 {
 	RT rt; rt.w = w; rt.h = h;
+	const bool ms = samples > 1;
+
+	// Single-sample color: the SHADER-READABLE result (resolve destination when MSAA, plain target otherwise).
 	TextureDesc cd;
 	cd.Name = "RT Color"; cd.Type = RESOURCE_DIM_TEX_2D; cd.Width = (Uint32)w; cd.Height = (Uint32)h;
 	cd.Format = TEX_FORMAT_RGBA8_UNORM; cd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
 	device->CreateTexture(cd, nullptr, &rt.color);
-	if (rt.color)
+	if (rt.color) rt.srv = rt.color->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+
+	if (ms)
 	{
-		rt.rtv = rt.color->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
-		rt.srv = rt.color->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+		TextureDesc cm = cd; cm.Name = "RT Color MS"; cm.SampleCount = samples; cm.BindFlags = BIND_RENDER_TARGET;
+		device->CreateTexture(cm, nullptr, &rt.colorMS);
+		if (rt.colorMS) rt.rtv = rt.colorMS->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+		TextureDesc dm; dm.Name = "RT Depth MS"; dm.Type = RESOURCE_DIM_TEX_2D; dm.Width = (Uint32)w; dm.Height = (Uint32)h;
+		dm.Format = TEX_FORMAT_D32_FLOAT; dm.BindFlags = BIND_DEPTH_STENCIL; dm.SampleCount = samples;
+		device->CreateTexture(dm, nullptr, &rt.depthMS);
+		if (rt.depthMS) rt.dsv = rt.depthMS->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
 	}
-	TextureDesc dd;
-	dd.Name = "RT Depth"; dd.Type = RESOURCE_DIM_TEX_2D; dd.Width = (Uint32)w; dd.Height = (Uint32)h;
-	dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL;
-	device->CreateTexture(dd, nullptr, &rt.depth);
-	if (rt.depth)
-		rt.dsv = rt.depth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
+	else
+	{
+		if (rt.color) rt.rtv = rt.color->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+		TextureDesc dd; dd.Name = "RT Depth"; dd.Type = RESOURCE_DIM_TEX_2D; dd.Width = (Uint32)w; dd.Height = (Uint32)h;
+		dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL;
+		device->CreateTexture(dd, nullptr, &rt.depth);
+		if (rt.depth) rt.dsv = rt.depth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
+	}
 	return rt;
+}
+
+// (Re)create the MS color+depth used when a camera renders to target 0 (the Player's backbuffer path).
+// The MS result is resolved into the swap chain backbuffer in endCamera.
+void NukeDiligent::Impl::EnsureBackbufferMS(int w, int h)
+{
+	if (samples <= 1 || w <= 0 || h <= 0) return;
+	if (backbufferMS.colorMS && backbufferMS.w == w && backbufferMS.h == h) return;
+	backbufferMS = RT{};
+	backbufferMS.w = w; backbufferMS.h = h;
+	TextureDesc cm; cm.Name = "Backbuffer Color MS"; cm.Type = RESOURCE_DIM_TEX_2D; cm.Width = (Uint32)w; cm.Height = (Uint32)h;
+	cm.Format = TEX_FORMAT_RGBA8_UNORM; cm.BindFlags = BIND_RENDER_TARGET; cm.SampleCount = samples;
+	device->CreateTexture(cm, nullptr, &backbufferMS.colorMS);
+	if (backbufferMS.colorMS) backbufferMS.rtv = backbufferMS.colorMS->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+	TextureDesc dm; dm.Name = "Backbuffer Depth MS"; dm.Type = RESOURCE_DIM_TEX_2D; dm.Width = (Uint32)w; dm.Height = (Uint32)h;
+	dm.Format = TEX_FORMAT_D32_FLOAT; dm.BindFlags = BIND_DEPTH_STENCIL; dm.SampleCount = samples;
+	device->CreateTexture(dm, nullptr, &backbufferMS.depthMS);
+	if (backbufferMS.depthMS) backbufferMS.dsv = backbufferMS.depthMS->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
 }
 
 static void glfw_error(int code, const char* desc)
@@ -929,6 +1039,19 @@ int NukeDiligent::render()
 		m_impl->swapChain->Resize((Uint32)fbw, (Uint32)fbh);
 	}
 
+	// Apply a deferred MSAA change here — between frames, after the previous frame's draw was submitted, so
+	// the RT textures the UI referenced are no longer in any pending draw list.
+	if (m_impl->pendingSamples > 0)
+	{
+		if ((Uint8)m_impl->pendingSamples != m_impl->samples)
+		{
+			m_impl->samples = (Uint8)m_impl->pendingSamples;
+			m_impl->RebuildForMSAA();
+			std::cout << "[NukeDiligent]\tMSAA -> " << (int)m_impl->samples << "x" << std::endl;
+		}
+		m_impl->pendingSamples = -1;
+	}
+
 	// 0) Clear the backbuffer up front. In the editor it's the UI background (the world
 	//    goes to off-screen RTs); in the Player the world renders straight to it, where
 	//    beginCamera(target 0) overwrites this clear. Either way it must NOT be cleared
@@ -1069,7 +1192,10 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	IBuffer* vbs[]    = { g.pos, g.nrm, g.uv };
 	Uint64   offs[]   = { 0, 0, 0 };
 	ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
-	ctx->SetPipelineState(wp.pso);
+	// Pick the blend variant for this material (engine sorts transparent/additive back-to-front).
+	IPipelineState* pso = wp.pso;
+	if (mat) { if (mat->blendMode == 1 && wp.psoBlend) pso = wp.psoBlend; else if (mat->blendMode == 2 && wp.psoAdd) pso = wp.psoAdd; }
+	ctx->SetPipelineState(pso);
 	ctx->CommitShaderResources(wp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
 	ctx->Draw(da);
@@ -1234,21 +1360,40 @@ uint64_t NukeDiligent::getRenderTargetTexture(uint64_t id)
 void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 {
 	m_impl->curTarget = cam.target;   // feedback guard: GetTexSRV won't sample the RT we draw into
+	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
+	const bool ms = m_impl->samples > 1;
 	ITextureView* rtv = nullptr;
 	ITextureView* dsv = nullptr;
 	int w = 0, h = 0;
 	if (cam.target == 0)
 	{
-		rtv = m_impl->swapChain->GetCurrentBackBufferRTV();
-		dsv = m_impl->swapChain->GetDepthBufferDSV();
 		w = (int)m_impl->swapChain->GetDesc().Width;
 		h = (int)m_impl->swapChain->GetDesc().Height;
+		if (ms)   // render into the MS backbuffer, resolve to the real backbuffer in endCamera
+		{
+			m_impl->EnsureBackbufferMS(w, h);
+			rtv = m_impl->backbufferMS.rtv; dsv = m_impl->backbufferMS.dsv;
+			m_impl->curMSAA = true;
+			m_impl->curResolveSrc = m_impl->backbufferMS.colorMS;
+			m_impl->curResolveDst = m_impl->swapChain->GetCurrentBackBufferRTV()->GetTexture();
+		}
+		else
+		{
+			rtv = m_impl->swapChain->GetCurrentBackBufferRTV();
+			dsv = m_impl->swapChain->GetDepthBufferDSV();
+		}
 	}
 	else
 	{
 		auto it = m_impl->rts.find(cam.target);
 		if (it == m_impl->rts.end()) return;
 		rtv = it->second.rtv; dsv = it->second.dsv; w = it->second.w; h = it->second.h;
+		if (ms && it->second.colorMS)
+		{
+			m_impl->curMSAA = true;
+			m_impl->curResolveSrc = it->second.colorMS;
+			m_impl->curResolveDst = it->second.color;
+		}
 	}
 	if (!rtv) return;
 	m_impl->curRTV = rtv; m_impl->curRTW = w; m_impl->curRTH = h;   // for the selection-outline pass
@@ -1465,7 +1610,34 @@ void NukeDiligent::renderShadowObject(Mesh* mesh, const float pos[3], const floa
 
 void NukeDiligent::endShadowPass() { /* the next beginCamera rebinds the camera targets */ }
 
-void NukeDiligent::endCamera() { m_impl->curTarget = 0; }
+void NukeDiligent::endCamera()
+{
+	// Resolve the multisampled color into the single-sample destination (RT's SRV / the backbuffer).
+	if (m_impl->curMSAA && m_impl->curResolveSrc && m_impl->curResolveDst)
+	{
+		ResolveTextureSubresourceAttribs ra;
+		ra.SrcTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ra.DstTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ra.Format = TEX_FORMAT_RGBA8_UNORM;
+		m_impl->context->ResolveTextureSubresource(m_impl->curResolveSrc, m_impl->curResolveDst, ra);
+	}
+	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
+	m_impl->curTarget = 0;
+}
+
+void NukeDiligent::setMSAA(int s)
+{
+	int req = (s >= 8) ? 8 : (s >= 4) ? 4 : (s >= 2) ? 2 : 1;   // snap to a power of two (1 = off)
+	if (!m_impl->device) { m_impl->samples = (Uint8)req; return; }   // before init: Setup will clamp + build
+	Uint32 colorSC = (Uint32)m_impl->device->GetTextureFormatInfoExt(TEX_FORMAT_RGBA8_UNORM).SampleCounts;
+	Uint32 depthSC = (Uint32)m_impl->device->GetTextureFormatInfoExt(TEX_FORMAT_D32_FLOAT).SampleCounts;
+	while (req > 1 && !((colorSC & req) && (depthSC & req))) req >>= 1;
+	// Defer the rebuild to the start of the next frame — doing it now (mid ImGui frame) would free the RT
+	// textures the current frame's draw data still references (UI ImGui::Image), crashing renderDrawLists.
+	m_impl->pendingSamples = req;
+}
+
+int NukeDiligent::getMSAA() { return m_impl->pendingSamples > 0 ? m_impl->pendingSamples : (int)m_impl->samples; }
 
 void NukeDiligent::getViewProj(float* view16, float* proj16)
 {

@@ -34,6 +34,8 @@ public:
 	void invalidateTexture(Texture* t) override;
 	void setLights(const NukeLight* lights, int count) override;
 	void setSky(const NukeSky& sky) override;
+	void setMSAA(int samples) override;
+	int  getMSAA() override;
 	void setOnFileDrop(bst::function<void(const char*)> cb) override;
 	int  shadowPassCount() override;
 	void beginShadowPass(int pass) override;
