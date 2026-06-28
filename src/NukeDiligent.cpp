@@ -405,16 +405,48 @@ uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::s
 
 ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 {
-	if (!t || t->pixels.empty() || t->width <= 0 || t->height <= 0) return nullptr;
+	if (!t) return nullptr;
+	if (t->renderTexture)   // sample a RenderTexture = the camera's render-target color view
+	{
+		auto rit = rts.find(t->rtId);
+		return rit != rts.end() ? rit->second.srv : nullptr;
+	}
+	if (t->pixels.empty() || t->width <= 0 || t->height <= 0) return nullptr;
 	auto it = texCache.find(t);
 	if (it == texCache.end())
 	{
-		TextureDesc td; td.Type = RESOURCE_DIM_TEX_2D; td.Width = t->width; td.Height = t->height;
-		td.Format = TEX_FORMAT_RGBA8_UNORM; td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
-		TextureSubResData sub; sub.pData = t->pixels.data(); sub.Stride = (Uint64)t->width * 4;
-		TextureData data; data.pSubResources = &sub; data.NumSubresources = 1;
 		RefCntAutoPtr<ITexture> tex;
-		device->CreateTexture(td, &data, &tex);
+		if (t->format == Texture::FMT_BC1 || t->format == Texture::FMT_BC3)
+		{
+			// Pre-compressed BC with a stored mip chain — upload every level (no GenerateMips for BC).
+			const int  blockBytes = (t->format == Texture::FMT_BC1) ? 8 : 16;
+			const int  mips = t->mipCount < 1 ? 1 : t->mipCount;
+			TextureDesc td; td.Type = RESOURCE_DIM_TEX_2D; td.Width = t->width; td.Height = t->height;
+			td.MipLevels = mips; td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
+			td.Format = (t->format == Texture::FMT_BC1) ? TEX_FORMAT_BC1_UNORM : TEX_FORMAT_BC3_UNORM;
+			std::vector<TextureSubResData> subs(mips);
+			size_t off = 0; int mw = t->width, mh = t->height;
+			for (int m = 0; m < mips; ++m)
+			{
+				int bx = (mw + 3) / 4, by = (mh + 3) / 4;
+				subs[m].pData  = t->pixels.data() + off;
+				subs[m].Stride = (Uint64)bx * blockBytes;
+				off += (size_t)bx * by * blockBytes;
+				mw = mw > 1 ? mw / 2 : 1; mh = mh > 1 ? mh / 2 : 1;
+			}
+			TextureData data; data.pSubResources = subs.data(); data.NumSubresources = (Uint32)mips;
+			device->CreateTexture(td, &data, &tex);
+		}
+		else   // RGBA8 — upload mip0 + generate the chain on GPU (trilinear via the g_Tex sampler)
+		{
+			TextureDesc td; td.Type = RESOURCE_DIM_TEX_2D; td.Width = t->width; td.Height = t->height;
+			td.MipLevels = 0; td.Format = TEX_FORMAT_RGBA8_UNORM; td.BindFlags = BIND_SHADER_RESOURCE;
+			td.Usage = USAGE_DEFAULT; td.MiscFlags = MISC_TEXTURE_FLAG_GENERATE_MIPS;
+			TextureSubResData sub; sub.pData = t->pixels.data(); sub.Stride = (Uint64)t->width * 4;
+			TextureData data; data.pSubResources = &sub; data.NumSubresources = 1;
+			device->CreateTexture(td, &data, &tex);
+			if (tex) context->GenerateMips(tex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+		}
 		it = texCache.emplace(t, tex).first;
 	}
 	return it->second ? it->second->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
@@ -823,6 +855,7 @@ void NukeDiligent::bindRenderTarget(uint64_t id)
 	if (it == m_impl->rts.end()) { m_impl->uiRTV = nullptr; m_impl->uiTW = m_impl->uiTH = 0; return; }
 	m_impl->uiRTV = it->second.rtv; m_impl->uiTW = (Uint32)it->second.w; m_impl->uiTH = (Uint32)it->second.h;
 }
+void NukeDiligent::invalidateTexture(Texture* t) { if (t) m_impl->texCache.erase(t); }   // re-uploaded on next GetTexSRV
 void NukeDiligent::getCursorPos(double& x, double& y) { x = y = 0; if (m_window) glfwGetCursorPos(m_window, &x, &y); }
 bool NukeDiligent::isMouseButtonDown(int b) { return m_window && glfwGetMouseButton(m_window, b) == GLFW_PRESS; }
 
