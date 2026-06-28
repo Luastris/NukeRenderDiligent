@@ -33,6 +33,7 @@ public:
 	void bindRenderTarget(uint64_t rtId) override;
 	void invalidateTexture(Texture* t) override;
 	void setLights(const NukeLight* lights, int count) override;
+	void setSky(const NukeSky& sky) override;
 	void setOnFileDrop(bst::function<void(const char*)> cb) override;
 	int  shadowPassCount() override;
 	void beginShadowPass(int pass) override;

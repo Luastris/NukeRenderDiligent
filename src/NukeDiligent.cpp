@@ -108,7 +108,8 @@ struct NukeDiligent::Impl
 	static const int                      kMaxLights = 16;
 	struct GPULight { float posType[4]; float dirRange[4]; float colorIntensity[4]; float spot[4]; };
 	struct FrameCBData { float camPos[4]; float ambient[4]; float lightCount[4]; GPULight lights[kMaxLights];
-	                     float shadowVP[16 * 4]; float shadowParams[4]; };   // 4 = SHADOW_SLOTS
+	                     float shadowVP[16 * 4]; float shadowParams[4];        // 4 = SHADOW_SLOTS
+	                     float skyTop[4]; float skyHorizon[4]; float skyGround[4]; float skyParams[4]; };  // IBL
 	float                                 curCamPos[3] = {0, 0, 0};  // set in beginCamera (PBR view dir)
 	uint64_t                              curTarget = 0;             // RT id bound by beginCamera (feedback guard)
 	std::vector<NukeLight>                lights;      // scene lights (setLights); empty -> default sun
@@ -125,6 +126,16 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>                shadowVSCB;    // VS: g_LightWVP (per shadow draw)
 	RefCntAutoPtr<IBuffer>                shadowPSCB;    // PS: g_Alpha    (per shadow draw)
 	RefCntAutoPtr<ISampler>               shadowCmpSampler;   // PCF comparison sampler (set on shadowSRV)
+	// Procedural sky / environment.
+	NukeSky                               sky;
+	RefCntAutoPtr<IPipelineState>         skyPSO;
+	RefCntAutoPtr<IShaderResourceBinding> skySRB;
+	RefCntAutoPtr<IBuffer>                skyCB;
+	IShaderResourceVariable*              skyStarVar = nullptr;   // sky PS "g_StarTex" (optional star panorama)
+	IShaderResourceVariable*              skyMoonVar = nullptr;   // sky PS "g_MoonTex" (optional moon disk)
+	void CreateSkyResources();
+	void DrawSky();
+
 	int                                   numShadowSlots = 0;          // assigned 2D slots this frame
 	int                                   lightSlot[kMaxLights];       // per-light 2D shadow slot (-1 = none)
 	float4x4                              slotVP[SHADOW_SLOTS];        // world->light-clip per 2D slot
@@ -306,6 +317,7 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 
 	BuildOutlinePipelines();   // selection outline (stencil mark + scaled draw)
 	CreateShadowResources();   // directional shadow map + depth PSO
+	CreateSkyResources();      // procedural sky pipeline
 }
 
 // Selection-outline pipelines: (1) MASK = render the mesh flat into an RGBA8 mask (alpha=1);
@@ -579,6 +591,80 @@ void NukeDiligent::Impl::CreateShadowResources()
 		shadowPsTexVar = shadowSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 	}
 	cout << "[NukeDiligent]\tshadow map " << SHADOW_RES << "x" << SHADOW_RES << (shadowPSO ? " ready" : " FAILED") << endl;
+}
+
+void NukeDiligent::Impl::CreateSkyResources()
+{
+	std::string vs = shaderSource("sky.vs"), ps = shaderSource("sky.ps");
+	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tsky shaders missing" << endl; return; }
+	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	RefCntAutoPtr<IShader> v, p;
+	sci.Desc = {"Sky VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); device->CreateShader(sci, &v);
+	sci.Desc = {"Sky PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &p);
+	if (!v || !p) return;
+
+	BufferDesc cbd; cbd.Name = "SkyCB"; cbd.Size = sizeof(float4x4) + sizeof(float) * 4 * 9;   // InvVP + 9 float4
+	cbd.Usage = USAGE_DYNAMIC; cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
+	device->CreateBuffer(cbd, nullptr, &skyCB);
+
+	GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Sky PSO";
+	auto& gp = ci.GraphicsPipeline;
+	gp.NumRenderTargets = 1; gp.RTVFormats[0] = TEX_FORMAT_RGBA8_UNORM;
+	gp.DSVFormat = TEX_FORMAT_D32_FLOAT;   // a depth buffer is bound in the camera pass; match it (test off)
+	gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+	gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
+	gp.DepthStencilDesc.DepthEnable = False;
+	gp.DepthStencilDesc.DepthWriteEnable = False;
+	gp.InputLayout.NumElements = 0;   // fullscreen triangle from SV_VertexID
+	ShaderResourceVariableDesc svars[] = {
+		{SHADER_TYPE_PIXEL, "g_StarTex", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_MoonTex", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+	};
+	ci.PSODesc.ResourceLayout.Variables = svars; ci.PSODesc.ResourceLayout.NumVariables = 2;
+	SamplerDesc ssamp; ssamp.MinFilter = FILTER_TYPE_LINEAR; ssamp.MagFilter = FILTER_TYPE_LINEAR; ssamp.MipFilter = FILTER_TYPE_LINEAR;
+	ssamp.AddressU = TEXTURE_ADDRESS_WRAP; ssamp.AddressV = TEXTURE_ADDRESS_CLAMP;
+	SamplerDesc msamp; msamp.MinFilter = FILTER_TYPE_LINEAR; msamp.MagFilter = FILTER_TYPE_LINEAR; msamp.MipFilter = FILTER_TYPE_LINEAR;
+	msamp.AddressU = TEXTURE_ADDRESS_CLAMP; msamp.AddressV = TEXTURE_ADDRESS_CLAMP;
+	ImmutableSamplerDesc simm[] = {
+		{SHADER_TYPE_PIXEL, "g_StarTex", ssamp},
+		{SHADER_TYPE_PIXEL, "g_MoonTex", msamp},
+	};
+	ci.PSODesc.ResourceLayout.ImmutableSamplers = simm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 2;
+	ci.pVS = v; ci.pPS = p;
+	device->CreateGraphicsPipelineState(ci, &skyPSO);
+	if (skyPSO)
+	{
+		if (auto* sv = skyPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL, "SkyCB")) sv->Set(skyCB);
+		skyPSO->CreateShaderResourceBinding(&skySRB, true);
+		skyStarVar = skySRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_StarTex");
+		skyMoonVar = skySRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_MoonTex");
+	}
+	cout << "[NukeDiligent]\tsky pipeline" << (skyPSO ? " ready" : " FAILED") << endl;
+}
+
+void NukeDiligent::Impl::DrawSky()
+{
+	if (!skyPSO || sky.mode != 1) return;
+	float4x4 invVP = (curView * curProj).Inverse();
+	ITextureView* starSRV = sky.starsTex ? GetTexSRV(sky.starsTex) : nullptr;
+	ITextureView* moonSRV = (sky.moonTex && sky.moonAmount > 0.0f) ? GetTexSRV(sky.moonTex) : nullptr;
+	struct SkyData { float4x4 invVP; float camPos[4]; float top[4]; float horizon[4]; float ground[4]; float params[4]; float sunDir[4]; float sunCol[4]; float moonDir[4]; float moonParams[4]; };
+	{
+		MapHelper<SkyData> cb(context, skyCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		cb->invVP = invVP;
+		cb->camPos[0] = curCamPos[0]; cb->camPos[1] = curCamPos[1]; cb->camPos[2] = curCamPos[2]; cb->camPos[3] = 1;
+		for (int k = 0; k < 3; ++k) { cb->top[k] = sky.top[k]; cb->horizon[k] = sky.horizon[k]; cb->ground[k] = sky.ground[k]; cb->sunDir[k] = sky.sunDir[k]; cb->sunCol[k] = sky.sunColor[k]; cb->moonDir[k] = sky.moonDir[k]; }
+		cb->top[3] = cb->horizon[3] = cb->ground[3] = cb->sunDir[3] = cb->sunCol[3] = cb->moonDir[3] = 1;
+		cb->params[0] = sky.skyIntensity; cb->params[1] = sky.sunIntensity; cb->params[2] = sky.stars;
+		cb->params[3] = starSRV ? 1.0f : 0.0f;   // has a star texture (else procedural)
+		cb->moonParams[0] = moonSRV ? sky.moonAmount : 0.0f; cb->moonParams[1] = sky.moonSize; cb->moonParams[2] = sky.moonPhase; cb->moonParams[3] = 0;
+	}
+	if (skyStarVar) skyStarVar->Set(starSRV ? starSRV : whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	if (skyMoonVar) skyMoonVar->Set(moonSRV ? moonSRV : whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	context->SetPipelineState(skyPSO);
+	context->CommitShaderResources(skySRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
+	context->Draw(da);
 }
 
 ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
@@ -1191,7 +1277,8 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 		MapHelper<Impl::FrameCBData> fb(m_impl->context, m_impl->worldFrameCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		memset(fb, 0, sizeof(Impl::FrameCBData));
 		fb->camPos[0] = P.x; fb->camPos[1] = P.y; fb->camPos[2] = P.z;
-		fb->ambient[0] = 0.5f; fb->ambient[1] = 0.55f; fb->ambient[2] = 0.6f; fb->ambient[3] = 0.35f;
+		fb->ambient[0] = m_impl->sky.ambient[0]; fb->ambient[1] = m_impl->sky.ambient[1];
+		fb->ambient[2] = m_impl->sky.ambient[2]; fb->ambient[3] = m_impl->sky.ambientIntensity;
 
 		std::vector<NukeLight> src = m_impl->lights;
 		if (src.empty())   // default directional "sun"
@@ -1220,8 +1307,15 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 		fb->shadowParams[1] = 0.f;
 		fb->shadowParams[2] = 1.0f / (float)Impl::SHADOW_RES;
 		fb->shadowParams[3] = 0.0015f;
+		// Sky gradient for IBL (procedural-sky ambient + reflections in the world PS).
+		for (int k = 0; k < 3; ++k) { fb->skyTop[k] = m_impl->sky.top[k]; fb->skyHorizon[k] = m_impl->sky.horizon[k]; fb->skyGround[k] = m_impl->sky.ground[k]; }
+		fb->skyParams[0] = m_impl->sky.skyIntensity; fb->skyParams[1] = (m_impl->sky.mode == 1) ? 1.0f : 0.0f; fb->skyParams[2] = 0; fb->skyParams[3] = 0;
 	}
+
+	m_impl->DrawSky();   // procedural sky behind the scene (after clear, before geometry)
 }
+
+void NukeDiligent::setSky(const NukeSky& s) { m_impl->sky = s; }
 
 // Desktop/Explorer file-drop -> editor import. One renderer instance, so a file-static callback is fine.
 static bst::function<void(const char*)> g_onFileDrop;
