@@ -1196,6 +1196,19 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	}
 }
 
+// Desktop/Explorer file-drop -> editor import. One renderer instance, so a file-static callback is fine.
+static bst::function<void(const char*)> g_onFileDrop;
+static void GlfwDropCB(GLFWwindow*, int count, const char** paths)
+{
+	if (!g_onFileDrop) return;
+	for (int i = 0; i < count; ++i) if (paths[i]) g_onFileDrop(paths[i]);
+}
+void NukeDiligent::setOnFileDrop(bst::function<void(const char*)> cb)
+{
+	g_onFileDrop = cb;
+	if (m_window) glfwSetDropCallback(m_window, GlfwDropCB);
+}
+
 void NukeDiligent::setLights(const NukeLight* lights, int count)
 {
 	m_impl->lights.assign(lights ? lights : nullptr, (lights && count > 0) ? lights + count : nullptr);
