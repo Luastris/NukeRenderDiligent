@@ -115,6 +115,8 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>                outlineEdgeCB;      // texel size + thickness
 	ITextureView*                         curRTV = nullptr;   // current camera color target (outline rebind)
 	int                                   curRTW = 0, curRTH = 0;
+	ITextureView*                         uiRTV = nullptr;    // explicit 2D target (bindRenderTarget); null = backbuffer
+	Uint32                                uiTW = 0, uiTH = 0; // its size (0 = use swapchain)
 	void BuildOutlinePipelines();
 	void EnsureOutlineMask(int w, int h);
 
@@ -814,6 +816,15 @@ void NukeDiligent::setWindowTitle(const char* title) { if (m_window && title) gl
 bool NukeDiligent::isWindowFocused() { return m_window && glfwGetWindowAttrib(m_window, GLFW_FOCUSED) != 0; }
 bool NukeDiligent::isWindowMaximized() { return m_window && glfwGetWindowAttrib(m_window, GLFW_MAXIMIZED) != 0; }
 void NukeDiligent::setWindowMaximized(bool m) { if (!m_window) return; if (m) glfwMaximizeWindow(m_window); else glfwRestoreWindow(m_window); }
+void NukeDiligent::bindRenderTarget(uint64_t id)
+{
+	if (id == 0) { m_impl->uiRTV = nullptr; m_impl->uiTW = m_impl->uiTH = 0; return; }
+	auto it = m_impl->rts.find(id);
+	if (it == m_impl->rts.end()) { m_impl->uiRTV = nullptr; m_impl->uiTW = m_impl->uiTH = 0; return; }
+	m_impl->uiRTV = it->second.rtv; m_impl->uiTW = (Uint32)it->second.w; m_impl->uiTH = (Uint32)it->second.h;
+}
+void NukeDiligent::getCursorPos(double& x, double& y) { x = y = 0; if (m_window) glfwGetCursorPos(m_window, &x, &y); }
+bool NukeDiligent::isMouseButtonDown(int b) { return m_window && glfwGetMouseButton(m_window, b) == GLFW_PRESS; }
 
 // ---- Neutral UI seam: generic 2D draw (no ImGui types) ----
 
@@ -978,8 +989,12 @@ void NukeDiligent::renderDrawLists(const NukeUIDrawData& data)
 		if (cb) *cb = proj;
 	}
 
-	const Uint32 surfW = m_impl->swapChain->GetDesc().Width;
-	const Uint32 surfH = m_impl->swapChain->GetDesc().Height;
+	// Target: an explicit RT (bindRenderTarget -> runtime UI into the viewport/camera RT) or the
+	// backbuffer (editor UI). Bound here, no clear, so the UI composites over whatever's already there.
+	ITextureView* uirtv = m_impl->uiRTV ? m_impl->uiRTV : m_impl->swapChain->GetCurrentBackBufferRTV();
+	const Uint32 surfW = (m_impl->uiRTV && m_impl->uiTW) ? m_impl->uiTW : m_impl->swapChain->GetDesc().Width;
+	const Uint32 surfH = (m_impl->uiRTV && m_impl->uiTH) ? m_impl->uiTH : m_impl->swapChain->GetDesc().Height;
+	ctx->SetRenderTargets(1, &uirtv, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
 	IBuffer* vbs[] = {m_impl->uiVB};
 	ctx->SetVertexBuffers(0, 1, vbs, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);

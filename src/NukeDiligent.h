@@ -28,6 +28,9 @@ public:
 	bool isWindowFocused() override;
 	bool isWindowMaximized() override;
 	void setWindowMaximized(bool maximized) override;
+	void getCursorPos(double& x, double& y) override;
+	bool isMouseButtonDown(int button) override;
+	void bindRenderTarget(uint64_t rtId) override;
 	void loop() override;
 	void deinit() override;
 	void update() override;
