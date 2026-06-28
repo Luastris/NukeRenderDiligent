@@ -31,9 +31,12 @@
 #include "MapHelper.hpp"
 #include "BasicMath.hpp"
 #include "GraphicsAccessories.hpp"
+// --- Windows-only HDR10 display output (DXGI / D3D11). Other platforms: no D3D11, HDR output is a no-op. ---
+#ifdef _WIN32
 #include <d3d11.h>           // ID3D11View etc. (needed BEFORE the Diligent D3D11 interface headers below)
 #include <dxgi1_6.h>         // IDXGISwapChain3/4 + IDXGIOutput6 (HDR10 colour space + display detection)
 #include "SwapChainD3D11.h"  // Diligent ISwapChainD3D11::GetDXGISwapChain (HDR10 swap-chain access)
+#endif
 
 // Engine headers last (they do `using namespace std;` internally).
 #include "NukeDiligent.h"
@@ -915,6 +918,7 @@ void NukeDiligent::Impl::EnsureBackbufferMS(int w, int h)
 void NukeDiligent::Impl::SetupHDROutput()
 {
 	hdr10Active = false;
+#ifdef _WIN32   // DXGI HDR10 path — Windows / D3D11 only
 	RefCntAutoPtr<ISwapChainD3D11> scD3D11(swapChain.RawPtr(), IID_SwapChainD3D11);
 	if (!scD3D11) return;
 	IDXGISwapChain* dxgi = scD3D11->GetDXGISwapChain();
@@ -962,6 +966,7 @@ void NukeDiligent::Impl::SetupHDROutput()
 	}
 	sc3->Release();
 	cout << "[NukeDiligent]\tHDR10 output " << (hdr10Active ? "ACTIVE" : "off (display not in HDR mode / unsupported)") << endl;
+#endif   // _WIN32
 }
 
 void NukeDiligent::Impl::CreatePostResources()
@@ -1802,7 +1807,14 @@ void NukeDiligent::setHDR(bool on)
 }
 bool NukeDiligent::getHDR() { return m_impl->pendingHDR >= 0 ? (m_impl->pendingHDR != 0) : m_impl->hdr; }
 
-void NukeDiligent::setHDROutput(bool on) { m_impl->hdrOutput = on; }   // honoured at init (swap-chain format)
+void NukeDiligent::setHDROutput(bool on)
+{
+#ifdef _WIN32
+	m_impl->hdrOutput = on;   // honoured at init (swap-chain format + HDR10 colour space)
+#else
+	(void)on;                 // no D3D11/DXGI off Windows — HDR output stays off
+#endif
+}
 bool NukeDiligent::getHDROutput() { return m_impl->hdr10Active; }
 
 void NukeDiligent::getViewProj(float* view16, float* proj16)
