@@ -145,6 +145,7 @@ struct NukeDiligent::Impl
 	std::unordered_map<Mesh*, MeshGPU>          meshCache;
 	MeshGPU* GetMeshGPU(Mesh* mesh);   // get-or-build the GPU vertex buffers (pos/nrm/uv) for a mesh
 	std::unordered_map<Texture*, RefCntAutoPtr<ITexture>> texCache;   // engine Texture -> GPU texture
+	std::unordered_map<Texture*, std::vector<RefCntAutoPtr<ITexture>>> animTex;   // GIF: one Texture2D per frame
 	float4x4 curView, curProj;   // set in beginCamera, used in renderObject
 
 	// Selection outline (editor): post-process. Pass 1 renders the selected mesh into a mask RT;
@@ -593,6 +594,32 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 		return rit != rts.end() ? rit->second.srv : nullptr;
 	}
 	if (t->pixels.empty() || t->width <= 0 || t->height <= 0) return nullptr;
+
+	if (t->frameCount > 1)   // animated (GIF): a separate Texture2D per frame; return the current frame's SRV
+	{
+		auto av = animTex.find(t);
+		if (av == animTex.end())
+		{
+			const int w = t->width, h = t->height, n = t->frameCount;
+			const size_t frameBytes = (size_t)w * h * 4;
+			if (t->pixels.size() < frameBytes * n) return nullptr;
+			std::vector<RefCntAutoPtr<ITexture>> frames(n);
+			for (int k = 0; k < n; ++k)
+			{
+				TextureDesc td; td.Type = RESOURCE_DIM_TEX_2D; td.Width = w; td.Height = h; td.MipLevels = 1;
+				td.Format = TEX_FORMAT_RGBA8_UNORM; td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
+				TextureSubResData sub; sub.pData = t->pixels.data() + (size_t)k * frameBytes; sub.Stride = (Uint64)w * 4;
+				TextureData data; data.pSubResources = &sub; data.NumSubresources = 1;
+				device->CreateTexture(td, &data, &frames[k]);
+			}
+			av = animTex.emplace(t, std::move(frames)).first;
+		}
+		auto& fs = av->second;
+		if (fs.empty()) return nullptr;
+		int f = t->curFrame; if (f < 0) f = 0; if (f >= (int)fs.size()) f %= (int)fs.size();
+		return fs[f] ? fs[f]->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
+	}
+
 	auto it = texCache.find(t);
 	if (it == texCache.end())
 	{
@@ -618,15 +645,15 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 			TextureData data; data.pSubResources = subs.data(); data.NumSubresources = (Uint32)mips;
 			device->CreateTexture(td, &data, &tex);
 		}
-		else   // RGBA8 — upload mip0 + generate the chain on GPU (trilinear via the g_Tex sampler)
+		else   // RGBA8 (non-BC fallback, e.g. odd sizes / GIF frames) — single level, no GPU mip-gen
 		{
+			if (t->pixels.size() < (size_t)t->width * t->height * 4) return nullptr;   // guard malformed data
 			TextureDesc td; td.Type = RESOURCE_DIM_TEX_2D; td.Width = t->width; td.Height = t->height;
-			td.MipLevels = 0; td.Format = TEX_FORMAT_RGBA8_UNORM; td.BindFlags = BIND_SHADER_RESOURCE;
-			td.Usage = USAGE_DEFAULT; td.MiscFlags = MISC_TEXTURE_FLAG_GENERATE_MIPS;
+			td.MipLevels = 1; td.Format = TEX_FORMAT_RGBA8_UNORM;
+			td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
 			TextureSubResData sub; sub.pData = t->pixels.data(); sub.Stride = (Uint64)t->width * 4;
 			TextureData data; data.pSubResources = &sub; data.NumSubresources = 1;
 			device->CreateTexture(td, &data, &tex);
-			if (tex) context->GenerateMips(tex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
 		}
 		it = texCache.emplace(t, tex).first;
 	}
