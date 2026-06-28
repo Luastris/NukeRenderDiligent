@@ -110,6 +110,7 @@ struct NukeDiligent::Impl
 	struct FrameCBData { float camPos[4]; float ambient[4]; float lightCount[4]; GPULight lights[kMaxLights];
 	                     float shadowVP[16 * 4]; float shadowParams[4]; };   // 4 = SHADOW_SLOTS
 	float                                 curCamPos[3] = {0, 0, 0};  // set in beginCamera (PBR view dir)
+	uint64_t                              curTarget = 0;             // RT id bound by beginCamera (feedback guard)
 	std::vector<NukeLight>                lights;      // scene lights (setLights); empty -> default sun
 
 	// --- Shadow maps (directional + spot share a 2D array; one slice per shadow-casting light) -----
@@ -584,6 +585,10 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 	if (!t) return nullptr;
 	if (t->renderTexture)   // sample a RenderTexture = the camera's render-target color view
 	{
+		// Feedback guard: never sample the RT we're currently rendering INTO (an object that displays the
+		// RT, caught in that camera's own view, would bind it as SRV while it's the RTV -> Diligent drops
+		// the render target and the whole pass renders nothing but the clear color).
+		if (t->rtId != 0 && t->rtId == curTarget) return nullptr;
 		auto rit = rts.find(t->rtId);
 		return rit != rts.end() ? rit->second.srv : nullptr;
 	}
@@ -1111,6 +1116,7 @@ uint64_t NukeDiligent::getRenderTargetTexture(uint64_t id)
 
 void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 {
+	m_impl->curTarget = cam.target;   // feedback guard: GetTexSRV won't sample the RT we draw into
 	ITextureView* rtv = nullptr;
 	ITextureView* dsv = nullptr;
 	int w = 0, h = 0;
@@ -1321,7 +1327,7 @@ void NukeDiligent::renderShadowObject(Mesh* mesh, const float pos[3], const floa
 
 void NukeDiligent::endShadowPass() { /* the next beginCamera rebinds the camera targets */ }
 
-void NukeDiligent::endCamera() {}
+void NukeDiligent::endCamera() { m_impl->curTarget = 0; }
 
 void NukeDiligent::getViewProj(float* view16, float* proj16)
 {
