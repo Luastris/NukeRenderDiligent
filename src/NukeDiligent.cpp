@@ -687,14 +687,18 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 		if (av == animTex.end())
 		{
 			const int w = t->width, h = t->height, n = t->frameCount;
-			const size_t frameBytes = (size_t)w * h * 4;
+			const bool bc = (t->format == Texture::FMT_BC1 || t->format == Texture::FMT_BC3);
+			const int  bb = (t->format == Texture::FMT_BC1) ? 8 : 16;
+			const TEXTURE_FORMAT fmt = bc ? (t->format == Texture::FMT_BC1 ? TEX_FORMAT_BC1_UNORM : TEX_FORMAT_BC3_UNORM) : TEX_FORMAT_RGBA8_UNORM;
+			const size_t frameBytes = bc ? (size_t)((w + 3) / 4) * ((h + 3) / 4) * bb : (size_t)w * h * 4;
+			const Uint64 stride     = bc ? (Uint64)((w + 3) / 4) * bb : (Uint64)w * 4;
 			if (t->pixels.size() < frameBytes * n) return nullptr;
 			std::vector<RefCntAutoPtr<ITexture>> frames(n);
 			for (int k = 0; k < n; ++k)
 			{
 				TextureDesc td; td.Type = RESOURCE_DIM_TEX_2D; td.Width = w; td.Height = h; td.MipLevels = 1;
-				td.Format = TEX_FORMAT_RGBA8_UNORM; td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
-				TextureSubResData sub; sub.pData = t->pixels.data() + (size_t)k * frameBytes; sub.Stride = (Uint64)w * 4;
+				td.Format = fmt; td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
+				TextureSubResData sub; sub.pData = t->pixels.data() + (size_t)k * frameBytes; sub.Stride = stride;
 				TextureData data; data.pSubResources = &sub; data.NumSubresources = 1;
 				device->CreateTexture(td, &data, &frames[k]);
 			}
