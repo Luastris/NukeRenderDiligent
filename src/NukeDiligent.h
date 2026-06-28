@@ -36,6 +36,10 @@ public:
 	void setSky(const NukeSky& sky) override;
 	void setMSAA(int samples) override;
 	int  getMSAA() override;
+	void setHDR(bool on) override;
+	bool getHDR() override;
+	void setHDROutput(bool on) override;
+	bool getHDROutput() override;
 	void setOnFileDrop(bst::function<void(const char*)> cb) override;
 	int  shadowPassCount() override;
 	void beginShadowPass(int pass) override;

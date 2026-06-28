@@ -31,6 +31,9 @@
 #include "MapHelper.hpp"
 #include "BasicMath.hpp"
 #include "GraphicsAccessories.hpp"
+#include <d3d11.h>           // ID3D11View etc. (needed BEFORE the Diligent D3D11 interface headers below)
+#include <dxgi1_6.h>         // IDXGISwapChain3/4 + IDXGIOutput6 (HDR10 colour space + display detection)
+#include "SwapChainD3D11.h"  // Diligent ISwapChainD3D11::GetDXGISwapChain (HDR10 swap-chain access)
 
 // Engine headers last (they do `using namespace std;` internally).
 #include "NukeDiligent.h"
@@ -73,11 +76,14 @@ struct NukeDiligent::Impl
 	// --- render targets (cameras draw into these; the UI can sample them) ---
 	struct RT
 	{
-		RefCntAutoPtr<ITexture> color, depth;     // single-sample: color = resolve dest (SRV); depth unused if MSAA
-		RefCntAutoPtr<ITexture> colorMS, depthMS; // multisampled render targets (when samples > 1)
-		ITextureView* rtv = nullptr;              // bound RTV (MS when samples>1, else color)
-		ITextureView* dsv = nullptr;              // bound DSV (MS when samples>1)
-		ITextureView* srv = nullptr;              // resolved single-sample SRV (shown by the UI)
+		RefCntAutoPtr<ITexture> color, depth;     // color = HDR (RGBA16F) single-sample: geometry target (no MSAA) / resolve dest
+		RefCntAutoPtr<ITexture> colorMS, depthMS; // multisampled HDR render targets (when samples > 1)
+		RefCntAutoPtr<ITexture> post;             // LDR (RGBA8) post-process output — what the UI samples
+		ITextureView* rtv = nullptr;              // geometry RTV (MS when samples>1, else color)
+		ITextureView* dsv = nullptr;              // geometry DSV
+		ITextureView* hdrSRV = nullptr;           // color's SRV (post-pass input)
+		ITextureView* postRTV = nullptr;          // post's RTV (post-pass output)
+		ITextureView* srv = nullptr;              // post's SRV (final LDR result shown by the UI / sampled as a texture)
 		int w = 0, h = 0;
 	};
 	std::unordered_map<uint64_t, RT> rts;
@@ -89,9 +95,30 @@ struct NukeDiligent::Impl
 	RT    backbufferMS;                // MS color+depth for camera target 0 (Player), resolved to the backbuffer
 	// Resolve bookkeeping for the current camera pass (set in beginCamera, consumed in endCamera).
 	bool      curMSAA = false;
-	ITexture* curResolveSrc = nullptr; // MS color to resolve from
-	ITexture* curResolveDst = nullptr; // single-sample destination
+	ITexture* curResolveSrc = nullptr; // MS HDR color to resolve from
+	ITexture* curResolveDst = nullptr; // single-sample HDR destination
+	ITextureView* curPostSrc = nullptr; // HDR SRV the post pass reads (after resolve)
+	ITextureView* curPostDst = nullptr; // LDR RTV the post pass writes (RT's post / the backbuffer)
 	void EnsureBackbufferMS(int w, int h);
+
+	// --- Post-process ------------------------------------------------------------------------------
+	RefCntAutoPtr<IPipelineState>         postPSO;       // -> RT targets (RGBA8, SDR sRGB)
+	RefCntAutoPtr<IShaderResourceBinding> postSRB;
+	RefCntAutoPtr<IPipelineState>         postPSOBB;     // -> the backbuffer (matches the swap-chain format; PQ when HDR10)
+	RefCntAutoPtr<IShaderResourceBinding> postSRBBB;
+	RefCntAutoPtr<IBuffer>                postCB;
+	IShaderResourceVariable*              postHdrVar = nullptr;
+	IShaderResourceVariable*              postHdrVarBB = nullptr;
+	float                                 exposure = 1.0f;
+	bool                                  hdrOutput = false;   // requested HDR10 display output (Player only, before init)
+	bool                                  hdr10Active = false; // an HDR10 swap chain is actually live (display is HDR)
+	void CreatePostResources();
+	void RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV, int w, int h, bool toBackbuffer);
+	void SetupHDROutput();   // after swap-chain creation: set the HDR10 colour space if the display supports it
+	static constexpr TEXTURE_FORMAT HDR_FMT = TEX_FORMAT_RGBA16_FLOAT;
+	bool hdr = true;                   // HDR pipeline on (scene = RGBA16F, post tonemaps) / off (RGBA8, world.ps tonemaps)
+	int  pendingHDR = -1;              // requested hdr (0/1); applied with pendingSamples at the start of render()
+	TEXTURE_FORMAT SceneFmt() const { return hdr ? HDR_FMT : TEX_FORMAT_RGBA8_UNORM; }
 
 	// --- 3D world pipelines (one per shader; all share the layout + CBs + white fallback) ---
 	struct WorldPipe
@@ -345,6 +372,7 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	BuildOutlinePipelines();   // selection outline (stencil mark + scaled draw)
 	CreateShadowResources();   // directional shadow map + depth PSO
 	CreateSkyResources();      // procedural sky pipeline
+	CreatePostResources();     // final tonemap / post-process pass
 }
 
 // Selection-outline pipelines: (1) MASK = render the mesh flat into an RGBA8 mask (alpha=1);
@@ -405,7 +433,7 @@ void NukeDiligent::Impl::BuildOutlinePipelines()
 			ci.PSODesc.Name = "Outline Edge PSO";
 			auto& gp = ci.GraphicsPipeline;
 			gp.NumRenderTargets             = 1;
-			gp.RTVFormats[0]                = TEX_FORMAT_RGBA8_UNORM;
+			gp.RTVFormats[0]                = SceneFmt();   // composites into the scene target
 			gp.DSVFormat                    = TEX_FORMAT_UNKNOWN;
 			gp.PrimitiveTopology            = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 			gp.RasterizerDesc.CullMode      = CULL_MODE_NONE;
@@ -466,7 +494,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	ci.PSODesc.Name = dbg;
 	auto& gp = ci.GraphicsPipeline;
 	gp.NumRenderTargets             = 1;
-	gp.RTVFormats[0]                = TEX_FORMAT_RGBA8_UNORM;
+	gp.RTVFormats[0]                = SceneFmt();   // HDR (post tonemaps) or RGBA8 (world.ps tonemaps)
 	gp.DSVFormat                    = TEX_FORMAT_D32_FLOAT;
 	gp.PrimitiveTopology            = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 	gp.RasterizerDesc.CullMode      = CULL_MODE_NONE;
@@ -688,7 +716,7 @@ void NukeDiligent::Impl::CreateSkyResources()
 
 	GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Sky PSO";
 	auto& gp = ci.GraphicsPipeline;
-	gp.NumRenderTargets = 1; gp.RTVFormats[0] = TEX_FORMAT_RGBA8_UNORM;
+	gp.NumRenderTargets = 1; gp.RTVFormats[0] = SceneFmt();   // sky draws into the scene target
 	gp.DSVFormat = TEX_FORMAT_D32_FLOAT;   // a depth buffer is bound in the camera pass; match it (test off)
 	gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 	gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
@@ -737,7 +765,8 @@ void NukeDiligent::Impl::DrawSky()
 		cb->top[3] = cb->horizon[3] = cb->ground[3] = cb->sunDir[3] = cb->sunCol[3] = cb->moonDir[3] = 1;
 		cb->params[0] = sky.skyIntensity; cb->params[1] = sky.sunIntensity; cb->params[2] = sky.stars;
 		cb->params[3] = starSRV ? 1.0f : 0.0f;   // has a star texture (else procedural)
-		cb->moonParams[0] = moonSRV ? sky.moonAmount : 0.0f; cb->moonParams[1] = sky.moonSize; cb->moonParams[2] = sky.moonPhase; cb->moonParams[3] = 0;
+		cb->moonParams[0] = moonSRV ? sky.moonAmount : 0.0f; cb->moonParams[1] = sky.moonSize; cb->moonParams[2] = sky.moonPhase;
+		cb->moonParams[3] = hdr ? 0.0f : 1.0f;   // HDR off: sky tonemaps itself (RGBA8 scene, post is passthrough)
 	}
 	if (skyStarVar) skyStarVar->Set(starSRV ? starSRV : whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
 	if (skyMoonVar) skyMoonVar->Set(moonSRV ? moonSRV : whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
@@ -835,16 +864,23 @@ NukeDiligent::Impl::RT NukeDiligent::Impl::MakeRT(int w, int h)
 	RT rt; rt.w = w; rt.h = h;
 	const bool ms = samples > 1;
 
-	// Single-sample color: the SHADER-READABLE result (resolve destination when MSAA, plain target otherwise).
+	// HDR (RGBA16F) color: geometry target (no MSAA) / resolve destination (MSAA). The post pass reads it.
 	TextureDesc cd;
-	cd.Name = "RT Color"; cd.Type = RESOURCE_DIM_TEX_2D; cd.Width = (Uint32)w; cd.Height = (Uint32)h;
-	cd.Format = TEX_FORMAT_RGBA8_UNORM; cd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+	cd.Name = "RT Color HDR"; cd.Type = RESOURCE_DIM_TEX_2D; cd.Width = (Uint32)w; cd.Height = (Uint32)h;
+	cd.Format = SceneFmt(); cd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;   // RGBA16F (HDR) or RGBA8 (off)
 	device->CreateTexture(cd, nullptr, &rt.color);
-	if (rt.color) rt.srv = rt.color->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+	if (rt.color) rt.hdrSRV = rt.color->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+
+	// LDR (RGBA8) post output — the tonemapped result the UI shows / a material samples.
+	TextureDesc pd;
+	pd.Name = "RT Color Post"; pd.Type = RESOURCE_DIM_TEX_2D; pd.Width = (Uint32)w; pd.Height = (Uint32)h;
+	pd.Format = TEX_FORMAT_RGBA8_UNORM; pd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+	device->CreateTexture(pd, nullptr, &rt.post);
+	if (rt.post) { rt.postRTV = rt.post->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); rt.srv = rt.post->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
 
 	if (ms)
 	{
-		TextureDesc cm = cd; cm.Name = "RT Color MS"; cm.SampleCount = samples; cm.BindFlags = BIND_RENDER_TARGET;
+		TextureDesc cm = cd; cm.Name = "RT Color HDR MS"; cm.SampleCount = samples; cm.BindFlags = BIND_RENDER_TARGET;
 		device->CreateTexture(cm, nullptr, &rt.colorMS);
 		if (rt.colorMS) rt.rtv = rt.colorMS->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
 		TextureDesc dm; dm.Name = "RT Depth MS"; dm.Type = RESOURCE_DIM_TEX_2D; dm.Width = (Uint32)w; dm.Height = (Uint32)h;
@@ -863,22 +899,135 @@ NukeDiligent::Impl::RT NukeDiligent::Impl::MakeRT(int w, int h)
 	return rt;
 }
 
-// (Re)create the MS color+depth used when a camera renders to target 0 (the Player's backbuffer path).
-// The MS result is resolved into the swap chain backbuffer in endCamera.
+// (Re)create the HDR intermediate used when a camera renders to target 0 (the Player's backbuffer path):
+// geometry -> this HDR target (MS if enabled) -> resolve -> HDR single -> post pass -> the swap-chain backbuffer.
+// Reuses MakeRT (its unused `post` LDR texture is harmless; the post pass writes the real backbuffer instead).
 void NukeDiligent::Impl::EnsureBackbufferMS(int w, int h)
 {
-	if (samples <= 1 || w <= 0 || h <= 0) return;
-	if (backbufferMS.colorMS && backbufferMS.w == w && backbufferMS.h == h) return;
-	backbufferMS = RT{};
-	backbufferMS.w = w; backbufferMS.h = h;
-	TextureDesc cm; cm.Name = "Backbuffer Color MS"; cm.Type = RESOURCE_DIM_TEX_2D; cm.Width = (Uint32)w; cm.Height = (Uint32)h;
-	cm.Format = TEX_FORMAT_RGBA8_UNORM; cm.BindFlags = BIND_RENDER_TARGET; cm.SampleCount = samples;
-	device->CreateTexture(cm, nullptr, &backbufferMS.colorMS);
-	if (backbufferMS.colorMS) backbufferMS.rtv = backbufferMS.colorMS->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
-	TextureDesc dm; dm.Name = "Backbuffer Depth MS"; dm.Type = RESOURCE_DIM_TEX_2D; dm.Width = (Uint32)w; dm.Height = (Uint32)h;
-	dm.Format = TEX_FORMAT_D32_FLOAT; dm.BindFlags = BIND_DEPTH_STENCIL; dm.SampleCount = samples;
-	device->CreateTexture(dm, nullptr, &backbufferMS.depthMS);
-	if (backbufferMS.depthMS) backbufferMS.dsv = backbufferMS.depthMS->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
+	if (w <= 0 || h <= 0) return;
+	if (backbufferMS.color && backbufferMS.w == w && backbufferMS.h == h) return;
+	backbufferMS = MakeRT(w, h);
+}
+
+// Final post-process pipeline: fullscreen pass that tonemaps the HDR scene into an LDR target.
+// After swap-chain creation: if the monitor is in HDR mode, switch the swap chain to the HDR10 (PQ, Rec2020)
+// colour space so the backbuffer drives the display as real HDR. Falls back to plain (SDR) on failure.
+void NukeDiligent::Impl::SetupHDROutput()
+{
+	hdr10Active = false;
+	RefCntAutoPtr<ISwapChainD3D11> scD3D11(swapChain.RawPtr(), IID_SwapChainD3D11);
+	if (!scD3D11) return;
+	IDXGISwapChain* dxgi = scD3D11->GetDXGISwapChain();
+	if (!dxgi) return;
+	IDXGISwapChain3* sc3 = nullptr;
+	if (FAILED(dxgi->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&sc3)) || !sc3) return;
+
+	bool displayHDR = false;
+	IDXGIOutput* out = nullptr;
+	if (SUCCEEDED(sc3->GetContainingOutput(&out)) && out)
+	{
+		IDXGIOutput6* out6 = nullptr;
+		if (SUCCEEDED(out->QueryInterface(__uuidof(IDXGIOutput6), (void**)&out6)) && out6)
+		{
+			DXGI_OUTPUT_DESC1 od{};
+			if (SUCCEEDED(out6->GetDesc1(&od)))
+				displayHDR = (od.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+			out6->Release();
+		}
+		out->Release();
+	}
+
+	if (displayHDR)
+	{
+		UINT support = 0;
+		if (SUCCEEDED(sc3->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, &support)) &&
+		    (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) &&
+		    SUCCEEDED(sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)))
+		{
+			hdr10Active = true;
+			IDXGISwapChain4* sc4 = nullptr;
+			if (SUCCEEDED(sc3->QueryInterface(__uuidof(IDXGISwapChain4), (void**)&sc4)) && sc4)
+			{
+				DXGI_HDR_METADATA_HDR10 md{};   // Rec2020 primaries + D65 white, 1000-nit peak (chromaticity * 50000)
+				md.RedPrimary[0]   = 34000; md.RedPrimary[1]   = 16000;
+				md.GreenPrimary[0] = 13250; md.GreenPrimary[1] = 34500;
+				md.BluePrimary[0]  =  7500; md.BluePrimary[1]  =  3000;
+				md.WhitePoint[0]   = 15635; md.WhitePoint[1]   = 16450;
+				md.MaxMasteringLuminance = 1000 * 10000; md.MinMasteringLuminance = 1;
+				md.MaxContentLightLevel = 1000; md.MaxFrameAverageLightLevel = 400;
+				sc4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, sizeof(md), &md);
+				sc4->Release();
+			}
+		}
+	}
+	sc3->Release();
+	cout << "[NukeDiligent]\tHDR10 output " << (hdr10Active ? "ACTIVE" : "off (display not in HDR mode / unsupported)") << endl;
+}
+
+void NukeDiligent::Impl::CreatePostResources()
+{
+	postPSO.Release(); postSRB.Release(); postPSOBB.Release(); postSRBBB.Release(); postCB.Release();   // rebuild-safe
+	std::string vs = shaderSource("post.vs"), ps = shaderSource("post.ps");
+	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tpost shaders missing" << endl; return; }
+	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	RefCntAutoPtr<IShader> v, p;
+	sci.Desc = {"Post VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); device->CreateShader(sci, &v);
+	sci.Desc = {"Post PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &p);
+	if (!v || !p) return;
+
+	BufferDesc cbd; cbd.Name = "PostCB"; cbd.Size = sizeof(float) * 4; cbd.Usage = USAGE_DYNAMIC;
+	cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
+	device->CreateBuffer(cbd, nullptr, &postCB);
+
+	// Build one post PSO per output format: RGBA8 for RT targets, swap-chain format for the backbuffer.
+	auto buildPost = [&](TEXTURE_FORMAT fmt, const char* name,
+	                     RefCntAutoPtr<IPipelineState>& pso, RefCntAutoPtr<IShaderResourceBinding>& srb, IShaderResourceVariable*& var)
+	{
+		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = name;
+		auto& gp = ci.GraphicsPipeline;
+		gp.NumRenderTargets = 1; gp.RTVFormats[0] = fmt;
+		gp.DSVFormat = TEX_FORMAT_UNKNOWN;
+		gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+		gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
+		gp.DepthStencilDesc.DepthEnable = False;
+		gp.InputLayout.NumElements = 0;
+		ShaderResourceVariableDesc vars[] = {{SHADER_TYPE_PIXEL, "g_HDR", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}};
+		ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 1;
+		SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
+		samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP;
+		ImmutableSamplerDesc imm[] = {{SHADER_TYPE_PIXEL, "g_HDR", samp}};
+		ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+		ci.pVS = v; ci.pPS = p;
+		device->CreateGraphicsPipelineState(ci, &pso);
+		if (pso)
+		{
+			if (auto* c = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostCB")) c->Set(postCB);
+			pso->CreateShaderResourceBinding(&srb, true);
+			var = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_HDR");
+		}
+	};
+	buildPost(TEX_FORMAT_RGBA8_UNORM, "Post PSO", postPSO, postSRB, postHdrVar);
+	TEXTURE_FORMAT bbFmt = swapChain ? swapChain->GetDesc().ColorBufferFormat : TEX_FORMAT_RGBA8_UNORM;
+	buildPost(bbFmt, "Post PSO BB", postPSOBB, postSRBBB, postHdrVarBB);
+}
+
+// Tonemap HDR -> output into dstRTV. toBackbuffer picks the backbuffer PSO + (when HDR10 is live) PQ encoding.
+void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV, int w, int h, bool toBackbuffer)
+{
+	IPipelineState*          pso = toBackbuffer ? postPSOBB : postPSO;
+	IShaderResourceBinding*  srb = toBackbuffer ? postSRBBB : postSRB;
+	IShaderResourceVariable* var = toBackbuffer ? postHdrVarBB : postHdrVar;
+	if (!pso || !srb || !hdrSRV || !dstRTV) return;
+	const float mode = !hdr ? 0.0f : ((toBackbuffer && hdr10Active) ? 2.0f : 1.0f);   // 0=passthrough,1=sRGB SDR,2=HDR10 PQ
+	{ MapHelper<float> cb(context, postCB, MAP_WRITE, MAP_FLAG_DISCARD); cb[0] = exposure; cb[1] = mode; cb[2] = 0; cb[3] = 0; }
+	context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+	context->SetViewports(1, &vp, w, h);
+	if (var) var->Set(hdrSRV);
+	context->SetPipelineState(pso);
+	context->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
+	context->Draw(da);
 }
 
 static void glfw_error(int code, const char* desc)
@@ -999,10 +1148,13 @@ int NukeDiligent::init(const WindowDesc& desc)
 	// Match the World PSO + offscreen render targets (RGBA8_UNORM). Diligent defaults the
 	// backbuffer to *_SRGB, which mismatches the world PSO when rendering straight to the
 	// window (the Player) — "RTV format does not match PSO" spam. Keep one format everywhere.
-	SCDesc.ColorBufferFormat = TEX_FORMAT_RGBA8_UNORM;
+	// HDR10 display output (Player): a 10-bit backbuffer carries the PQ-encoded HDR signal. Plain RGBA8 otherwise.
+	SCDesc.ColorBufferFormat = m_impl->hdrOutput ? TEX_FORMAT_RGB10A2_UNORM : TEX_FORMAT_RGBA8_UNORM;
 	pFactory->CreateSwapChainD3D11(m_impl->device, m_impl->context, SCDesc,
 	                               FullScreenModeDesc{}, Window, &m_impl->swapChain);
 	if (!m_impl->swapChain) { cout << "[NukeDiligent]\tswap chain creation failed" << endl; return 1; }
+
+	if (m_impl->hdrOutput) m_impl->SetupHDROutput();   // set the HDR10 colour space if the monitor is in HDR mode
 
 	const SwapChainDesc& scd = m_impl->swapChain->GetDesc();
 	m_impl->CreateUIPipeline(scd.ColorBufferFormat, scd.DepthBufferFormat);
@@ -1039,17 +1191,20 @@ int NukeDiligent::render()
 		m_impl->swapChain->Resize((Uint32)fbw, (Uint32)fbh);
 	}
 
-	// Apply a deferred MSAA change here — between frames, after the previous frame's draw was submitted, so
-	// the RT textures the UI referenced are no longer in any pending draw list.
-	if (m_impl->pendingSamples > 0)
+	// Apply deferred MSAA / HDR changes here — between frames, after the previous frame's draw was submitted,
+	// so the RT textures the UI referenced are no longer in any pending draw list (rebuilding mid-frame frees
+	// them and crashes renderDrawLists). Both flip RTV/texture formats, so one rebuild covers both.
+	if (m_impl->pendingSamples > 0 || m_impl->pendingHDR >= 0)
 	{
-		if ((Uint8)m_impl->pendingSamples != m_impl->samples)
+		bool changed = false;
+		if (m_impl->pendingSamples > 0 && (Uint8)m_impl->pendingSamples != m_impl->samples) { m_impl->samples = (Uint8)m_impl->pendingSamples; changed = true; }
+		if (m_impl->pendingHDR >= 0 && (bool)m_impl->pendingHDR != m_impl->hdr) { m_impl->hdr = m_impl->pendingHDR != 0; changed = true; }
+		if (changed)
 		{
-			m_impl->samples = (Uint8)m_impl->pendingSamples;
 			m_impl->RebuildForMSAA();
-			std::cout << "[NukeDiligent]\tMSAA -> " << (int)m_impl->samples << "x" << std::endl;
+			std::cout << "[NukeDiligent]\tMSAA " << (int)m_impl->samples << "x, HDR " << (m_impl->hdr ? "on" : "off") << std::endl;
 		}
-		m_impl->pendingSamples = -1;
+		m_impl->pendingSamples = -1; m_impl->pendingHDR = -1;
 	}
 
 	// 0) Clear the backbuffer up front. In the editor it's the UI background (the world
@@ -1361,39 +1516,33 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 {
 	m_impl->curTarget = cam.target;   // feedback guard: GetTexSRV won't sample the RT we draw into
 	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
+	m_impl->curPostSrc = nullptr; m_impl->curPostDst = nullptr;
 	const bool ms = m_impl->samples > 1;
 	ITextureView* rtv = nullptr;
 	ITextureView* dsv = nullptr;
 	int w = 0, h = 0;
 	if (cam.target == 0)
 	{
+		// The backbuffer path always renders through an HDR intermediate, then the post pass tonemaps it
+		// into the actual (LDR) swap-chain backbuffer in endCamera.
 		w = (int)m_impl->swapChain->GetDesc().Width;
 		h = (int)m_impl->swapChain->GetDesc().Height;
-		if (ms)   // render into the MS backbuffer, resolve to the real backbuffer in endCamera
-		{
-			m_impl->EnsureBackbufferMS(w, h);
-			rtv = m_impl->backbufferMS.rtv; dsv = m_impl->backbufferMS.dsv;
-			m_impl->curMSAA = true;
-			m_impl->curResolveSrc = m_impl->backbufferMS.colorMS;
-			m_impl->curResolveDst = m_impl->swapChain->GetCurrentBackBufferRTV()->GetTexture();
-		}
-		else
-		{
-			rtv = m_impl->swapChain->GetCurrentBackBufferRTV();
-			dsv = m_impl->swapChain->GetDepthBufferDSV();
-		}
+		m_impl->EnsureBackbufferMS(w, h);
+		Impl::RT& bb = m_impl->backbufferMS;
+		rtv = bb.rtv; dsv = bb.dsv;
+		if (ms) { m_impl->curMSAA = true; m_impl->curResolveSrc = bb.colorMS; m_impl->curResolveDst = bb.color; }
+		m_impl->curPostSrc = bb.hdrSRV;
+		m_impl->curPostDst = m_impl->swapChain->GetCurrentBackBufferRTV();
 	}
 	else
 	{
 		auto it = m_impl->rts.find(cam.target);
 		if (it == m_impl->rts.end()) return;
-		rtv = it->second.rtv; dsv = it->second.dsv; w = it->second.w; h = it->second.h;
-		if (ms && it->second.colorMS)
-		{
-			m_impl->curMSAA = true;
-			m_impl->curResolveSrc = it->second.colorMS;
-			m_impl->curResolveDst = it->second.color;
-		}
+		Impl::RT& rt = it->second;
+		rtv = rt.rtv; dsv = rt.dsv; w = rt.w; h = rt.h;
+		if (ms && rt.colorMS) { m_impl->curMSAA = true; m_impl->curResolveSrc = rt.colorMS; m_impl->curResolveDst = rt.color; }
+		m_impl->curPostSrc = rt.hdrSRV;
+		m_impl->curPostDst = rt.postRTV;
 	}
 	if (!rtv) return;
 	m_impl->curRTV = rtv; m_impl->curRTW = w; m_impl->curRTH = h;   // for the selection-outline pass
@@ -1458,7 +1607,9 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 		fb->shadowParams[3] = 0.0015f;
 		// Sky gradient for IBL (procedural-sky ambient + reflections in the world PS).
 		for (int k = 0; k < 3; ++k) { fb->skyTop[k] = m_impl->sky.top[k]; fb->skyHorizon[k] = m_impl->sky.horizon[k]; fb->skyGround[k] = m_impl->sky.ground[k]; }
-		fb->skyParams[0] = m_impl->sky.skyIntensity; fb->skyParams[1] = (m_impl->sky.mode == 1) ? 1.0f : 0.0f; fb->skyParams[2] = 0; fb->skyParams[3] = 0;
+		fb->skyParams[0] = m_impl->sky.skyIntensity; fb->skyParams[1] = (m_impl->sky.mode == 1) ? 1.0f : 0.0f;
+		fb->skyParams[2] = m_impl->hdr ? 0.0f : 1.0f;   // 1 => world.ps tonemaps inline (HDR off, no post tonemap); 0 => post does it
+		fb->skyParams[3] = 0;
 	}
 
 	m_impl->DrawSky();   // procedural sky behind the scene (after clear, before geometry)
@@ -1612,16 +1763,21 @@ void NukeDiligent::endShadowPass() { /* the next beginCamera rebinds the camera 
 
 void NukeDiligent::endCamera()
 {
-	// Resolve the multisampled color into the single-sample destination (RT's SRV / the backbuffer).
+	// 1) Resolve the multisampled HDR color into the single-sample HDR texture (post-pass input).
 	if (m_impl->curMSAA && m_impl->curResolveSrc && m_impl->curResolveDst)
 	{
 		ResolveTextureSubresourceAttribs ra;
 		ra.SrcTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
 		ra.DstTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
-		ra.Format = TEX_FORMAT_RGBA8_UNORM;
+		ra.Format = m_impl->SceneFmt();
 		m_impl->context->ResolveTextureSubresource(m_impl->curResolveSrc, m_impl->curResolveDst, ra);
 	}
+	// 2) Post-process: tonemap the HDR scene into the output (RT's post texture, or the backbuffer for target 0).
+	if (m_impl->curPostSrc && m_impl->curPostDst)
+		m_impl->RunPostPass(m_impl->curPostSrc, m_impl->curPostDst, m_impl->curRTW, m_impl->curRTH, m_impl->curTarget == 0);
+
 	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
+	m_impl->curPostSrc = nullptr; m_impl->curPostDst = nullptr;
 	m_impl->curTarget = 0;
 }
 
@@ -1638,6 +1794,16 @@ void NukeDiligent::setMSAA(int s)
 }
 
 int NukeDiligent::getMSAA() { return m_impl->pendingSamples > 0 ? m_impl->pendingSamples : (int)m_impl->samples; }
+
+void NukeDiligent::setHDR(bool on)
+{
+	if (!m_impl->device) { m_impl->hdr = on; return; }   // before init: Setup builds at this setting
+	m_impl->pendingHDR = on ? 1 : 0;                       // applied at the start of the next frame (see render())
+}
+bool NukeDiligent::getHDR() { return m_impl->pendingHDR >= 0 ? (m_impl->pendingHDR != 0) : m_impl->hdr; }
+
+void NukeDiligent::setHDROutput(bool on) { m_impl->hdrOutput = on; }   // honoured at init (swap-chain format)
+bool NukeDiligent::getHDROutput() { return m_impl->hdr10Active; }
 
 void NukeDiligent::getViewProj(float* view16, float* proj16)
 {
