@@ -85,7 +85,11 @@ struct NukeDiligent::Impl
 	{
 		RefCntAutoPtr<IPipelineState>         pso;
 		RefCntAutoPtr<IShaderResourceBinding> srb;
-		IShaderResourceVariable*              texVar = nullptr;   // PS "g_Tex" (dynamic)
+		IShaderResourceVariable*              texVar  = nullptr;  // PS "g_Tex"        (base color, dynamic)
+		IShaderResourceVariable*              normVar = nullptr;  // PS "g_Normal"     (normal map, dynamic)
+		IShaderResourceVariable*              mrVar   = nullptr;  // PS "g_MetalRough" (dynamic)
+		IShaderResourceVariable*              aoVar   = nullptr;  // PS "g_Occlusion"  (dynamic)
+		IShaderResourceVariable*              emVar   = nullptr;  // PS "g_Emissive"   (dynamic)
 	};
 	std::unordered_map<uint64_t, WorldPipe> worldPipes;   // shader handle -> pipeline
 	uint64_t                              defaultWorldHandle = 0;   // builtin "world" pipeline
@@ -94,6 +98,14 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>                worldMatCB;  // PS: color + params + custom shader props (shared)
 	static const uint32_t                 kMatCBBytes = 256;   // MatCB capacity (color/params + props)
 	RefCntAutoPtr<ITexture>               whiteTex;    // 1x1 fallback when a material has no texture
+	RefCntAutoPtr<ITexture>               flatNormTex; // 1x1 (0.5,0.5,1) flat normal fallback
+	RefCntAutoPtr<IBuffer>                worldFrameCB;// PS b1: camera pos + ambient + light array (shared)
+	// PBR lighting buffer layout (matches FrameCB in world.ps.hlsl). Each float4 = 16 bytes.
+	static const int                      kMaxLights = 16;
+	struct GPULight { float posType[4]; float dirRange[4]; float colorIntensity[4]; float spot[4]; };
+	struct FrameCBData { float camPos[4]; float ambient[4]; float lightCount[4]; GPULight lights[kMaxLights]; };
+	float                                 curCamPos[3] = {0, 0, 0};  // set in beginCamera (PBR view dir)
+	std::vector<NukeLight>                lights;      // scene lights (setLights); empty -> default sun
 	// Build a world-type PSO (fixed layout/CBs) from VS+PS source; store it under a handle.
 	uint64_t MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg);
 	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; };
@@ -169,7 +181,11 @@ void NukeDiligent::Impl::CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT d
 	auto& GP = PSOCreateInfo.GraphicsPipeline;
 	GP.NumRenderTargets  = 1;
 	GP.RTVFormats[0]     = bbFmt;
-	GP.DSVFormat         = dsFmt;
+	// UI draws with NO depth bound (SetRenderTargets passes a null DSV) and never tests/writes depth,
+	// so the PSO must declare DSVFormat = UNKNOWN — otherwise Diligent warns every frame about a
+	// depth-format mismatch (bound UNKNOWN vs PSO D32_FLOAT). dsFmt is intentionally unused.
+	(void)dsFmt;
+	GP.DSVFormat         = TEX_FORMAT_UNKNOWN;
 	GP.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 	GP.RasterizerDesc.CullMode      = CULL_MODE_NONE;
 	GP.RasterizerDesc.ScissorEnable = True;
@@ -231,6 +247,12 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	mcbd.BindFlags = BIND_UNIFORM_BUFFER; mcbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(mcbd, nullptr, &worldMatCB);
 
+	// PS lighting buffer (camera pos + ambient + light array), bound as a static var on every world PSO.
+	BufferDesc fcbd;
+	fcbd.Name = "World FrameCB"; fcbd.Size = sizeof(FrameCBData); fcbd.Usage = USAGE_DYNAMIC;
+	fcbd.BindFlags = BIND_UNIFORM_BUFFER; fcbd.CPUAccessFlags = CPU_ACCESS_WRITE;
+	device->CreateBuffer(fcbd, nullptr, &worldFrameCB);
+
 	// 1x1 white fallback texture (bound when a material has no texture).
 	uint32_t white = 0xFFFFFFFFu;
 	TextureDesc wd; wd.Type = RESOURCE_DIM_TEX_2D; wd.Width = 1; wd.Height = 1;
@@ -238,6 +260,12 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	TextureSubResData wsr; wsr.pData = &white; wsr.Stride = 4;
 	TextureData wdat; wdat.pSubResources = &wsr; wdat.NumSubresources = 1;
 	device->CreateTexture(wd, &wdat, &whiteTex);
+
+	// 1x1 flat normal (R=128,G=128,B=255 -> +Z), bound when a material has no normal map.
+	uint32_t flatN = 0xFFFF8080u;   // RGBA8 little-endian: R=0x80 G=0x80 B=0xFF A=0xFF
+	TextureSubResData nsr; nsr.pData = &flatN; nsr.Stride = 4;
+	TextureData ndat; ndat.pSubResources = &nsr; ndat.NumSubresources = 1;
+	device->CreateTexture(wd, &ndat, &flatNormTex);
 
 	// Built-in "world" pipeline from the engine shaders.
 	defaultWorldHandle = MakeWorldPSO(shaderSource("world.vs"), shaderSource("world.ps"), "World");
@@ -380,12 +408,18 @@ uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::s
 	gp.InputLayout.NumElements    = 3;
 	gp.InputLayout.LayoutElements = layout;
 
-	ShaderResourceVariableDesc vars[] = {{SHADER_TYPE_PIXEL, "g_Tex", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}};
+	ShaderResourceVariableDesc vars[] = {
+		{SHADER_TYPE_PIXEL, "g_Tex",        SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_Normal",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_MetalRough", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_Occlusion",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_Emissive",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+	};
 	ci.PSODesc.ResourceLayout.Variables    = vars;
-	ci.PSODesc.ResourceLayout.NumVariables = 1;
+	ci.PSODesc.ResourceLayout.NumVariables = 5;
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_WRAP; samp.AddressV = TEXTURE_ADDRESS_WRAP; samp.AddressW = TEXTURE_ADDRESS_WRAP;
-	ImmutableSamplerDesc immSamp[] = {{SHADER_TYPE_PIXEL, "g_Tex", samp}};
+	ImmutableSamplerDesc immSamp[] = {{SHADER_TYPE_PIXEL, "g_Tex", samp}};   // one shared sampler for all maps
 	ci.PSODesc.ResourceLayout.ImmutableSamplers    = immSamp;
 	ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
 	ci.pVS = vs; ci.pPS = ps;
@@ -393,10 +427,15 @@ uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::s
 	WorldPipe wp;
 	device->CreateGraphicsPipelineState(ci, &wp.pso);
 	if (!wp.pso) { cout << "[NukeDiligent]\tPSO build failed for shader '" << dbg << "'" << endl; return 0; }
-	if (auto* v = wp.pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))    v->Set(worldCB);
-	if (auto* m = wp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB")) m->Set(worldMatCB);
+	if (auto* v = wp.pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))      v->Set(worldCB);
+	if (auto* m = wp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB"))   m->Set(worldMatCB);
+	if (auto* f = wp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "FrameCB")) f->Set(worldFrameCB);
 	wp.pso->CreateShaderResourceBinding(&wp.srb, true);
-	wp.texVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
+	wp.texVar  = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
+	wp.normVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
+	wp.mrVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
+	wp.aoVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Occlusion");
+	wp.emVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Emissive");
 
 	uint64_t h = nextShaderHandle++;
 	worldPipes[h] = std::move(wp);
@@ -704,13 +743,23 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 		cb->wvp = wvp; cb->world = world;
 	}
 
-	// Material: base color + diffuse texture (white fallback when none).
+	// Material: base color + PBR maps/params (fallbacks when none).
 	float col[4] = { 1, 1, 1, 1 };
-	ITextureView* srv = nullptr;
+	float metallic = 0.0f, roughness = 0.6f;
+	float emissive[3] = { 0, 0, 0 }, emissiveI = 0.0f;
+	ITextureView* srv = nullptr; ITextureView* nsrv = nullptr;
+	ITextureView* mrsrv = nullptr; ITextureView* aosrv = nullptr; ITextureView* emsrv = nullptr;
 	if (mat)
 	{
-		for (int i = 0; i < 4; ++i) col[i] = mat->color[i];
-		if (mat->diff) srv = m_impl->GetTexSRV(mat->diff);
+		col[0] = (float)mat->color.r; col[1] = (float)mat->color.g; col[2] = (float)mat->color.b; col[3] = (float)mat->color.a;
+		metallic = mat->metallic; roughness = mat->roughness;
+		emissive[0] = (float)mat->emissive.r; emissive[1] = (float)mat->emissive.g; emissive[2] = (float)mat->emissive.b;
+		emissiveI = mat->emissiveIntensity;
+		if (mat->diff) srv   = m_impl->GetTexSRV(mat->diff);
+		if (mat->norm) nsrv  = m_impl->GetTexSRV(mat->norm);
+		if (mat->mr)   mrsrv = m_impl->GetTexSRV(mat->mr);
+		if (mat->ao)   aosrv = m_impl->GetTexSRV(mat->ao);
+		if (mat->em)   emsrv = m_impl->GetTexSRV(mat->em);
 	}
 	// Pick the pipeline for this material's shader (fallback to the built-in "world" pipeline).
 	uint64_t h = (mat && mat->shader && mat->shader->rendererHandle) ? mat->shader->rendererHandle
@@ -728,8 +777,12 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 		Uint8* p = mb;
 		memset(p, 0, Impl::kMatCBBytes);
 		memcpy(p + 0, col, sizeof(float) * 4);
-		float prm[4] = { srv ? 1.0f : 0.0f, 0, 0, 0 };
-		memcpy(p + 16, prm, sizeof(float) * 4);
+		float prm[4] = { srv ? 1.0f : 0.0f, nsrv ? 1.0f : 0.0f, metallic, roughness };
+		memcpy(p + 16, prm, sizeof(float) * 4);   // g_Params (hasBase, hasNormal, metallic, roughness)
+		float prm2[4] = { mrsrv ? 1.0f : 0.0f, aosrv ? 1.0f : 0.0f, emsrv ? 1.0f : 0.0f, 1.0f };
+		memcpy(p + 32, prm2, sizeof(float) * 4);  // g_Params2 (hasMR, hasAO, hasEm, aoStrength)
+		float emv[4] = { emissive[0], emissive[1], emissive[2], emissiveI };
+		memcpy(p + 48, emv, sizeof(float) * 4);   // g_Emissive2 (rgb, intensity)
 		if (mat && mat->shader)
 			for (const nuke::ShaderProp& sp : mat->shader->props)
 			{
@@ -744,6 +797,12 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 
 	if (wp.texVar)
 		wp.texVar->Set(srv ? srv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	ITextureView* whiteSRV = m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+	if (wp.normVar)
+		wp.normVar->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	if (wp.mrVar) wp.mrVar->Set(mrsrv ? mrsrv : whiteSRV);
+	if (wp.aoVar) wp.aoVar->Set(aosrv ? aosrv : whiteSRV);
+	if (wp.emVar) wp.emVar->Set(emsrv ? emsrv : whiteSRV);
 
 	IDeviceContext* ctx = m_impl->context;
 	IBuffer* vbs[]    = { g.pos, g.nrm, g.uv };
@@ -953,6 +1012,39 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 		R.z, U.z, F.z, 0.f,
 		-dot(P, R), -dot(P, U), -dot(P, F), 1.f);
 	m_impl->curProj = float4x4::Projection(cam.fov, aspect, cam.nearZ, cam.farZ, false);
+
+	// PBR lighting buffer for this pass: camera pos + ambient + scene lights (default sun if none).
+	m_impl->curCamPos[0] = P.x; m_impl->curCamPos[1] = P.y; m_impl->curCamPos[2] = P.z;
+	{
+		MapHelper<Impl::FrameCBData> fb(m_impl->context, m_impl->worldFrameCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		memset(fb, 0, sizeof(Impl::FrameCBData));
+		fb->camPos[0] = P.x; fb->camPos[1] = P.y; fb->camPos[2] = P.z;
+		fb->ambient[0] = 0.5f; fb->ambient[1] = 0.55f; fb->ambient[2] = 0.6f; fb->ambient[3] = 0.35f;
+
+		std::vector<NukeLight> src = m_impl->lights;
+		if (src.empty())   // default directional "sun"
+		{
+			NukeLight sun; sun.type = 0;
+			sun.dir[0] = -0.4f; sun.dir[1] = -0.85f; sun.dir[2] = -0.35f;
+			sun.color[0] = sun.color[1] = sun.color[2] = 1.0f; sun.intensity = 3.0f;
+			src.push_back(sun);
+		}
+		int n = (int)src.size(); if (n > Impl::kMaxLights) n = Impl::kMaxLights;
+		fb->lightCount[0] = (float)n;
+		for (int k = 0; k < n; ++k)
+		{
+			const NukeLight& L = src[k]; Impl::GPULight& g = fb->lights[k];
+			g.posType[0] = L.pos[0]; g.posType[1] = L.pos[1]; g.posType[2] = L.pos[2]; g.posType[3] = (float)L.type;
+			g.dirRange[0] = L.dir[0]; g.dirRange[1] = L.dir[1]; g.dirRange[2] = L.dir[2]; g.dirRange[3] = L.range;
+			g.colorIntensity[0] = L.color[0]; g.colorIntensity[1] = L.color[1]; g.colorIntensity[2] = L.color[2]; g.colorIntensity[3] = L.intensity;
+			g.spot[0] = L.spotInner; g.spot[1] = L.spotOuter;
+		}
+	}
+}
+
+void NukeDiligent::setLights(const NukeLight* lights, int count)
+{
+	m_impl->lights.assign(lights ? lights : nullptr, (lights && count > 0) ? lights + count : nullptr);
 }
 
 void NukeDiligent::endCamera() {}

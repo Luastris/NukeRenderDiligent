@@ -32,6 +32,7 @@ public:
 	bool isMouseButtonDown(int button) override;
 	void bindRenderTarget(uint64_t rtId) override;
 	void invalidateTexture(Texture* t) override;
+	void setLights(const NukeLight* lights, int count) override;
 	void loop() override;
 	void deinit() override;
 	void update() override;
