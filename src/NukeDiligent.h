@@ -40,6 +40,7 @@ public:
 	bool getHDR() override;
 	void setHDROutput(bool on) override;
 	bool getHDROutput() override;
+	void setHDRNits(float paperWhite, float peak) override;
 	uint64_t createPostPipeline(const char* name, const char* ps) override;
 	void     setPostChain(const NukePostStage* stages, int count) override;
 	void setOnFileDrop(bst::function<void(const char*)> cb) override;

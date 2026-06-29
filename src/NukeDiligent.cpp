@@ -139,6 +139,8 @@ struct NukeDiligent::Impl
 	void RunBloom(ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, float threshold, float intensity);
 	bool                                  hdrOutput = false;   // requested HDR10 display output (Player only, before init)
 	bool                                  hdr10Active = false; // an HDR10 swap chain is actually live (display is HDR)
+	float                                 hdrPaperWhite = 200.0f;   // diffuse-white nits for the HDR10 encode
+	float                                 hdrPeak = 1000.0f;        // highlight peak nits
 	void CreatePostResources();
 	void RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV, int w, int h, bool toBackbuffer);
 	void SetupHDROutput();   // after swap-chain creation: set the HDR10 colour space if the display supports it
@@ -1093,6 +1095,7 @@ void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV,
 		MapHelper<float> cb(context, postCB, MAP_WRITE, MAP_FLAG_DISCARD);   // final pass = tonemap/encode ONLY
 		for (int k = 0; k < 8; ++k) cb[k] = 0.0f;
 		cb[1] = mode;
+		cb[2] = hdrPaperWhite; cb[3] = hdrPeak;   // HDR10 mapping (post.ps mode 2)
 	}
 	context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
@@ -2059,6 +2062,12 @@ void NukeDiligent::setHDROutput(bool on)
 #endif
 }
 bool NukeDiligent::getHDROutput() { return m_impl->hdr10Active; }
+
+void NukeDiligent::setHDRNits(float paperWhite, float peak)
+{
+	m_impl->hdrPaperWhite = paperWhite > 1.0f ? paperWhite : 1.0f;
+	m_impl->hdrPeak = peak > m_impl->hdrPaperWhite ? peak : m_impl->hdrPaperWhite;
+}
 
 void NukeDiligent::getViewProj(float* view16, float* proj16)
 {
