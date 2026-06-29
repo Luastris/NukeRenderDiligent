@@ -137,6 +137,28 @@ struct NukeDiligent::Impl
 	int                                   bloomW = 0, bloomH = 0;
 	void EnsureBloom(int w, int h);
 	void RunBloom(ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, float threshold, float intensity);
+
+	// --- Reflection probe: scene-captured HDR cubemaps ----------------------------------------------
+	struct CubeRT
+	{
+		RefCntAutoPtr<ITexture>     color;      // RGBA16F cube (6 faces, full mip chain), GenerateMips for rough refl
+		RefCntAutoPtr<ITexture>     depth;      // shared D32 per face
+		RefCntAutoPtr<ITextureView> faceRTV[6]; // mip-0 RTV per face (CreateView-owned)
+		RefCntAutoPtr<ITextureView> dsv;
+		ITextureView*               srv = nullptr;   // cube SRV (default view, texture-owned)
+		int res = 0, mips = 1;
+		bool fmtHdr = true;   // which SceneFmt the cube was built with (rebuild on HDR toggle to match world PSO)
+	};
+	std::unordered_map<uint64_t, CubeRT> cubes;
+	void BuildCube(CubeRT& c, int res);   // (re)create the cube GPU resources at the current SceneFmt()
+	RefCntAutoPtr<ITexture>              fallbackCube;     // 1x1 cube bound to g_Probe when no probe is active
+	ITextureView*                        fallbackCubeSRV = nullptr;
+	RefCntAutoPtr<ISampler>              probeSampler;     // linear-clamp; attached to probe/fallback cube SRVs
+	bool        probeActive = false;     // a probe cube is bound (and not currently capturing)
+	ITextureView* probeCubeSRV = nullptr;
+	float       probePos[3] = {0,0,0};
+	float       probeIntensity = 1.0f;
+	float       probeMaxMip = 0.0f;
 	bool                                  hdrOutput = false;   // requested HDR10 display output (Player only, before init)
 	bool                                  hdr10Active = false; // an HDR10 swap chain is actually live (display is HDR)
 	float                                 hdrPaperWhite = 200.0f;   // diffuse-white nits for the HDR10 encode
@@ -163,6 +185,7 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              emVar   = nullptr;  // PS "g_Emissive"   (dynamic)
 		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
+		IShaderResourceVariable*              probeVar  = nullptr;// PS "g_Probe" (reflection cubemap, dynamic)
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on an MSAA change)
 	};
 	std::unordered_map<uint64_t, WorldPipe> worldPipes;   // shader handle -> pipeline
@@ -179,7 +202,9 @@ struct NukeDiligent::Impl
 	struct GPULight { float posType[4]; float dirRange[4]; float colorIntensity[4]; float spot[4]; };
 	struct FrameCBData { float camPos[4]; float ambient[4]; float lightCount[4]; GPULight lights[kMaxLights];
 	                     float shadowVP[16 * 4]; float shadowParams[4];        // 4 = SHADOW_SLOTS
-	                     float skyTop[4]; float skyHorizon[4]; float skyGround[4]; float skyParams[4]; };  // IBL
+	                     float skyTop[4]; float skyHorizon[4]; float skyGround[4]; float skyParams[4];      // IBL
+	                     float probePos[4]; float probeParams[4]; };   // reflection probe: pos.xyz+active, intensity+maxMip
+	void WriteFrameCB(const Diligent::float3& P);   // fill worldFrameCB (lights/shadows/sky/probe) — shared by camera + cube-face passes
 	float                                 curCamPos[3] = {0, 0, 0};  // set in beginCamera (PBR view dir)
 	uint64_t                              curTarget = 0;             // RT id bound by beginCamera (feedback guard)
 	std::vector<NukeLight>                lights;      // scene lights (setLights); empty -> default sun
@@ -389,6 +414,25 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	TextureData ndat; ndat.pSubResources = &nsr; ndat.NumSubresources = 1;
 	device->CreateTexture(wd, &ndat, &flatNormTex);
 
+	// Probe sampler (linear, clamp) — attached to each probe/fallback cube SRV (combined-texture-samplers mode
+	// reads it from the view), so g_Probe needs NO immutable sampler in the world PSO (custom shaders may omit it).
+	{
+		SamplerDesc ps; ps.MinFilter = FILTER_TYPE_LINEAR; ps.MagFilter = FILTER_TYPE_LINEAR; ps.MipFilter = FILTER_TYPE_LINEAR;
+		ps.AddressU = TEXTURE_ADDRESS_CLAMP; ps.AddressV = TEXTURE_ADDRESS_CLAMP; ps.AddressW = TEXTURE_ADDRESS_CLAMP;
+		device->CreateSampler(ps, &probeSampler);
+	}
+	// 1x1 black cube — bound to g_Probe when no reflection probe is active (so the var is always valid).
+	{
+		uint16_t blackF16[4] = { 0, 0, 0, 0x3C00 };   // half (0,0,0,1)
+		TextureDesc cd; cd.Name = "Fallback Cube"; cd.Type = RESOURCE_DIM_TEX_CUBE; cd.Width = 1; cd.Height = 1;
+		cd.ArraySize = 6; cd.MipLevels = 1; cd.Format = HDR_FMT; cd.BindFlags = BIND_SHADER_RESOURCE; cd.Usage = USAGE_IMMUTABLE;
+		TextureSubResData subs[6]; for (int f = 0; f < 6; ++f) { subs[f].pData = blackF16; subs[f].Stride = 8; }
+		TextureData cdat; cdat.pSubResources = subs; cdat.NumSubresources = 6;
+		device->CreateTexture(cd, &cdat, &fallbackCube);
+		if (fallbackCube) { fallbackCubeSRV = fallbackCube->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+			if (fallbackCubeSRV && probeSampler) fallbackCubeSRV->SetSampler(probeSampler); }
+	}
+
 	// Clamp the requested MSAA to what the device supports for BOTH color (RGBA8) and depth (D32),
 	// stepping 8->4->2->1. SampleCounts is a bitmask where the bit value equals the sample count.
 	{
@@ -552,14 +596,15 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		{SHADER_TYPE_PIXEL, "g_Emissive",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Shadow",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_ShadowCube", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_Probe",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // reflection probe cubemap
 	};
 	ci.PSODesc.ResourceLayout.Variables    = vars;
-	ci.PSODesc.ResourceLayout.NumVariables = 7;
+	ci.PSODesc.ResourceLayout.NumVariables = 8;
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_WRAP; samp.AddressV = TEXTURE_ADDRESS_WRAP; samp.AddressW = TEXTURE_ADDRESS_WRAP;
-	ImmutableSamplerDesc immSamp[] = {{SHADER_TYPE_PIXEL, "g_Tex", samp}};   // shared sampler for material maps;
-	ci.PSODesc.ResourceLayout.ImmutableSamplers    = immSamp;                // the shadow comparison sampler is
-	ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;                      // attached to the shadow SRV instead
+	ImmutableSamplerDesc immSamp[] = {{SHADER_TYPE_PIXEL, "g_Tex", samp}};   // shared sampler for material maps; the
+	ci.PSODesc.ResourceLayout.ImmutableSamplers    = immSamp;                // shadow + probe samplers are attached
+	ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;                      // to their SRVs (custom shaders may omit them)
 	ci.pVS = vs; ci.pPS = ps;
 
 	auto setStatics = [&](IPipelineState* pso) {
@@ -606,6 +651,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.emVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Emissive");
 	wp.shadowVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Shadow");
 	wp.cubeVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ShadowCube");
+	wp.probeVar  = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Probe");
 	return true;
 }
 
@@ -1557,6 +1603,7 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	if (wp.emVar) wp.emVar->Set(emsrv ? emsrv : whiteSRV);
 	if (wp.shadowVar) wp.shadowVar->Set(m_impl->shadowSRV ? m_impl->shadowSRV : whiteSRV);
 	if (wp.cubeVar && m_impl->shadowCubeSRV) wp.cubeVar->Set(m_impl->shadowCubeSRV);
+	if (wp.probeVar) wp.probeVar->Set((m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV);
 
 	IDeviceContext* ctx = m_impl->context;
 	IBuffer* vbs[]    = { g.pos, g.nrm, g.uv };
@@ -1727,6 +1774,45 @@ uint64_t NukeDiligent::getRenderTargetTexture(uint64_t id)
 	return (it == m_impl->rts.end()) ? 0 : reinterpret_cast<uint64_t>(it->second.srv);
 }
 
+// Fill the world FrameCB (camera pos, ambient, lights, shadow maps/params, sky IBL, reflection probe).
+// Shared by the camera pass and the probe cube-face passes (no duplication).
+void NukeDiligent::Impl::WriteFrameCB(const float3& P)
+{
+	MapHelper<FrameCBData> fb(context, worldFrameCB, MAP_WRITE, MAP_FLAG_DISCARD);
+	memset(fb, 0, sizeof(FrameCBData));
+	fb->camPos[0] = P.x; fb->camPos[1] = P.y; fb->camPos[2] = P.z;
+	fb->ambient[0] = sky.ambient[0]; fb->ambient[1] = sky.ambient[1];
+	fb->ambient[2] = sky.ambient[2]; fb->ambient[3] = sky.ambientIntensity;
+
+	std::vector<NukeLight> src = lights;
+	if (src.empty())
+	{
+		NukeLight sun; sun.type = 0; sun.dir[0] = -0.4f; sun.dir[1] = -0.85f; sun.dir[2] = -0.35f;
+		sun.color[0] = sun.color[1] = sun.color[2] = 1.0f; sun.intensity = 3.0f; src.push_back(sun);
+	}
+	int n = (int)src.size(); if (n > kMaxLights) n = kMaxLights;
+	fb->lightCount[0] = (float)n;
+	for (int k = 0; k < n; ++k)
+	{
+		const NukeLight& L = src[k]; GPULight& g = fb->lights[k];
+		g.posType[0] = L.pos[0]; g.posType[1] = L.pos[1]; g.posType[2] = L.pos[2]; g.posType[3] = (float)L.type;
+		g.dirRange[0] = L.dir[0]; g.dirRange[1] = L.dir[1]; g.dirRange[2] = L.dir[2]; g.dirRange[3] = L.range;
+		g.colorIntensity[0] = L.color[0]; g.colorIntensity[1] = L.color[1]; g.colorIntensity[2] = L.color[2]; g.colorIntensity[3] = L.intensity;
+		g.spot[0] = L.spotInner; g.spot[1] = L.spotOuter; g.spot[2] = (float)lightSlot[k]; g.spot[3] = (float)lightCube[k];
+	}
+	for (int s = 0; s < SHADOW_SLOTS; ++s) memcpy(fb->shadowVP + s * 16, &slotVP[s], sizeof(float) * 16);
+	fb->shadowParams[0] = (float)numShadowSlots;
+	fb->shadowParams[1] = shadowNormalBias;
+	fb->shadowParams[2] = (1.0f / (float)shadowRes) * shadowSoftness;
+	fb->shadowParams[3] = shadowDepthBias;
+	for (int k = 0; k < 3; ++k) { fb->skyTop[k] = sky.top[k]; fb->skyHorizon[k] = sky.horizon[k]; fb->skyGround[k] = sky.ground[k]; }
+	fb->skyParams[0] = sky.skyIntensity; fb->skyParams[1] = (sky.mode == 1) ? 1.0f : 0.0f;
+	fb->skyParams[2] = hdr ? 0.0f : 1.0f; fb->skyParams[3] = 0;
+	const bool probe = probeActive && probeCubeSRV;   // off during the probe's own capture -> no feedback
+	fb->probePos[0] = probePos[0]; fb->probePos[1] = probePos[1]; fb->probePos[2] = probePos[2]; fb->probePos[3] = probe ? 1.0f : 0.0f;
+	fb->probeParams[0] = probeIntensity; fb->probeParams[1] = probeMaxMip; fb->probeParams[2] = 0; fb->probeParams[3] = 0;
+}
+
 void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 {
 	m_impl->curTarget = cam.target;   // feedback guard: GetTexSRV won't sample the RT we draw into
@@ -1786,46 +1872,7 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 
 	// PBR lighting buffer for this pass: camera pos + ambient + scene lights (default sun if none).
 	m_impl->curCamPos[0] = P.x; m_impl->curCamPos[1] = P.y; m_impl->curCamPos[2] = P.z;
-	{
-		MapHelper<Impl::FrameCBData> fb(m_impl->context, m_impl->worldFrameCB, MAP_WRITE, MAP_FLAG_DISCARD);
-		memset(fb, 0, sizeof(Impl::FrameCBData));
-		fb->camPos[0] = P.x; fb->camPos[1] = P.y; fb->camPos[2] = P.z;
-		fb->ambient[0] = m_impl->sky.ambient[0]; fb->ambient[1] = m_impl->sky.ambient[1];
-		fb->ambient[2] = m_impl->sky.ambient[2]; fb->ambient[3] = m_impl->sky.ambientIntensity;
-
-		std::vector<NukeLight> src = m_impl->lights;
-		if (src.empty())   // default directional "sun"
-		{
-			NukeLight sun; sun.type = 0;
-			sun.dir[0] = -0.4f; sun.dir[1] = -0.85f; sun.dir[2] = -0.35f;
-			sun.color[0] = sun.color[1] = sun.color[2] = 1.0f; sun.intensity = 3.0f;
-			src.push_back(sun);
-		}
-		int n = (int)src.size(); if (n > Impl::kMaxLights) n = Impl::kMaxLights;
-		fb->lightCount[0] = (float)n;
-		for (int k = 0; k < n; ++k)
-		{
-			const NukeLight& L = src[k]; Impl::GPULight& g = fb->lights[k];
-			g.posType[0] = L.pos[0]; g.posType[1] = L.pos[1]; g.posType[2] = L.pos[2]; g.posType[3] = (float)L.type;
-			g.dirRange[0] = L.dir[0]; g.dirRange[1] = L.dir[1]; g.dirRange[2] = L.dir[2]; g.dirRange[3] = L.range;
-			g.colorIntensity[0] = L.color[0]; g.colorIntensity[1] = L.color[1]; g.colorIntensity[2] = L.color[2]; g.colorIntensity[3] = L.intensity;
-			g.spot[0] = L.spotInner; g.spot[1] = L.spotOuter;
-			g.spot[2] = (float)m_impl->lightSlot[k];   // 2D shadow-map slot (-1 = none)
-			g.spot[3] = (float)m_impl->lightCube[k];   // point-light cube index (-1 = none)
-		}
-		// Shadow maps: per-slot world->light-clip array + params for the world PS.
-		for (int s = 0; s < Impl::SHADOW_SLOTS; ++s)
-			memcpy(fb->shadowVP + s * 16, &m_impl->slotVP[s], sizeof(float) * 16);
-		fb->shadowParams[0] = (float)m_impl->numShadowSlots;
-		fb->shadowParams[1] = m_impl->shadowNormalBias;                              // world-units offset along N
-		fb->shadowParams[2] = (1.0f / (float)m_impl->shadowRes) * m_impl->shadowSoftness;  // PCF step (softness)
-		fb->shadowParams[3] = m_impl->shadowDepthBias;
-		// Sky gradient for IBL (procedural-sky ambient + reflections in the world PS).
-		for (int k = 0; k < 3; ++k) { fb->skyTop[k] = m_impl->sky.top[k]; fb->skyHorizon[k] = m_impl->sky.horizon[k]; fb->skyGround[k] = m_impl->sky.ground[k]; }
-		fb->skyParams[0] = m_impl->sky.skyIntensity; fb->skyParams[1] = (m_impl->sky.mode == 1) ? 1.0f : 0.0f;
-		fb->skyParams[2] = m_impl->hdr ? 0.0f : 1.0f;   // 1 => world.ps tonemaps inline (HDR off, no post tonemap); 0 => post does it
-		fb->skyParams[3] = 0;
-	}
+	m_impl->WriteFrameCB(P);
 
 	m_impl->DrawSky();   // procedural sky behind the scene (after clear, before geometry)
 }
@@ -2092,6 +2139,103 @@ void NukeDiligent::setHDRNits(float paperWhite, float peak)
 {
 	m_impl->hdrPaperWhite = paperWhite > 1.0f ? paperWhite : 1.0f;
 	m_impl->hdrPeak = peak > m_impl->hdrPaperWhite ? peak : m_impl->hdrPaperWhite;
+}
+
+// (Re)create a probe cube's GPU resources at the CURRENT scene format (SceneFmt) so capture into it matches
+// the geometry PSOs' RTV format. Rebuild-safe (releases prior objects -> no Diligent overwrite assert).
+void NukeDiligent::Impl::BuildCube(CubeRT& c, int res)
+{
+	res = res < 16 ? 16 : (res > 1024 ? 1024 : res);
+	c.color.Release(); c.depth.Release(); c.dsv.Release();
+	for (auto& v : c.faceRTV) v.Release();
+	c.srv = nullptr;
+	c.res = res; c.fmtHdr = hdr;
+	int mips = 1; { int s = res; while (s > 1) { s >>= 1; ++mips; } } c.mips = mips;
+
+	TextureDesc cd; cd.Name = "Probe Cube"; cd.Type = RESOURCE_DIM_TEX_CUBE; cd.Width = (Uint32)res; cd.Height = (Uint32)res;
+	cd.ArraySize = 6; cd.MipLevels = (Uint32)mips; cd.Format = SceneFmt();   // match the world/Shader PSO RTV
+	cd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE; cd.MiscFlags = MISC_TEXTURE_FLAG_GENERATE_MIPS;
+	device->CreateTexture(cd, nullptr, &c.color);
+	if (!c.color) return;
+	c.srv = c.color->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+	if (c.srv && probeSampler) c.srv->SetSampler(probeSampler);   // combined-texture-samplers reads it from the view
+	for (int f = 0; f < 6; ++f)
+	{
+		TextureViewDesc vd; vd.Name = "Probe face RTV"; vd.ViewType = TEXTURE_VIEW_RENDER_TARGET;
+		vd.TextureDim = RESOURCE_DIM_TEX_2D_ARRAY; vd.FirstArraySlice = (Uint32)f; vd.NumArraySlices = 1;
+		vd.MostDetailedMip = 0; vd.NumMipLevels = 1;
+		c.color->CreateView(vd, &c.faceRTV[f]);
+	}
+	TextureDesc dd; dd.Name = "Probe Depth"; dd.Type = RESOURCE_DIM_TEX_2D; dd.Width = (Uint32)res; dd.Height = (Uint32)res;
+	dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL;
+	device->CreateTexture(dd, nullptr, &c.depth);
+	if (c.depth) c.dsv = c.depth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
+}
+
+uint64_t NukeDiligent::createReflectionCube(int resolution)
+{
+	if (!m_impl->device) return 0;
+	uint64_t id = ++m_impl->rtCounter;
+	Impl::CubeRT& c = m_impl->cubes[id];
+	m_impl->BuildCube(c, resolution);
+	if (!c.color) { m_impl->cubes.erase(id); return 0; }
+	return id;
+}
+
+void NukeDiligent::beginCubeFace(uint64_t cube, int face, const float pos[3], float nearZ, float farZ)
+{
+	auto it = m_impl->cubes.find(cube);
+	if (it == m_impl->cubes.end() || face < 0 || face > 5) return;
+	Impl::CubeRT& c = it->second;
+	if (c.fmtHdr != m_impl->hdr) m_impl->BuildCube(c, c.res);   // HDR toggled -> rebuild to match the geometry PSO
+	if (!c.faceRTV[face] || !c.dsv) return;
+	m_impl->probeActive = false;   // never sample the probe while capturing it (analytic IBL) -> no feedback
+	m_impl->curTarget = 0;
+
+	// D3D cube-face orientations (look dir + up), so the captured faces match TextureCube sampling.
+	static const float3 F6[6] = { { 1,0,0}, {-1,0,0}, {0, 1,0}, {0,-1,0}, {0,0, 1}, {0,0,-1} };
+	static const float3 U6[6] = { { 0,1,0}, { 0,1,0}, {0,0,-1}, {0,0, 1}, {0,1, 0}, {0,1, 0} };
+	float3 P(pos[0], pos[1], pos[2]);
+	float3 F = F6[face], U = U6[face], R = normalize(cross(U, F)); U = cross(F, R);
+	m_impl->curView = float4x4(R.x,U.x,F.x,0, R.y,U.y,F.y,0, R.z,U.z,F.z,0, -dot(P,R),-dot(P,U),-dot(P,F),1);
+	m_impl->curProj = float4x4::Projection(1.5707963f, 1.0f, nearZ, farZ, false);   // 90deg, square
+	m_impl->curCamPos[0] = P.x; m_impl->curCamPos[1] = P.y; m_impl->curCamPos[2] = P.z;
+	m_impl->curRTV = c.faceRTV[face]; m_impl->curRTW = c.res; m_impl->curRTH = c.res;
+
+	IDeviceContext* ctx = m_impl->context;
+	ITextureView* rtv = c.faceRTV[face];
+	ctx->SetRenderTargets(1, &rtv, c.dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	const float clr[4] = { 0, 0, 0, 1 };
+	ctx->ClearRenderTarget(rtv, clr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ctx->ClearDepthStencil(c.dsv, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)c.res; vp.Height = (float)c.res; vp.MinDepth = 0; vp.MaxDepth = 1;
+	ctx->SetViewports(1, &vp, c.res, c.res);
+
+	m_impl->WriteFrameCB(P);   // probe off (probeActive=false) -> analytic IBL during capture
+	m_impl->DrawSky();
+}
+
+void NukeDiligent::endCubeFace(uint64_t cube, int face)
+{
+	if (face != 5) return;   // all six faces captured -> build the mip chain for rough reflections
+	auto it = m_impl->cubes.find(cube);
+	if (it != m_impl->cubes.end() && it->second.srv)
+		m_impl->context->GenerateMips(it->second.srv);
+}
+
+void NukeDiligent::setReflectionProbe(uint64_t cube, const float pos[3], float intensity, float farZ)
+{
+	(void)farZ;
+	auto it = (cube != 0) ? m_impl->cubes.find(cube) : m_impl->cubes.end();
+	if (it != m_impl->cubes.end() && it->second.srv)
+	{
+		m_impl->probeActive = true;
+		m_impl->probeCubeSRV = it->second.srv;
+		m_impl->probePos[0] = pos[0]; m_impl->probePos[1] = pos[1]; m_impl->probePos[2] = pos[2];
+		m_impl->probeIntensity = intensity;
+		m_impl->probeMaxMip = (float)(it->second.mips - 1);
+	}
+	else { m_impl->probeActive = false; m_impl->probeCubeSRV = nullptr; }
 }
 
 void NukeDiligent::setShadowSettings(int resolution, float distance, float depthBias, float normalBias, float softness)

@@ -42,6 +42,10 @@ public:
 	bool getHDROutput() override;
 	void setHDRNits(float paperWhite, float peak) override;
 	void setShadowSettings(int resolution, float distance, float depthBias, float normalBias, float softness) override;
+	uint64_t createReflectionCube(int resolution) override;
+	void beginCubeFace(uint64_t cube, int face, const float pos[3], float nearZ, float farZ) override;
+	void endCubeFace(uint64_t cube, int face) override;
+	void setReflectionProbe(uint64_t cube, const float pos[3], float intensity, float farZ) override;
 	uint64_t createPostPipeline(const char* name, const char* ps) override;
 	void     setPostChain(const NukePostStage* stages, int count) override;
 	void setOnFileDrop(bst::function<void(const char*)> cb) override;
