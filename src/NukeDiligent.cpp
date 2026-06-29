@@ -112,7 +112,17 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>                postCB;
 	IShaderResourceVariable*              postHdrVar = nullptr;
 	IShaderResourceVariable*              postHdrVarBB = nullptr;
-	float                                 exposure = 1.0f;
+	// Custom post-effect chain (one fullscreen pipeline per effect; ping-ponged in HDR before the final tonemap).
+	struct PostPipe { RefCntAutoPtr<IPipelineState> pso; RefCntAutoPtr<IShaderResourceBinding> srb; IShaderResourceVariable* srcVar = nullptr; };
+	std::unordered_map<uint64_t, PostPipe> postPipes;
+	RefCntAutoPtr<IBuffer>                postParamsCB;   // shared PostParams (per-effect params, 256B)
+	RefCntAutoPtr<IBuffer>                postFrameCB;    // shared PostFrame (resolution / time)
+	RefCntAutoPtr<ITexture>               scratch[2];     // HDR ping-pong targets for the effect chain
+	int                                   scratchW = 0, scratchH = 0;
+	struct ChainStage { uint64_t pipeline; std::vector<float> params; };
+	std::vector<ChainStage>               postChain;      // current camera's effect chain (copied in setPostChain)
+	uint64_t CreatePostPipe(const std::string& ps);
+	void     EnsureScratch(int w, int h);
 	bool                                  hdrOutput = false;   // requested HDR10 display output (Player only, before init)
 	bool                                  hdr10Active = false; // an HDR10 swap chain is actually live (display is HDR)
 	void CreatePostResources();
@@ -980,9 +990,13 @@ void NukeDiligent::Impl::CreatePostResources()
 	sci.Desc = {"Post PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &p);
 	if (!v || !p) return;
 
-	BufferDesc cbd; cbd.Name = "PostCB"; cbd.Size = sizeof(float) * 4; cbd.Usage = USAGE_DYNAMIC;
+	BufferDesc cbd; cbd.Name = "PostCB"; cbd.Size = sizeof(float) * 8; cbd.Usage = USAGE_DYNAMIC;   // g_Post + g_Grade
 	cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(cbd, nullptr, &postCB);
+	// Shared cbuffers for custom post-effect pipelines: PostParams (per-effect params, packed by the engine)
+	// and PostFrame (resolution / time, for blur kernels & animated effects).
+	if (!postParamsCB) { BufferDesc d; d.Name = "PostParams"; d.Size = 256; d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &postParamsCB); }
+	if (!postFrameCB)  { BufferDesc d; d.Name = "PostFrame";  d.Size = sizeof(float) * 8; d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &postFrameCB); }
 
 	// Build one post PSO per output format: RGBA8 for RT targets, swap-chain format for the backbuffer.
 	auto buildPost = [&](TEXTURE_FORMAT fmt, const char* name,
@@ -1024,7 +1038,11 @@ void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV,
 	IShaderResourceVariable* var = toBackbuffer ? postHdrVarBB : postHdrVar;
 	if (!pso || !srb || !hdrSRV || !dstRTV) return;
 	const float mode = !hdr ? 0.0f : ((toBackbuffer && hdr10Active) ? 2.0f : 1.0f);   // 0=passthrough,1=sRGB SDR,2=HDR10 PQ
-	{ MapHelper<float> cb(context, postCB, MAP_WRITE, MAP_FLAG_DISCARD); cb[0] = exposure; cb[1] = mode; cb[2] = 0; cb[3] = 0; }
+	{
+		MapHelper<float> cb(context, postCB, MAP_WRITE, MAP_FLAG_DISCARD);   // final pass = tonemap/encode ONLY
+		for (int k = 0; k < 8; ++k) cb[k] = 0.0f;
+		cb[1] = mode;
+	}
 	context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
 	context->SetViewports(1, &vp, w, h);
@@ -1033,6 +1051,58 @@ void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV,
 	context->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
 	context->Draw(da);
+}
+
+// Build a custom post-effect pipeline from a fullscreen PS (samples g_Source, params in PostParams).
+uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& ps)
+{
+	std::string vs = shaderSource("post.vs");
+	if (vs.empty() || ps.empty()) return 0;
+	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	RefCntAutoPtr<IShader> v, p;
+	sci.Desc = {"Post Effect VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); device->CreateShader(sci, &v);
+	sci.Desc = {"Post Effect PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &p);
+	if (!v || !p) return 0;
+
+	GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Post Effect PSO";
+	auto& gp = ci.GraphicsPipeline;
+	gp.NumRenderTargets = 1; gp.RTVFormats[0] = HDR_FMT;   // the chain runs in HDR, single-sample scratch
+	gp.DSVFormat = TEX_FORMAT_UNKNOWN;
+	gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+	gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
+	gp.DepthStencilDesc.DepthEnable = False;
+	gp.InputLayout.NumElements = 0;
+	ShaderResourceVariableDesc vars[] = {{SHADER_TYPE_PIXEL, "g_Source", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}};
+	ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 1;
+	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
+	samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP;
+	ImmutableSamplerDesc imm[] = {{SHADER_TYPE_PIXEL, "g_Source", samp}};
+	ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+	ci.pVS = v; ci.pPS = p;
+	PostPipe pp;
+	device->CreateGraphicsPipelineState(ci, &pp.pso);
+	if (!pp.pso) { cout << "[NukeDiligent]\tpost effect PSO build failed" << endl; return 0; }
+	if (auto* c = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostParams")) c->Set(postParamsCB);
+	if (auto* f = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostFrame"))  f->Set(postFrameCB);
+	pp.pso->CreateShaderResourceBinding(&pp.srb, true);
+	pp.srcVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Source");
+	uint64_t h = nextShaderHandle++;
+	postPipes[h] = std::move(pp);
+	return h;
+}
+
+void NukeDiligent::Impl::EnsureScratch(int w, int h)
+{
+	if (w <= 0 || h <= 0) return;
+	if (scratch[0] && scratchW == w && scratchH == h) return;
+	scratchW = w; scratchH = h;
+	for (int i = 0; i < 2; ++i)
+	{
+		scratch[i].Release();
+		TextureDesc td; td.Name = "Post Scratch"; td.Type = RESOURCE_DIM_TEX_2D; td.Width = (Uint32)w; td.Height = (Uint32)h;
+		td.Format = HDR_FMT; td.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+		device->CreateTexture(td, nullptr, &scratch[i]);
+	}
 }
 
 static void glfw_error(int code, const char* desc)
@@ -1777,9 +1847,47 @@ void NukeDiligent::endCamera()
 		ra.Format = m_impl->SceneFmt();
 		m_impl->context->ResolveTextureSubresource(m_impl->curResolveSrc, m_impl->curResolveDst, ra);
 	}
-	// 2) Post-process: tonemap the HDR scene into the output (RT's post texture, or the backbuffer for target 0).
-	if (m_impl->curPostSrc && m_impl->curPostDst)
-		m_impl->RunPostPass(m_impl->curPostSrc, m_impl->curPostDst, m_impl->curRTW, m_impl->curRTH, m_impl->curTarget == 0);
+	// 2) Custom effect chain (HDR): ping-pong the resolved scene through each post pipeline.
+	ITextureView* chainSrc = m_impl->curPostSrc;
+	if (!m_impl->postChain.empty() && m_impl->curPostSrc && m_impl->curRTW > 0 && m_impl->curRTH > 0)
+	{
+		m_impl->EnsureScratch(m_impl->curRTW, m_impl->curRTH);
+		const int w = m_impl->curRTW, h = m_impl->curRTH;
+		ITextureView* srcSRV = m_impl->curPostSrc;
+		int idx = 0;
+		for (auto& cs : m_impl->postChain)
+		{
+			auto pit = m_impl->postPipes.find(cs.pipeline);
+			if (pit == m_impl->postPipes.end() || !pit->second.pso) continue;
+			Diligent::ITexture* dstTex = m_impl->scratch[idx % 2];
+			if (!dstTex) break;
+			ITextureView* dstRTV = dstTex->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+			{
+				MapHelper<float> cb(m_impl->context, m_impl->postParamsCB, MAP_WRITE, MAP_FLAG_DISCARD);
+				int n = (int)cs.params.size(); if (n > 64) n = 64;
+				for (int k = 0; k < 64; ++k) cb[k] = (k < n) ? cs.params[k] : 0.0f;
+			}
+			{
+				MapHelper<float> fb(m_impl->context, m_impl->postFrameCB, MAP_WRITE, MAP_FLAG_DISCARD);
+				fb[0] = (float)w; fb[1] = (float)h; fb[2] = w ? 1.0f / w : 0.0f; fb[3] = h ? 1.0f / h : 0.0f;
+				fb[4] = fb[5] = fb[6] = fb[7] = 0.0f;
+			}
+			m_impl->context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+			m_impl->context->SetViewports(1, &vp, w, h);
+			if (pit->second.srcVar) pit->second.srcVar->Set(srcSRV);
+			m_impl->context->SetPipelineState(pit->second.pso);
+			m_impl->context->CommitShaderResources(pit->second.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
+			m_impl->context->Draw(da);
+			srcSRV = dstTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+			++idx;
+		}
+		chainSrc = srcSRV;
+	}
+	// 3) Final tonemap/encode into the output (RT's post texture, or the backbuffer for target 0).
+	if (chainSrc && m_impl->curPostDst)
+		m_impl->RunPostPass(chainSrc, m_impl->curPostDst, m_impl->curRTW, m_impl->curRTH, m_impl->curTarget == 0);
 
 	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
 	m_impl->curPostSrc = nullptr; m_impl->curPostDst = nullptr;
@@ -1806,6 +1914,20 @@ void NukeDiligent::setHDR(bool on)
 	m_impl->pendingHDR = on ? 1 : 0;                       // applied at the start of the next frame (see render())
 }
 bool NukeDiligent::getHDR() { return m_impl->pendingHDR >= 0 ? (m_impl->pendingHDR != 0) : m_impl->hdr; }
+
+uint64_t NukeDiligent::createPostPipeline(const char* name, const char* ps) { (void)name; return m_impl->CreatePostPipe(ps ? ps : ""); }
+
+void NukeDiligent::setPostChain(const NukePostStage* stages, int count)
+{
+	m_impl->postChain.clear();
+	for (int i = 0; i < count; ++i)
+	{
+		Impl::ChainStage cs; cs.pipeline = stages[i].pipeline;
+		int n = stages[i].paramFloats > 0 ? stages[i].paramFloats : 0;
+		if (stages[i].params && n > 0) cs.params.assign(stages[i].params, stages[i].params + n);
+		m_impl->postChain.push_back(std::move(cs));
+	}
+}
 
 void NukeDiligent::setHDROutput(bool on)
 {
