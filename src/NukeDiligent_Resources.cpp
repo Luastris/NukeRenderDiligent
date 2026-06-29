@@ -151,7 +151,9 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 		const Uint64 sz3 = (Uint64)mesh->numVerts * 3 * sizeof(float);
 		const Uint64 sz2 = (Uint64)mesh->numVerts * 2 * sizeof(float);
 		BufferDesc bd; bd.BindFlags = BIND_VERTEX_BUFFER; bd.Usage = USAGE_IMMUTABLE;
-		bd.Size = sz3; bd.Name = "mesh pos"; BufferData pdat{mesh->vertexArray, sz3}; device->CreateBuffer(bd, &pdat, &g.pos);
+		// Positions double as BLAS geometry under D3D12 ray tracing -> they need BIND_RAY_TRACING too.
+		BufferDesc pbd = bd; if (rtSupported) pbd.BindFlags = BIND_VERTEX_BUFFER | BIND_RAY_TRACING;
+		pbd.Size = sz3; pbd.Name = "mesh pos"; BufferData pdat{mesh->vertexArray, sz3}; device->CreateBuffer(pbd, &pdat, &g.pos);
 		bd.Size = sz3; bd.Name = "mesh nrm"; BufferData ndat{mesh->normalArray, sz3}; device->CreateBuffer(bd, &ndat, &g.nrm);
 		std::vector<float> zeroUV;
 		const float* uvSrc = mesh->uvArray;

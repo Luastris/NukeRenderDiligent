@@ -30,6 +30,7 @@ add_library(NukeRenderDiligent SHARED
     src/NukeDiligent_SSR.cpp
     src/NukeDiligent_Post.cpp
     src/NukeDiligent_UI.cpp
+    src/NukeDiligent_RT.cpp
 )
 
 target_compile_definitions(NukeRenderDiligent PRIVATE

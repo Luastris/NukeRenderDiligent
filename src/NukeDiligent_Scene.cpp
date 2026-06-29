@@ -114,6 +114,7 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	if (wp.shadowVar) wp.shadowVar->Set(m_impl->shadowSRV ? m_impl->shadowSRV : whiteSRV);
 	if (wp.cubeVar && m_impl->shadowCubeSRV) wp.cubeVar->Set(m_impl->shadowCubeSRV);
 	if (wp.probeVar) wp.probeVar->Set((m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV);
+	if (wp.tlasVar)  wp.tlasVar->Set((m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr());
 
 	IDeviceContext* ctx = m_impl->context;
 	IBuffer* vbs[]    = { g.pos, g.nrm, g.uv };

@@ -135,6 +135,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 	                      (m_impl->device->GetAdapterInfo().RayTracing.CapFlags & RAY_TRACING_CAP_FLAG_STANDALONE_SHADERS) != 0;
 	cout << "[NukeDiligent]\tbackend=" << (m_impl->useD3D12 ? "D3D12" : "D3D11")
 	     << " rayTracing=" << (m_impl->rtSupported ? "yes" : "no") << endl;
+	if (m_impl->rtSupported) m_impl->EnsureRTFallback();   // g_TLAS must have a valid bind before any draw
 
 	if (m_impl->hdrOutput) m_impl->SetupHDROutput();   // set the HDR10 colour space if the monitor is in HDR mode
 

@@ -267,6 +267,15 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	if (vsSrc.empty() || psSrc.empty()) return false;
 	ShaderCreateInfo sci;
 	sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	// Ray tracing: compile the world shaders via DXC at SM6.5 with RT_ENABLED so world.ps can use inline RayQuery
+	// (RT shadows). D3D11 / unsupported GPUs keep the default FXC SM5 path (shadow maps).
+	ShaderMacro rtMacro[] = {{"RT_ENABLED", "1"}};
+	if (rtSupported)
+	{
+		sci.ShaderCompiler = SHADER_COMPILER_DXC;
+		sci.HLSLVersion    = ShaderVersion{6, 5};
+		sci.Macros         = ShaderMacroArray{rtMacro, 1};
+	}
 	RefCntAutoPtr<IShader> vs, ps;
 	sci.Desc = {dbg, SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); device->CreateShader(sci, &vs);
 	sci.Desc = {dbg, SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); device->CreateShader(sci, &ps);
@@ -301,9 +310,10 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		{SHADER_TYPE_PIXEL, "g_Shadow",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_ShadowCube", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Probe",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // reflection probe cubemap
+		{SHADER_TYPE_PIXEL, "g_TLAS",       SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // RT scene (only present when rtSupported)
 	};
 	ci.PSODesc.ResourceLayout.Variables    = vars;
-	ci.PSODesc.ResourceLayout.NumVariables = 8;
+	ci.PSODesc.ResourceLayout.NumVariables = rtSupported ? 9 : 8;
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_WRAP; samp.AddressV = TEXTURE_ADDRESS_WRAP; samp.AddressW = TEXTURE_ADDRESS_WRAP;
 	ImmutableSamplerDesc immSamp[] = {{SHADER_TYPE_PIXEL, "g_Tex", samp}};   // shared sampler for material maps; the
@@ -356,6 +366,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.shadowVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Shadow");
 	wp.cubeVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ShadowCube");
 	wp.probeVar  = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Probe");
+	wp.tlasVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_TLAS");
 	return true;
 }
 

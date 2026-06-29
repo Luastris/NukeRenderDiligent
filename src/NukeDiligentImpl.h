@@ -29,6 +29,8 @@
 #include "Buffer.h"
 #include "Texture.h"
 #include "Shader.h"
+#include "BottomLevelAS.h"   // ray tracing acceleration structures (D3D12)
+#include "TopLevelAS.h"
 #include "RefCntAutoPtr.hpp"
 #include "MapHelper.hpp"
 #include "BasicMath.hpp"
@@ -173,6 +175,19 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IShaderResourceBinding> gbufSRB;
 	IShaderResourceVariable*            gbufMRVar = nullptr;   // PS g_MetalRough (dynamic)
 	RefCntAutoPtr<IBuffer>              ssrCB;                 // SSR matrices (view/proj/invProj/res)
+
+	// --- Ray tracing (D3D12) ---------------------------------------------------------------------------------
+	std::unordered_map<Mesh*, RefCntAutoPtr<IBottomLevelAS>> blasCache;   // BLAS per mesh (built once, reused)
+	RefCntAutoPtr<ITopLevelAS>         tlas;                  // scene TLAS (rebuilt per frame)
+	RefCntAutoPtr<IBuffer>             tlasScratch, tlasInstanceBuf;
+	Uint32                             tlasMaxInstances = 0;
+	std::vector<TLASBuildInstanceData> rtInstances;           // accumulated between beginRTScene/buildRTScene
+	std::vector<std::string>           rtInstanceNames;        // stable storage backing TLASBuildInstanceData::InstanceName
+	bool                               rtSceneReady = false;   // a valid TLAS is built for the current frame
+	RefCntAutoPtr<ITopLevelAS>         fallbackTLAS;           // empty TLAS bound to g_TLAS when no scene TLAS (rays miss)
+	RefCntAutoPtr<IBuffer>             fbTlasScratch, fbTlasInst;
+	IBottomLevelAS* GetMeshBLAS(Mesh* mesh);                   // get-or-build the BLAS for a mesh (from its pos buffer)
+	void EnsureRTFallback();                                   // build the empty fallback TLAS once
 	void EnsureGBuffer(int w, int h);
 	bool BuildGBufferPipe();
 	void SetCameraViewProj(const NukeCameraDesc& cam, int w, int h);   // curView/curProj/curCamPos (shared: camera + gbuffer)
@@ -211,6 +226,7 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
 		IShaderResourceVariable*              probeVar  = nullptr;// PS "g_Probe" (reflection cubemap, dynamic)
+		IShaderResourceVariable*              tlasVar   = nullptr;// PS "g_TLAS" (ray-tracing accel struct, RT builds only)
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on an MSAA change)
 	};
 	std::unordered_map<uint64_t, WorldPipe> worldPipes;   // shader handle -> pipeline
