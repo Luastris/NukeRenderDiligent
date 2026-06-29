@@ -21,6 +21,15 @@ set(VCPKG_INSTALLED "$ENV{VCPKG_ROOT}/installed/x64-windows")   # VCPKG_ROOT env
 
 add_library(NukeRenderDiligent SHARED
     src/NukeDiligent.cpp
+    src/NukeDiligent_Pipelines.cpp
+    src/NukeDiligent_Resources.cpp
+    src/NukeDiligent_Scene.cpp
+    src/NukeDiligent_Sky.cpp
+    src/NukeDiligent_Shadow.cpp
+    src/NukeDiligent_Probe.cpp
+    src/NukeDiligent_SSR.cpp
+    src/NukeDiligent_Post.cpp
+    src/NukeDiligent_UI.cpp
 )
 
 target_compile_definitions(NukeRenderDiligent PRIVATE
@@ -45,6 +54,7 @@ target_link_directories(NukeRenderDiligent PRIVATE
 
 target_link_libraries(NukeRenderDiligent PRIVATE
     Diligent-GraphicsEngineD3D11-static
+    Diligent-GraphicsEngineD3D12-static
     Diligent-GraphicsTools
     Diligent-Common
     Diligent-GraphicsAccessories

@@ -1,0 +1,322 @@
+#pragma once
+// IMPORTANT include order: Windows-pulling headers (GLFW native + Diligent D3D)
+// MUST come before the engine headers. Several engine headers do a global
+// `using namespace std;`, which brings std::byte into scope; if the Windows SDK
+// headers (objidl.h/oaidl.h, pulled by Diligent's D3D backend) are processed
+// after that, `byte` becomes ambiguous (std::byte vs Windows ::byte). Processing
+// the Windows headers first avoids the clash.
+
+#include <cmath>   // acosf (spot shadow FOV)
+
+// GLFW: window creation + native Win32 handle
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
+#include <shellapi.h>   // ExtractIconEx (set the window icon from the .exe)
+#include <dwmapi.h>     // DwmSetWindowAttribute (dark title bar)
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20   // Win10 2004+ (build 19041+)
+#endif
+
+// Diligent Engine
+#include "EngineFactoryD3D11.h"
+#include "EngineFactoryD3D12.h"   // D3D12 backend (ray tracing); chosen at launch via WindowDesc.backend
+#include "RenderDevice.h"
+#include "DeviceContext.h"
+#include "SwapChain.h"
+#include "PipelineState.h"
+#include "ShaderResourceBinding.h"
+#include "Buffer.h"
+#include "Texture.h"
+#include "Shader.h"
+#include "RefCntAutoPtr.hpp"
+#include "MapHelper.hpp"
+#include "BasicMath.hpp"
+#include "GraphicsAccessories.hpp"
+// --- Windows-only HDR10 display output (DXGI / D3D11). Other platforms: no D3D11, HDR output is a no-op. ---
+#ifdef _WIN32
+#include <d3d11.h>           // ID3D11View etc. (needed BEFORE the Diligent D3D11 interface headers below)
+#include <d3d12.h>           // D3D12_CPU_DESCRIPTOR_HANDLE etc. (needed BEFORE the Diligent D3D12 interface headers)
+#include <dxgi1_6.h>         // IDXGISwapChain3/4 + IDXGIOutput6 (HDR10 colour space + display detection)
+#include "SwapChainD3D11.h"  // Diligent ISwapChainD3D11::GetDXGISwapChain (HDR10 swap-chain access)
+#include "SwapChainD3D12.h"  // Diligent ISwapChainD3D12::GetDXGISwapChain (HDR10 on the D3D12 backend)
+#endif
+
+// Engine headers last (they do `using namespace std;` internally).
+#include "NukeDiligent.h"
+#include <interface/RenderModule.h>
+
+#include <cstring>
+#include <vector>
+#include <unordered_map>
+#include <algorithm>
+#include <iostream>
+#include <string>
+
+using namespace Diligent;
+// NOTE: deliberately NOT `using namespace std` — it pulls std::byte, which clashes
+// with the Windows SDK's ::byte (rpcndr.h) and makes `byte` ambiguous.
+using std::cout;
+using std::endl;
+
+struct NukeDiligent::Impl
+{
+	RefCntAutoPtr<IRenderDevice>  device;
+	RefCntAutoPtr<IDeviceContext> context;
+	RefCntAutoPtr<ISwapChain>     swapChain;
+	bool                          useD3D12 = false;   // active backend (set in init from WindowDesc.backend)
+	bool                          rtSupported = false; // device reports ray-tracing capability (D3D12 + RT-capable GPU)
+
+	std::vector<boost::function<void(void)>> onGUI;
+	std::vector<boost::function<void(void)>> onRender;
+	std::vector<boost::function<void()>>     onClose;
+
+	// --- generic 2D (UI) draw-list renderer ---
+	RefCntAutoPtr<IPipelineState>         uiPSO;
+	RefCntAutoPtr<IShaderResourceBinding> uiSRB;
+	IShaderResourceVariable*              uiTexVar = nullptr;
+	RefCntAutoPtr<IBuffer>                uiVB, uiIB, uiCB;
+	int uiVBSize = 0;
+	int uiIBSize = 0;
+	bool baseVertexSupported = false;
+	// Keep created textures alive; handle == ITextureView*.
+	std::unordered_map<uint64_t, RefCntAutoPtr<ITexture>> textures;
+
+	// --- render targets (cameras draw into these; the UI can sample them) ---
+	struct RT
+	{
+		RefCntAutoPtr<ITexture> color, depth;     // color = HDR (RGBA16F) single-sample: geometry target (no MSAA) / resolve dest
+		RefCntAutoPtr<ITexture> colorMS, depthMS; // multisampled HDR render targets (when samples > 1)
+		RefCntAutoPtr<ITexture> post;             // LDR (RGBA8) post-process output — what the UI samples
+		ITextureView* rtv = nullptr;              // geometry RTV (MS when samples>1, else color)
+		ITextureView* dsv = nullptr;              // geometry DSV
+		ITextureView* hdrSRV = nullptr;           // color's SRV (post-pass input)
+		ITextureView* postRTV = nullptr;          // post's RTV (post-pass output)
+		ITextureView* srv = nullptr;              // post's SRV (final LDR result shown by the UI / sampled as a texture)
+		int w = 0, h = 0;
+	};
+	std::unordered_map<uint64_t, RT> rts;
+	uint64_t rtCounter = 0;
+
+	// --- MSAA --------------------------------------------------------------------------------------
+	Uint8 samples = 4;                 // hardware multisample count for all geometry passes (1 = off)
+	int   pendingSamples = -1;         // requested sample count; applied at the START of render() (never mid-frame)
+	RT    backbufferMS;                // MS color+depth for camera target 0 (Player), resolved to the backbuffer
+	// Resolve bookkeeping for the current camera pass (set in beginCamera, consumed in endCamera).
+	bool      curMSAA = false;
+	ITexture* curResolveSrc = nullptr; // MS HDR color to resolve from
+	ITexture* curResolveDst = nullptr; // single-sample HDR destination
+	ITextureView* curPostSrc = nullptr; // HDR SRV the post pass reads (after resolve)
+	ITextureView* curPostDst = nullptr; // LDR RTV the post pass writes (RT's post / the backbuffer)
+	void EnsureBackbufferMS(int w, int h);
+
+	// --- Post-process ------------------------------------------------------------------------------
+	RefCntAutoPtr<IPipelineState>         postPSO;       // -> RT targets (RGBA8, SDR sRGB)
+	RefCntAutoPtr<IShaderResourceBinding> postSRB;
+	RefCntAutoPtr<IPipelineState>         postPSOBB;     // -> the backbuffer (matches the swap-chain format; PQ when HDR10)
+	RefCntAutoPtr<IShaderResourceBinding> postSRBBB;
+	RefCntAutoPtr<IBuffer>                postCB;
+	IShaderResourceVariable*              postHdrVar = nullptr;
+	IShaderResourceVariable*              postHdrVarBB = nullptr;
+	// Custom post-effect chain (one fullscreen pipeline per effect; ping-ponged in HDR before the final tonemap).
+	struct PostPipe { RefCntAutoPtr<IPipelineState> pso; RefCntAutoPtr<IShaderResourceBinding> srb; IShaderResourceVariable* srcVar = nullptr; bool isBloom = false;
+	                  IShaderResourceVariable* gbufVar = nullptr; IShaderResourceVariable* depthVar = nullptr; bool isSSR = false; };
+	std::unordered_map<uint64_t, PostPipe> postPipes;
+	RefCntAutoPtr<IBuffer>                postParamsCB;   // shared PostParams (per-effect params, 256B)
+	RefCntAutoPtr<IBuffer>                postFrameCB;    // shared PostFrame (resolution / time)
+	RefCntAutoPtr<ITexture>               scratch[2];     // HDR ping-pong targets for the effect chain
+	int                                   scratchW = 0, scratchH = 0;
+	struct ChainStage { uint64_t pipeline; std::vector<float> params; };
+	std::vector<ChainStage>               postChain;      // current camera's effect chain (copied in setPostChain)
+	uint64_t CreatePostPipe(const std::string& name, const std::string& ps);
+	void     EnsureScratch(int w, int h);
+
+	// Built-in bloom (multi-pass): bright-pass -> separable blur (half-res ping-pong) -> composite. Invoked
+	// for a chain stage whose post shader is named "bloom".
+	RefCntAutoPtr<IPipelineState>         bloomBrightPSO, bloomBlurPSO, bloomCompPSO;
+	RefCntAutoPtr<IShaderResourceBinding> bloomBrightSRB, bloomBlurSRB, bloomCompSRB;
+	IShaderResourceVariable*              bbSrc = nullptr;   // bright g_Source
+	IShaderResourceVariable*              blSrc = nullptr;   // blur g_Source
+	IShaderResourceVariable*              bcSrc = nullptr;   // comp g_Source (scene)
+	IShaderResourceVariable*              bcBloom = nullptr; // comp g_Bloom
+	RefCntAutoPtr<IBuffer>                bloomCB;
+	RefCntAutoPtr<ITexture>               bloomTex[2];       // half-res blur ping-pong
+	int                                   bloomW = 0, bloomH = 0;
+	void EnsureBloom(int w, int h);
+	void RunBloom(ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, float threshold, float intensity);
+
+	// --- Reflection probe: scene-captured HDR cubemaps ----------------------------------------------
+	struct CubeRT
+	{
+		RefCntAutoPtr<ITexture>     color;      // RGBA16F cube (6 faces, full mip chain), GenerateMips for rough refl
+		RefCntAutoPtr<ITexture>     depth;      // shared D32 per face
+		RefCntAutoPtr<ITextureView> faceRTV[6]; // mip-0 RTV per face (CreateView-owned)
+		RefCntAutoPtr<ITextureView> dsv;
+		ITextureView*               srv = nullptr;   // cube SRV (default view, texture-owned)
+		int res = 0, mips = 1;
+		bool fmtHdr = true;   // which SceneFmt the cube was built with (rebuild on HDR toggle to match world PSO)
+	};
+	std::unordered_map<uint64_t, CubeRT> cubes;
+	void BuildCube(CubeRT& c, int res);   // (re)create the cube GPU resources at the current SceneFmt()
+	RefCntAutoPtr<ITexture>              fallbackCube;     // 1x1 cube bound to g_Probe when no probe is active
+	ITextureView*                        fallbackCubeSRV = nullptr;
+	RefCntAutoPtr<ISampler>              probeSampler;     // linear-clamp; attached to probe/fallback cube SRVs
+
+	// G-buffer prepass (single-sample) for screen-space reflections: normal(oct)+roughness+metalness + depth.
+	// Rendered per SSR camera before the colour pass; the "ssr" post effect samples it. Own 1x depth -> no MSAA
+	// depth resolve, and the colour/custom shaders stay untouched (a dedicated gbuffer.ps fills it).
+	RefCntAutoPtr<ITexture>             gbufColor, gbufDepth;
+	ITextureView*                       gbufRTV = nullptr, *gbufDSV = nullptr, *gbufSRV = nullptr, *gbufDepthSRV = nullptr;
+	int                                 gbufW = 0, gbufH = 0;
+	bool                                gbufActive = false;   // a valid prepass ran for the current camera
+	RefCntAutoPtr<IPipelineState>       gbufPSO;
+	RefCntAutoPtr<IShaderResourceBinding> gbufSRB;
+	IShaderResourceVariable*            gbufMRVar = nullptr;   // PS g_MetalRough (dynamic)
+	RefCntAutoPtr<IBuffer>              ssrCB;                 // SSR matrices (view/proj/invProj/res)
+	void EnsureGBuffer(int w, int h);
+	bool BuildGBufferPipe();
+	void SetCameraViewProj(const NukeCameraDesc& cam, int w, int h);   // curView/curProj/curCamPos (shared: camera + gbuffer)
+	bool CameraSize(const NukeCameraDesc& cam, int& w, int& h);
+	void RunSSR(PostPipe& pp, ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, const std::vector<float>& params);
+	bool        probeActive = false;     // a probe cube is bound (and not currently capturing)
+	ITextureView* probeCubeSRV = nullptr;
+	float       probePos[3] = {0,0,0};
+	float       probeIntensity = 1.0f;
+	float       probeMaxMip = 0.0f;
+	float       probeBoxHalf[3] = {0,0,0};   // parallax box half-extents (0 = no parallax correction)
+	bool                                  hdrOutput = false;   // requested HDR10 display output (Player only, before init)
+	bool                                  hdr10Active = false; // an HDR10 swap chain is actually live (display is HDR)
+	float                                 hdrPaperWhite = 200.0f;   // diffuse-white nits for the HDR10 encode
+	float                                 hdrPeak = 1000.0f;        // highlight peak nits
+	void CreatePostResources();
+	void RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV, int w, int h, bool toBackbuffer);
+	void SetupHDROutput();   // after swap-chain creation: set the HDR10 colour space if the display supports it
+	static constexpr TEXTURE_FORMAT HDR_FMT = TEX_FORMAT_RGBA16_FLOAT;
+	bool hdr = true;                   // HDR pipeline on (scene = RGBA16F, post tonemaps) / off (RGBA8, world.ps tonemaps)
+	int  pendingHDR = -1;              // requested hdr (0/1); applied with pendingSamples at the start of render()
+	TEXTURE_FORMAT SceneFmt() const { return hdr ? HDR_FMT : TEX_FORMAT_RGBA8_UNORM; }
+
+	// --- 3D world pipelines (one per shader; all share the layout + CBs + white fallback) ---
+	struct WorldPipe
+	{
+		RefCntAutoPtr<IPipelineState>         pso;        // opaque (blend off, depth write on)
+		RefCntAutoPtr<IPipelineState>         psoBlend;   // transparent: alpha blend, depth test on / write off
+		RefCntAutoPtr<IPipelineState>         psoAdd;     // additive: add blend, depth write off
+		RefCntAutoPtr<IShaderResourceBinding> srb;
+		IShaderResourceVariable*              texVar  = nullptr;  // PS "g_Tex"        (base color, dynamic)
+		IShaderResourceVariable*              normVar = nullptr;  // PS "g_Normal"     (normal map, dynamic)
+		IShaderResourceVariable*              mrVar   = nullptr;  // PS "g_MetalRough" (dynamic)
+		IShaderResourceVariable*              aoVar   = nullptr;  // PS "g_Occlusion"  (dynamic)
+		IShaderResourceVariable*              emVar   = nullptr;  // PS "g_Emissive"   (dynamic)
+		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
+		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
+		IShaderResourceVariable*              probeVar  = nullptr;// PS "g_Probe" (reflection cubemap, dynamic)
+		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on an MSAA change)
+	};
+	std::unordered_map<uint64_t, WorldPipe> worldPipes;   // shader handle -> pipeline
+	uint64_t                              defaultWorldHandle = 0;   // builtin "world" pipeline
+	uint64_t                              nextShaderHandle   = 1;   // handles handed to the engine
+	RefCntAutoPtr<IBuffer>                worldCB;     // VS: WVP + World   (shared)
+	RefCntAutoPtr<IBuffer>                worldMatCB;  // PS: color + params + custom shader props (shared)
+	static const uint32_t                 kMatCBBytes = 256;   // MatCB capacity (color/params + props)
+	RefCntAutoPtr<ITexture>               whiteTex;    // 1x1 fallback when a material has no texture
+	RefCntAutoPtr<ITexture>               flatNormTex; // 1x1 (0.5,0.5,1) flat normal fallback
+	RefCntAutoPtr<IBuffer>                worldFrameCB;// PS b1: camera pos + ambient + light array (shared)
+	// PBR lighting buffer layout (matches FrameCB in world.ps.hlsl). Each float4 = 16 bytes.
+	static const int                      kMaxLights = 16;
+	struct GPULight { float posType[4]; float dirRange[4]; float colorIntensity[4]; float spot[4]; };
+	struct FrameCBData { float camPos[4]; float ambient[4]; float lightCount[4]; GPULight lights[kMaxLights];
+	                     float shadowVP[16 * 4]; float shadowParams[4];        // 4 = SHADOW_SLOTS
+	                     float skyTop[4]; float skyHorizon[4]; float skyGround[4]; float skyParams[4];      // IBL
+	                     float probePos[4]; float probeParams[4]; float probeBox[4]; };   // probe: pos.xyz+active, intensity+maxMip, boxHalf.xyz+valid
+	void WriteFrameCB(const Diligent::float3& P);   // fill worldFrameCB (lights/shadows/sky/probe) — shared by camera + cube-face passes
+	float                                 curCamPos[3] = {0, 0, 0};  // set in beginCamera (PBR view dir)
+	uint64_t                              curTarget = 0;             // RT id bound by beginCamera (feedback guard)
+	std::vector<NukeLight>                lights;      // scene lights (setLights); empty -> default sun
+
+	// --- Shadow maps (directional + spot share a 2D array; one slice per shadow-casting light) -----
+	int                                   shadowRes    = 2048;   // global, World-Settings-driven (rebuilds on change)
+	int                                   pendingShadowRes = 0;  // requested resolution; applied at render() top
+	float                                 shadowDistance = 60.0f; // directional ortho extent / range
+	float                                 shadowDepthBias = 0.0015f;
+	float                                 shadowNormalBias = 0.0f; // world-units offset along N at sample time
+	float                                 shadowSoftness = 1.0f;   // PCF step multiplier
+	static const int                      SHADOW_SLOTS = 4;
+	RefCntAutoPtr<ITexture>               shadowTex;             // Texture2DArray, D32, SHADOW_SLOTS slices
+	RefCntAutoPtr<ITextureView>           shadowSliceDSV[SHADOW_SLOTS];   // per-slice depth targets
+	ITextureView*                         shadowSRV = nullptr;   // whole-array SRV (sampled in the world pass)
+	RefCntAutoPtr<IPipelineState>         shadowPSO;
+	RefCntAutoPtr<IShaderResourceBinding> shadowSRB;
+	IShaderResourceVariable*              shadowPsTexVar = nullptr;   // shadow PS "g_Tex" (alpha)
+	RefCntAutoPtr<IBuffer>                shadowVSCB;    // VS: g_LightWVP (per shadow draw)
+	RefCntAutoPtr<IBuffer>                shadowPSCB;    // PS: g_Alpha    (per shadow draw)
+	RefCntAutoPtr<ISampler>               shadowCmpSampler;   // PCF comparison sampler (set on shadowSRV)
+	// Procedural sky / environment.
+	NukeSky                               sky;
+	RefCntAutoPtr<IPipelineState>         skyPSO;
+	RefCntAutoPtr<IShaderResourceBinding> skySRB;
+	RefCntAutoPtr<IBuffer>                skyCB;
+	IShaderResourceVariable*              skyStarVar = nullptr;   // sky PS "g_StarTex" (optional star panorama)
+	IShaderResourceVariable*              skyMoonVar = nullptr;   // sky PS "g_MoonTex" (optional moon disk)
+	void CreateSkyResources();
+	void DrawSky();
+
+	int                                   numShadowSlots = 0;          // assigned 2D slots this frame
+	int                                   lightSlot[kMaxLights];       // per-light 2D shadow slot (-1 = none)
+	float4x4                              slotVP[SHADOW_SLOTS];        // world->light-clip per 2D slot
+	float4x4                              curShadowVP;                 // VP of the pass being rendered
+	// Point-light shadows: a cube depth array (6 faces per cube), sampled by direction.
+	static const int                      MAX_POINT_SHADOWS = 2;
+	RefCntAutoPtr<ITexture>               shadowCubeTex;               // TextureCubeArray, D32
+	RefCntAutoPtr<ITextureView>           cubeFaceDSV[MAX_POINT_SHADOWS * 6];
+	ITextureView*                         shadowCubeSRV = nullptr;
+	RefCntAutoPtr<ISampler>               shadowCubeCmpSampler;
+	int                                   numCubes = 0;
+	float4x4                              cubeFaceVP[MAX_POINT_SHADOWS * 6];
+	int                                   lightCube[kMaxLights];       // per-light cube index (-1 = none)
+	void CreateShadowResources();
+	// Build a world-type PSO (fixed layout/CBs) from VS+PS source; store it under a handle.
+	uint64_t MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg);
+	bool     BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg);
+	void     RebuildForMSAA();   // rebuild all sample-count-dependent pipelines + targets after `samples` changes
+	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; };
+	std::unordered_map<Mesh*, MeshGPU>          meshCache;
+	MeshGPU* GetMeshGPU(Mesh* mesh);   // get-or-build the GPU vertex buffers (pos/nrm/uv) for a mesh
+	std::unordered_map<Texture*, RefCntAutoPtr<ITexture>> texCache;   // engine Texture -> GPU texture
+	std::unordered_map<Texture*, std::vector<RefCntAutoPtr<ITexture>>> animTex;   // GIF: one Texture2D per frame
+	float4x4 curView, curProj;   // set in beginCamera, used in renderObject
+
+	// Selection outline (editor): post-process. Pass 1 renders the selected mesh into a mask RT;
+	// pass 2 is a fullscreen edge-detect that draws a CONSTANT-pixel-thickness border around the mask
+	// (independent of distance/size, works for any geometry incl. flat planes).
+	RefCntAutoPtr<IPipelineState>         outlineMaskPSO, outlineEdgePSO;
+	RefCntAutoPtr<IShaderResourceBinding> outlineMaskSRB, outlineEdgeSRB;
+	IShaderResourceVariable*              outlineEdgeMaskVar = nullptr;   // edge PS "g_Mask" (dynamic)
+	RefCntAutoPtr<ITexture>               outlineMaskTex;
+	ITextureView*                         outlineMaskRTV = nullptr;
+	ITextureView*                         outlineMaskSRV = nullptr;
+	int                                   outlineMaskW = 0, outlineMaskH = 0;
+	RefCntAutoPtr<IBuffer>                outlineEdgeCB;      // texel size + thickness
+	ITextureView*                         curRTV = nullptr;   // current camera color target (outline rebind)
+	int                                   curRTW = 0, curRTH = 0;
+	ITextureView*                         uiRTV = nullptr;    // explicit 2D target (bindRenderTarget); null = backbuffer
+	Uint32                                uiTW = 0, uiTH = 0; // its size (0 = use swapchain)
+	void BuildOutlinePipelines();
+	void EnsureOutlineMask(int w, int h);
+
+	// Shader sources pushed by the engine (the renderer does NO file IO). name -> HLSL.
+	std::unordered_map<std::string, std::string> shaderSrc;
+	std::string shaderSource(const char* name)
+	{
+		auto it = shaderSrc.find(name);
+		if (it == shaderSrc.end() || it->second.empty())
+			{ cout << "[NukeDiligent]\tmissing shader source '" << name << "'" << endl; return std::string(); }
+		return it->second;
+	}
+
+	ITextureView* GetTexSRV(Texture* t);   // get-or-create a GPU texture from an engine Texture
+
+	void CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT dsFmt);
+	void CreateWorldPipeline();
+	RT   MakeRT(int w, int h);
+};

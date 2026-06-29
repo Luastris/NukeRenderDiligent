@@ -1,0 +1,354 @@
+#include "NukeDiligentImpl.h"
+
+
+// Camera basis -> curView/curProj/curCamPos. Shared by beginCamera and the SSR gbuffer prepass so both use the
+// exact same transform (left-handed look-at; same projection as beginCamera).
+void NukeDiligent::Impl::SetCameraViewProj(const NukeCameraDesc& cam, int w, int h)
+{
+	const float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
+	float3 F = normalize(float3(cam.camFwd[0], cam.camFwd[1], cam.camFwd[2]));
+	float3 U = float3(cam.camUp[0], cam.camUp[1], cam.camUp[2]);
+	float3 R = normalize(cross(U, F)); U = cross(F, R);
+	curView = float4x4(R.x, U.x, F.x, 0.f, R.y, U.y, F.y, 0.f, R.z, U.z, F.z, 0.f, -dot(P, R), -dot(P, U), -dot(P, F), 1.f);
+	curProj = float4x4::Projection(cam.fov, aspect, cam.nearZ, cam.farZ, false);
+	curCamPos[0] = P.x; curCamPos[1] = P.y; curCamPos[2] = P.z;
+}
+
+// Target size for a camera (matches beginCamera): backbuffer (target 0) or the off-screen RT.
+bool NukeDiligent::Impl::CameraSize(const NukeCameraDesc& cam, int& w, int& h)
+{
+	if (cam.target == 0)
+	{
+		if (!swapChain) return false;
+		w = (int)swapChain->GetDesc().Width; h = (int)swapChain->GetDesc().Height;
+	}
+	else
+	{
+		auto it = rts.find(cam.target);
+		if (it == rts.end()) return false;
+		w = it->second.w; h = it->second.h;
+	}
+	return w > 0 && h > 0;
+}
+
+void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
+                                const float pos[3], const float quat[4], const float scale[3])
+{
+	if (m_impl->worldPipes.empty()) return;
+	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
+	if (!gp) return;
+	Impl::MeshGPU& g = *gp;
+
+	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
+	               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
+	               * float4x4::Translation(pos[0], pos[1], pos[2]);
+	float4x4 wvp = world * m_impl->curView * m_impl->curProj;
+
+	struct CBData { float4x4 wvp; float4x4 world; };
+	{
+		MapHelper<CBData> cb(m_impl->context, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		cb->wvp = wvp; cb->world = world;
+	}
+
+	// Material: base color + PBR maps/params (fallbacks when none).
+	float col[4] = { 1, 1, 1, 1 };
+	float metallic = 0.0f, roughness = 0.6f;
+	float emissive[3] = { 0, 0, 0 }, emissiveI = 0.0f;
+	ITextureView* srv = nullptr; ITextureView* nsrv = nullptr;
+	ITextureView* mrsrv = nullptr; ITextureView* aosrv = nullptr; ITextureView* emsrv = nullptr;
+	if (mat)
+	{
+		col[0] = (float)mat->color.r; col[1] = (float)mat->color.g; col[2] = (float)mat->color.b; col[3] = (float)mat->color.a;
+		metallic = mat->metallic; roughness = mat->roughness;
+		emissive[0] = (float)mat->emissive.r; emissive[1] = (float)mat->emissive.g; emissive[2] = (float)mat->emissive.b;
+		emissiveI = mat->emissiveIntensity;
+		if (mat->diff) srv   = m_impl->GetTexSRV(mat->diff);
+		if (mat->norm) nsrv  = m_impl->GetTexSRV(mat->norm);
+		if (mat->mr)   mrsrv = m_impl->GetTexSRV(mat->mr);
+		if (mat->ao)   aosrv = m_impl->GetTexSRV(mat->ao);
+		if (mat->em)   emsrv = m_impl->GetTexSRV(mat->em);
+	}
+	// Pick the pipeline for this material's shader (fallback to the built-in "world" pipeline).
+	uint64_t h = (mat && mat->shader && mat->shader->rendererHandle) ? mat->shader->rendererHandle
+	                                                                  : m_impl->defaultWorldHandle;
+	auto pit = m_impl->worldPipes.find(h);
+	if (pit == m_impl->worldPipes.end()) pit = m_impl->worldPipes.find(m_impl->defaultWorldHandle);
+	if (pit == m_impl->worldPipes.end()) return;
+	Impl::WorldPipe& wp = pit->second;
+
+	// Material constant buffer: standard color @0 + params @16, then the shader's custom props at
+	// their engine-parsed offsets (Shader::props). The renderer consumes the schema the engine
+	// parsed from the shader source — it never reads shader files itself.
+	{
+		MapHelper<Uint8> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		Uint8* p = mb;
+		memset(p, 0, Impl::kMatCBBytes);
+		memcpy(p + 0, col, sizeof(float) * 4);
+		float prm[4] = { srv ? 1.0f : 0.0f, nsrv ? 1.0f : 0.0f, metallic, roughness };
+		memcpy(p + 16, prm, sizeof(float) * 4);   // g_Params (hasBase, hasNormal, metallic, roughness)
+		float prm2[4] = { mrsrv ? 1.0f : 0.0f, aosrv ? 1.0f : 0.0f, emsrv ? 1.0f : 0.0f, 1.0f };
+		memcpy(p + 32, prm2, sizeof(float) * 4);  // g_Params2 (hasMR, hasAO, hasEm, aoStrength)
+		float emv[4] = { emissive[0], emissive[1], emissive[2], emissiveI };
+		memcpy(p + 48, emv, sizeof(float) * 4);   // g_Emissive2 (rgb, intensity)
+		if (mat && mat->shader)
+			for (const nuke::ShaderProp& sp : mat->shader->props)
+			{
+				// Value from the material INSTANCE's prop map (data only — no engine symbols linked);
+				// unset -> the shader's HLSL default.
+				auto pv = mat->props.find(sp.name);
+				const float* v = (pv != mat->props.end()) ? pv->second.data() : sp.def;
+				uint32_t bytes = (uint32_t)sp.components * sizeof(float);
+				if (sp.offset + bytes <= Impl::kMatCBBytes) memcpy(p + sp.offset, v, bytes);
+			}
+	}
+
+	if (wp.texVar)
+		wp.texVar->Set(srv ? srv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	ITextureView* whiteSRV = m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+	if (wp.normVar)
+		wp.normVar->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	if (wp.mrVar) wp.mrVar->Set(mrsrv ? mrsrv : whiteSRV);
+	if (wp.aoVar) wp.aoVar->Set(aosrv ? aosrv : whiteSRV);
+	if (wp.emVar) wp.emVar->Set(emsrv ? emsrv : whiteSRV);
+	if (wp.shadowVar) wp.shadowVar->Set(m_impl->shadowSRV ? m_impl->shadowSRV : whiteSRV);
+	if (wp.cubeVar && m_impl->shadowCubeSRV) wp.cubeVar->Set(m_impl->shadowCubeSRV);
+	if (wp.probeVar) wp.probeVar->Set((m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV);
+
+	IDeviceContext* ctx = m_impl->context;
+	IBuffer* vbs[]    = { g.pos, g.nrm, g.uv };
+	Uint64   offs[]   = { 0, 0, 0 };
+	ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	// Pick the blend variant for this material (engine sorts transparent/additive back-to-front).
+	IPipelineState* pso = wp.pso;
+	if (mat) { if (mat->blendMode == 1 && wp.psoBlend) pso = wp.psoBlend; else if (mat->blendMode == 2 && wp.psoAdd) pso = wp.psoAdd; }
+	ctx->SetPipelineState(pso);
+	ctx->CommitShaderResources(wp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
+	ctx->Draw(da);
+}
+
+void NukeDiligent::renderSelectionOutline(Mesh* mesh, const float pos[3], const float quat[4], const float scale[3])
+{
+	if (!m_impl->outlineMaskPSO || !m_impl->outlineEdgePSO || !m_impl->curRTV) return;
+	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
+	if (!gp) return;
+	Impl::MeshGPU& g = *gp;
+	m_impl->EnsureOutlineMask(m_impl->curRTW, m_impl->curRTH);
+	if (!m_impl->outlineMaskRTV || !m_impl->outlineMaskSRV) return;
+
+	IDeviceContext* ctx = m_impl->context;
+
+	// --- pass 1: render the selected mesh into the mask RT (alpha = 1 over the object) ---
+	{
+		float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
+		               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
+		               * float4x4::Translation(pos[0], pos[1], pos[2]);
+		float4x4 wvp = world * m_impl->curView * m_impl->curProj;
+		struct CBData { float4x4 wvp; float4x4 world; };
+		{ MapHelper<CBData> cb(ctx, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD); cb->wvp = wvp; cb->world = world; }
+
+		const float zero[4] = { 0, 0, 0, 0 };
+		ctx->SetRenderTargets(1, &m_impl->outlineMaskRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->ClearRenderTarget(m_impl->outlineMaskRTV, zero, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		IBuffer* vbs[]  = { g.pos, g.nrm, g.uv };
+		Uint64   offs[] = { 0, 0, 0 };
+		ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+		ctx->SetPipelineState(m_impl->outlineMaskPSO);
+		ctx->CommitShaderResources(m_impl->outlineMaskSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
+		ctx->Draw(da);
+	}
+
+	// --- pass 2: fullscreen edge-detect over the mask -> draw the border into the camera RT ---
+	{
+		struct EdgeData { float texel[4]; };
+		{
+			MapHelper<EdgeData> cb(ctx, m_impl->outlineEdgeCB, MAP_WRITE, MAP_FLAG_DISCARD);
+			cb->texel[0] = (m_impl->curRTW > 0) ? 1.0f / m_impl->curRTW : 0.0f;
+			cb->texel[1] = (m_impl->curRTH > 0) ? 1.0f / m_impl->curRTH : 0.0f;
+			cb->texel[2] = 2.0f;   // outline thickness in pixels (constant on screen)
+			cb->texel[3] = 0.0f;
+		}
+		ctx->SetRenderTargets(1, &m_impl->curRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->SetVertexBuffers(0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+		if (m_impl->outlineEdgeMaskVar) m_impl->outlineEdgeMaskVar->Set(m_impl->outlineMaskSRV);
+		ctx->SetPipelineState(m_impl->outlineEdgePSO);
+		ctx->CommitShaderResources(m_impl->outlineEdgeSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawAttribs fs{3, DRAW_FLAG_VERIFY_STATES};
+		ctx->Draw(fs);
+	}
+}
+
+// Fill the world FrameCB (camera pos, ambient, lights, shadow maps/params, sky IBL, reflection probe).
+// Shared by the camera pass and the probe cube-face passes (no duplication).
+void NukeDiligent::Impl::WriteFrameCB(const float3& P)
+{
+	MapHelper<FrameCBData> fb(context, worldFrameCB, MAP_WRITE, MAP_FLAG_DISCARD);
+	memset(fb, 0, sizeof(FrameCBData));
+	fb->camPos[0] = P.x; fb->camPos[1] = P.y; fb->camPos[2] = P.z;
+	fb->ambient[0] = sky.ambient[0]; fb->ambient[1] = sky.ambient[1];
+	fb->ambient[2] = sky.ambient[2]; fb->ambient[3] = sky.ambientIntensity;
+
+	std::vector<NukeLight> src = lights;
+	if (src.empty())
+	{
+		NukeLight sun; sun.type = 0; sun.dir[0] = -0.4f; sun.dir[1] = -0.85f; sun.dir[2] = -0.35f;
+		sun.color[0] = sun.color[1] = sun.color[2] = 1.0f; sun.intensity = 3.0f; src.push_back(sun);
+	}
+	int n = (int)src.size(); if (n > kMaxLights) n = kMaxLights;
+	fb->lightCount[0] = (float)n;
+	for (int k = 0; k < n; ++k)
+	{
+		const NukeLight& L = src[k]; GPULight& g = fb->lights[k];
+		g.posType[0] = L.pos[0]; g.posType[1] = L.pos[1]; g.posType[2] = L.pos[2]; g.posType[3] = (float)L.type;
+		g.dirRange[0] = L.dir[0]; g.dirRange[1] = L.dir[1]; g.dirRange[2] = L.dir[2]; g.dirRange[3] = L.range;
+		g.colorIntensity[0] = L.color[0]; g.colorIntensity[1] = L.color[1]; g.colorIntensity[2] = L.color[2]; g.colorIntensity[3] = L.intensity;
+		g.spot[0] = L.spotInner; g.spot[1] = L.spotOuter; g.spot[2] = (float)lightSlot[k]; g.spot[3] = (float)lightCube[k];
+	}
+	for (int s = 0; s < SHADOW_SLOTS; ++s) memcpy(fb->shadowVP + s * 16, &slotVP[s], sizeof(float) * 16);
+	fb->shadowParams[0] = (float)numShadowSlots;
+	fb->shadowParams[1] = shadowNormalBias;
+	fb->shadowParams[2] = (1.0f / (float)shadowRes) * shadowSoftness;
+	fb->shadowParams[3] = shadowDepthBias;
+	for (int k = 0; k < 3; ++k) { fb->skyTop[k] = sky.top[k]; fb->skyHorizon[k] = sky.horizon[k]; fb->skyGround[k] = sky.ground[k]; }
+	fb->skyParams[0] = sky.skyIntensity; fb->skyParams[1] = (sky.mode == 1) ? 1.0f : 0.0f;
+	fb->skyParams[2] = hdr ? 0.0f : 1.0f; fb->skyParams[3] = 0;
+	const bool probe = probeActive && probeCubeSRV;   // off during the probe's own capture -> no feedback
+	fb->probePos[0] = probePos[0]; fb->probePos[1] = probePos[1]; fb->probePos[2] = probePos[2]; fb->probePos[3] = probe ? 1.0f : 0.0f;
+	fb->probeParams[0] = probeIntensity; fb->probeParams[1] = probeMaxMip; fb->probeParams[2] = 0; fb->probeParams[3] = 0;
+	const bool box = probe && (probeBoxHalf[0] > 0.f || probeBoxHalf[1] > 0.f || probeBoxHalf[2] > 0.f);
+	fb->probeBox[0] = probeBoxHalf[0]; fb->probeBox[1] = probeBoxHalf[1]; fb->probeBox[2] = probeBoxHalf[2]; fb->probeBox[3] = box ? 1.0f : 0.0f;
+}
+
+void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
+{
+	m_impl->curTarget = cam.target;   // feedback guard: GetTexSRV won't sample the RT we draw into
+	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
+	m_impl->curPostSrc = nullptr; m_impl->curPostDst = nullptr;
+	const bool ms = m_impl->samples > 1;
+	ITextureView* rtv = nullptr;
+	ITextureView* dsv = nullptr;
+	int w = 0, h = 0;
+	if (cam.target == 0)
+	{
+		// The backbuffer path always renders through an HDR intermediate, then the post pass tonemaps it
+		// into the actual (LDR) swap-chain backbuffer in endCamera.
+		w = (int)m_impl->swapChain->GetDesc().Width;
+		h = (int)m_impl->swapChain->GetDesc().Height;
+		m_impl->EnsureBackbufferMS(w, h);
+		Impl::RT& bb = m_impl->backbufferMS;
+		rtv = bb.rtv; dsv = bb.dsv;
+		if (ms) { m_impl->curMSAA = true; m_impl->curResolveSrc = bb.colorMS; m_impl->curResolveDst = bb.color; }
+		m_impl->curPostSrc = bb.hdrSRV;
+		m_impl->curPostDst = m_impl->swapChain->GetCurrentBackBufferRTV();
+	}
+	else
+	{
+		auto it = m_impl->rts.find(cam.target);
+		if (it == m_impl->rts.end()) return;
+		Impl::RT& rt = it->second;
+		rtv = rt.rtv; dsv = rt.dsv; w = rt.w; h = rt.h;
+		if (ms && rt.colorMS) { m_impl->curMSAA = true; m_impl->curResolveSrc = rt.colorMS; m_impl->curResolveDst = rt.color; }
+		m_impl->curPostSrc = rt.hdrSRV;
+		m_impl->curPostDst = rt.postRTV;
+	}
+	if (!rtv) return;
+	m_impl->curRTV = rtv; m_impl->curRTW = w; m_impl->curRTH = h;   // for the selection-outline pass
+
+	IDeviceContext* ctx = m_impl->context;
+	ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ctx->ClearRenderTarget(rtv, cam.clear, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	if (dsv)
+		ctx->ClearDepthStencil(dsv, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+	ctx->SetViewports(1, &vp, w, h);
+
+	m_impl->SetCameraViewProj(cam, w, h);   // curView/curProj/curCamPos (shared with the SSR gbuffer prepass)
+
+	// PBR lighting buffer for this pass: camera pos + ambient + scene lights (default sun if none).
+	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
+	m_impl->WriteFrameCB(P);
+
+	m_impl->DrawSky();   // procedural sky behind the scene (after clear, before geometry)
+}
+
+void NukeDiligent::setSky(const NukeSky& s) { m_impl->sky = s; }
+
+void NukeDiligent::endCamera()
+{
+	// 1) Resolve the multisampled HDR color into the single-sample HDR texture (post-pass input).
+	if (m_impl->curMSAA && m_impl->curResolveSrc && m_impl->curResolveDst)
+	{
+		ResolveTextureSubresourceAttribs ra;
+		ra.SrcTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ra.DstTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ra.Format = m_impl->SceneFmt();
+		m_impl->context->ResolveTextureSubresource(m_impl->curResolveSrc, m_impl->curResolveDst, ra);
+	}
+	// 2) Custom effect chain (HDR): ping-pong the resolved scene through each post pipeline.
+	ITextureView* chainSrc = m_impl->curPostSrc;
+	if (!m_impl->postChain.empty() && m_impl->curPostSrc && m_impl->curRTW > 0 && m_impl->curRTH > 0)
+	{
+		m_impl->EnsureScratch(m_impl->curRTW, m_impl->curRTH);
+		const int w = m_impl->curRTW, h = m_impl->curRTH;
+		ITextureView* srcSRV = m_impl->curPostSrc;
+		int idx = 0;
+		for (auto& cs : m_impl->postChain)
+		{
+			auto pit = m_impl->postPipes.find(cs.pipeline);
+			if (pit == m_impl->postPipes.end() || !pit->second.pso) continue;
+			Diligent::ITexture* dstTex = m_impl->scratch[idx % 2];
+			if (!dstTex) break;
+			ITextureView* dstRTV = dstTex->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+			if (pit->second.isSSR)     // built-in screen-space reflections (samples the prepass G-buffer + depth)
+			{
+				if (!m_impl->gbufActive) continue;   // no prepass ran -> skip this stage (src passes through unchanged)
+				m_impl->RunSSR(pit->second, srcSRV, dstRTV, w, h, cs.params);
+			}
+			else if (pit->second.isBloom)   // built-in multi-pass bloom (params: x=threshold, y=intensity)
+			{
+				float thr = cs.params.size() > 0 ? cs.params[0] : 1.0f;
+				float inten = cs.params.size() > 1 ? cs.params[1] : 0.6f;
+				m_impl->RunBloom(srcSRV, dstRTV, w, h, thr, inten);
+			}
+			else                       // single fullscreen custom effect
+			{
+				{
+					MapHelper<float> cb(m_impl->context, m_impl->postParamsCB, MAP_WRITE, MAP_FLAG_DISCARD);
+					int n = (int)cs.params.size(); if (n > 64) n = 64;
+					for (int k = 0; k < 64; ++k) cb[k] = (k < n) ? cs.params[k] : 0.0f;
+				}
+				{
+					MapHelper<float> fb(m_impl->context, m_impl->postFrameCB, MAP_WRITE, MAP_FLAG_DISCARD);
+					fb[0] = (float)w; fb[1] = (float)h; fb[2] = w ? 1.0f / w : 0.0f; fb[3] = h ? 1.0f / h : 0.0f;
+					fb[4] = fb[5] = fb[6] = fb[7] = 0.0f;
+				}
+				m_impl->context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+				Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+				m_impl->context->SetViewports(1, &vp, w, h);
+				if (pit->second.srcVar) pit->second.srcVar->Set(srcSRV);
+				m_impl->context->SetPipelineState(pit->second.pso);
+				m_impl->context->CommitShaderResources(pit->second.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+				DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
+				m_impl->context->Draw(da);
+			}
+			srcSRV = dstTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+			++idx;
+		}
+		chainSrc = srcSRV;
+	}
+	// 3) Final tonemap/encode into the output (RT's post texture, or the backbuffer for target 0).
+	if (chainSrc && m_impl->curPostDst)
+		m_impl->RunPostPass(chainSrc, m_impl->curPostDst, m_impl->curRTW, m_impl->curRTH, m_impl->curTarget == 0);
+
+	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
+	m_impl->curPostSrc = nullptr; m_impl->curPostDst = nullptr;
+	m_impl->curTarget = 0;
+}
+
+void NukeDiligent::getViewProj(float* view16, float* proj16)
+{
+	if (view16) memcpy(view16, m_impl->curView.Data(), 16 * sizeof(float));
+	if (proj16) memcpy(proj16, m_impl->curProj.Data(), 16 * sizeof(float));
+}
