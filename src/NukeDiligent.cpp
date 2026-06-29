@@ -113,7 +113,7 @@ struct NukeDiligent::Impl
 	IShaderResourceVariable*              postHdrVar = nullptr;
 	IShaderResourceVariable*              postHdrVarBB = nullptr;
 	// Custom post-effect chain (one fullscreen pipeline per effect; ping-ponged in HDR before the final tonemap).
-	struct PostPipe { RefCntAutoPtr<IPipelineState> pso; RefCntAutoPtr<IShaderResourceBinding> srb; IShaderResourceVariable* srcVar = nullptr; };
+	struct PostPipe { RefCntAutoPtr<IPipelineState> pso; RefCntAutoPtr<IShaderResourceBinding> srb; IShaderResourceVariable* srcVar = nullptr; bool isBloom = false; };
 	std::unordered_map<uint64_t, PostPipe> postPipes;
 	RefCntAutoPtr<IBuffer>                postParamsCB;   // shared PostParams (per-effect params, 256B)
 	RefCntAutoPtr<IBuffer>                postFrameCB;    // shared PostFrame (resolution / time)
@@ -121,8 +121,22 @@ struct NukeDiligent::Impl
 	int                                   scratchW = 0, scratchH = 0;
 	struct ChainStage { uint64_t pipeline; std::vector<float> params; };
 	std::vector<ChainStage>               postChain;      // current camera's effect chain (copied in setPostChain)
-	uint64_t CreatePostPipe(const std::string& ps);
+	uint64_t CreatePostPipe(const std::string& name, const std::string& ps);
 	void     EnsureScratch(int w, int h);
+
+	// Built-in bloom (multi-pass): bright-pass -> separable blur (half-res ping-pong) -> composite. Invoked
+	// for a chain stage whose post shader is named "bloom".
+	RefCntAutoPtr<IPipelineState>         bloomBrightPSO, bloomBlurPSO, bloomCompPSO;
+	RefCntAutoPtr<IShaderResourceBinding> bloomBrightSRB, bloomBlurSRB, bloomCompSRB;
+	IShaderResourceVariable*              bbSrc = nullptr;   // bright g_Source
+	IShaderResourceVariable*              blSrc = nullptr;   // blur g_Source
+	IShaderResourceVariable*              bcSrc = nullptr;   // comp g_Source (scene)
+	IShaderResourceVariable*              bcBloom = nullptr; // comp g_Bloom
+	RefCntAutoPtr<IBuffer>                bloomCB;
+	RefCntAutoPtr<ITexture>               bloomTex[2];       // half-res blur ping-pong
+	int                                   bloomW = 0, bloomH = 0;
+	void EnsureBloom(int w, int h);
+	void RunBloom(ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, float threshold, float intensity);
 	bool                                  hdrOutput = false;   // requested HDR10 display output (Player only, before init)
 	bool                                  hdr10Active = false; // an HDR10 swap chain is actually live (display is HDR)
 	void CreatePostResources();
@@ -1028,6 +1042,43 @@ void NukeDiligent::Impl::CreatePostResources()
 	buildPost(TEX_FORMAT_RGBA8_UNORM, "Post PSO", postPSO, postSRB, postHdrVar);
 	TEXTURE_FORMAT bbFmt = swapChain ? swapChain->GetDesc().ColorBufferFormat : TEX_FORMAT_RGBA8_UNORM;
 	buildPost(bbFmt, "Post PSO BB", postPSOBB, postSRBBB, postHdrVarBB);
+
+	// --- Built-in bloom pipelines (bright-pass / blur / composite), all fullscreen HDR ----------------
+	bloomBrightPSO.Release(); bloomBlurPSO.Release(); bloomCompPSO.Release(); bloomCB.Release();
+	if (!bloomCB) { BufferDesc d; d.Name = "BloomCB"; d.Size = sizeof(float) * 8; d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &bloomCB); }
+	auto bloomPSO = [&](const char* psName, const char* dbg, bool twoTex,
+	                    RefCntAutoPtr<IPipelineState>& pso, RefCntAutoPtr<IShaderResourceBinding>& srb,
+	                    IShaderResourceVariable*& srcV, IShaderResourceVariable** bloomV)
+	{
+		std::string ps = shaderSource(psName);
+		if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tbloom shader missing: " << psName << endl; return; }
+		ShaderCreateInfo s; s.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+		RefCntAutoPtr<IShader> vv, pp; s.Desc = {dbg, SHADER_TYPE_VERTEX, true}; s.Source = vs.c_str(); device->CreateShader(s, &vv);
+		s.Desc = {dbg, SHADER_TYPE_PIXEL, true}; s.Source = ps.c_str(); device->CreateShader(s, &pp);
+		if (!vv || !pp) return;
+		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = dbg;
+		auto& gp = ci.GraphicsPipeline;
+		gp.NumRenderTargets = 1; gp.RTVFormats[0] = HDR_FMT; gp.DSVFormat = TEX_FORMAT_UNKNOWN;
+		gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
+		gp.DepthStencilDesc.DepthEnable = False; gp.InputLayout.NumElements = 0;
+		std::vector<ShaderResourceVariableDesc> vars = {{SHADER_TYPE_PIXEL, "g_Source", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}};
+		std::vector<ImmutableSamplerDesc> imms;
+		SamplerDesc sm; sm.MinFilter = FILTER_TYPE_LINEAR; sm.MagFilter = FILTER_TYPE_LINEAR; sm.MipFilter = FILTER_TYPE_LINEAR; sm.AddressU = TEXTURE_ADDRESS_CLAMP; sm.AddressV = TEXTURE_ADDRESS_CLAMP;
+		imms.push_back({SHADER_TYPE_PIXEL, "g_Source", sm});
+		if (twoTex) { vars.push_back({SHADER_TYPE_PIXEL, "g_Bloom", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}); imms.push_back({SHADER_TYPE_PIXEL, "g_Bloom", sm}); }
+		ci.PSODesc.ResourceLayout.Variables = vars.data(); ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
+		ci.PSODesc.ResourceLayout.ImmutableSamplers = imms.data(); ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)imms.size();
+		ci.pVS = vv; ci.pPS = pp;
+		device->CreateGraphicsPipelineState(ci, &pso);
+		if (!pso) { cout << "[NukeDiligent]\tbloom PSO failed: " << dbg << endl; return; }
+		if (auto* c = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "BloomCB")) c->Set(bloomCB);
+		pso->CreateShaderResourceBinding(&srb, true);
+		srcV = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Source");
+		if (bloomV) *bloomV = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Bloom");
+	};
+	bloomPSO("bloom_bright.ps", "Bloom Bright", false, bloomBrightPSO, bloomBrightSRB, bbSrc, nullptr);
+	bloomPSO("bloom_blur.ps",   "Bloom Blur",   false, bloomBlurPSO,   bloomBlurSRB,   blSrc, nullptr);
+	bloomPSO("bloom_comp.ps",   "Bloom Comp",   true,  bloomCompPSO,   bloomCompSRB,   bcSrc, &bcBloom);
 }
 
 // Tonemap HDR -> output into dstRTV. toBackbuffer picks the backbuffer PSO + (when HDR10 is live) PQ encoding.
@@ -1054,7 +1105,7 @@ void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV,
 }
 
 // Build a custom post-effect pipeline from a fullscreen PS (samples g_Source, params in PostParams).
-uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& ps)
+uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::string& ps)
 {
 	std::string vs = shaderSource("post.vs");
 	if (vs.empty() || ps.empty()) return 0;
@@ -1086,6 +1137,7 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& ps)
 	if (auto* f = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostFrame"))  f->Set(postFrameCB);
 	pp.pso->CreateShaderResourceBinding(&pp.srb, true);
 	pp.srcVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Source");
+	pp.isBloom = (name == "bloom");   // built-in multi-pass effect; the renderer runs the passes itself
 	uint64_t h = nextShaderHandle++;
 	postPipes[h] = std::move(pp);
 	return h;
@@ -1103,6 +1155,66 @@ void NukeDiligent::Impl::EnsureScratch(int w, int h)
 		td.Format = HDR_FMT; td.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
 		device->CreateTexture(td, nullptr, &scratch[i]);
 	}
+}
+
+void NukeDiligent::Impl::EnsureBloom(int w, int h)
+{
+	int bw = w > 1 ? w / 2 : 1, bh = h > 1 ? h / 2 : 1;
+	if (bloomTex[0] && bloomW == bw && bloomH == bh) return;
+	bloomW = bw; bloomH = bh;
+	for (int i = 0; i < 2; ++i)
+	{
+		bloomTex[i].Release();
+		TextureDesc td; td.Name = "Bloom"; td.Type = RESOURCE_DIM_TEX_2D; td.Width = (Uint32)bw; td.Height = (Uint32)bh;
+		td.Format = HDR_FMT; td.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+		device->CreateTexture(td, nullptr, &bloomTex[i]);
+	}
+}
+
+// Built-in bloom: bright-pass (-> half-res A) -> separable blur (A<->B, a few iterations) -> composite
+// (scene + A*intensity -> dst).
+void NukeDiligent::Impl::RunBloom(ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, float threshold, float intensity)
+{
+	if (!bloomBrightPSO || !bloomBlurPSO || !bloomCompPSO || !srcSRV || !dstRTV) return;
+	EnsureBloom(w, h);
+	if (!bloomTex[0] || !bloomTex[1]) return;
+	const int bw = bloomW, bh = bloomH;
+	auto setCB = [&](float dx, float dy)
+	{
+		MapHelper<float> cb(context, bloomCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		cb[0] = threshold; cb[1] = intensity; cb[2] = 0; cb[3] = 0; cb[4] = dx; cb[5] = dy; cb[6] = 0; cb[7] = 0;
+	};
+	auto pass = [&](IPipelineState* pso, IShaderResourceBinding* srb, IShaderResourceVariable* sv, ITextureView* in, ITextureView* out, int vw, int vh)
+	{
+		context->SetRenderTargets(1, &out, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)vw; vp.Height = (float)vh; vp.MinDepth = 0; vp.MaxDepth = 1;
+		context->SetViewports(1, &vp, vw, vh);
+		if (sv) sv->Set(in);
+		context->SetPipelineState(pso);
+		context->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES}; context->Draw(da);
+	};
+	ITextureView* aRTV = bloomTex[0]->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+	ITextureView* aSRV = bloomTex[0]->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+	ITextureView* bRTV = bloomTex[1]->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+	ITextureView* bSRV = bloomTex[1]->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+	setCB(0, 0);                                          // 1) bright-pass: scene -> A (half res)
+	pass(bloomBrightPSO, bloomBrightSRB, bbSrc, srcSRV, aRTV, bw, bh);
+	const float tx = bw ? 1.0f / bw : 0.0f, ty = bh ? 1.0f / bh : 0.0f;
+	for (int it = 0; it < 3; ++it)                        // 2) separable Gaussian blur (H then V)
+	{
+		setCB(tx, 0.0f); pass(bloomBlurPSO, bloomBlurSRB, blSrc, aSRV, bRTV, bw, bh);
+		setCB(0.0f, ty); pass(bloomBlurPSO, bloomBlurSRB, blSrc, bSRV, aRTV, bw, bh);
+	}
+	setCB(0, 0);                                          // 3) composite: scene + A*intensity -> dst (full res)
+	context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+	context->SetViewports(1, &vp, w, h);
+	if (bcSrc)   bcSrc->Set(srcSRV);
+	if (bcBloom) bcBloom->Set(aSRV);
+	context->SetPipelineState(bloomCompPSO);
+	context->CommitShaderResources(bloomCompSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES}; context->Draw(da);
 }
 
 static void glfw_error(int code, const char* desc)
@@ -1862,24 +1974,33 @@ void NukeDiligent::endCamera()
 			Diligent::ITexture* dstTex = m_impl->scratch[idx % 2];
 			if (!dstTex) break;
 			ITextureView* dstRTV = dstTex->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+			if (pit->second.isBloom)   // built-in multi-pass bloom (params: x=threshold, y=intensity)
 			{
-				MapHelper<float> cb(m_impl->context, m_impl->postParamsCB, MAP_WRITE, MAP_FLAG_DISCARD);
-				int n = (int)cs.params.size(); if (n > 64) n = 64;
-				for (int k = 0; k < 64; ++k) cb[k] = (k < n) ? cs.params[k] : 0.0f;
+				float thr = cs.params.size() > 0 ? cs.params[0] : 1.0f;
+				float inten = cs.params.size() > 1 ? cs.params[1] : 0.6f;
+				m_impl->RunBloom(srcSRV, dstRTV, w, h, thr, inten);
 			}
+			else                       // single fullscreen custom effect
 			{
-				MapHelper<float> fb(m_impl->context, m_impl->postFrameCB, MAP_WRITE, MAP_FLAG_DISCARD);
-				fb[0] = (float)w; fb[1] = (float)h; fb[2] = w ? 1.0f / w : 0.0f; fb[3] = h ? 1.0f / h : 0.0f;
-				fb[4] = fb[5] = fb[6] = fb[7] = 0.0f;
+				{
+					MapHelper<float> cb(m_impl->context, m_impl->postParamsCB, MAP_WRITE, MAP_FLAG_DISCARD);
+					int n = (int)cs.params.size(); if (n > 64) n = 64;
+					for (int k = 0; k < 64; ++k) cb[k] = (k < n) ? cs.params[k] : 0.0f;
+				}
+				{
+					MapHelper<float> fb(m_impl->context, m_impl->postFrameCB, MAP_WRITE, MAP_FLAG_DISCARD);
+					fb[0] = (float)w; fb[1] = (float)h; fb[2] = w ? 1.0f / w : 0.0f; fb[3] = h ? 1.0f / h : 0.0f;
+					fb[4] = fb[5] = fb[6] = fb[7] = 0.0f;
+				}
+				m_impl->context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+				Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+				m_impl->context->SetViewports(1, &vp, w, h);
+				if (pit->second.srcVar) pit->second.srcVar->Set(srcSRV);
+				m_impl->context->SetPipelineState(pit->second.pso);
+				m_impl->context->CommitShaderResources(pit->second.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+				DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
+				m_impl->context->Draw(da);
 			}
-			m_impl->context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-			Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
-			m_impl->context->SetViewports(1, &vp, w, h);
-			if (pit->second.srcVar) pit->second.srcVar->Set(srcSRV);
-			m_impl->context->SetPipelineState(pit->second.pso);
-			m_impl->context->CommitShaderResources(pit->second.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-			DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
-			m_impl->context->Draw(da);
 			srcSRV = dstTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 			++idx;
 		}
@@ -1915,7 +2036,7 @@ void NukeDiligent::setHDR(bool on)
 }
 bool NukeDiligent::getHDR() { return m_impl->pendingHDR >= 0 ? (m_impl->pendingHDR != 0) : m_impl->hdr; }
 
-uint64_t NukeDiligent::createPostPipeline(const char* name, const char* ps) { (void)name; return m_impl->CreatePostPipe(ps ? ps : ""); }
+uint64_t NukeDiligent::createPostPipeline(const char* name, const char* ps) { return m_impl->CreatePostPipe(name ? name : "", ps ? ps : ""); }
 
 void NukeDiligent::setPostChain(const NukePostStage* stages, int count)
 {
