@@ -113,7 +113,8 @@ struct NukeDiligent::Impl
 	IShaderResourceVariable*              postHdrVar = nullptr;
 	IShaderResourceVariable*              postHdrVarBB = nullptr;
 	// Custom post-effect chain (one fullscreen pipeline per effect; ping-ponged in HDR before the final tonemap).
-	struct PostPipe { RefCntAutoPtr<IPipelineState> pso; RefCntAutoPtr<IShaderResourceBinding> srb; IShaderResourceVariable* srcVar = nullptr; bool isBloom = false; };
+	struct PostPipe { RefCntAutoPtr<IPipelineState> pso; RefCntAutoPtr<IShaderResourceBinding> srb; IShaderResourceVariable* srcVar = nullptr; bool isBloom = false;
+	                  IShaderResourceVariable* gbufVar = nullptr; IShaderResourceVariable* depthVar = nullptr; bool isSSR = false; };
 	std::unordered_map<uint64_t, PostPipe> postPipes;
 	RefCntAutoPtr<IBuffer>                postParamsCB;   // shared PostParams (per-effect params, 256B)
 	RefCntAutoPtr<IBuffer>                postFrameCB;    // shared PostFrame (resolution / time)
@@ -154,11 +155,29 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<ITexture>              fallbackCube;     // 1x1 cube bound to g_Probe when no probe is active
 	ITextureView*                        fallbackCubeSRV = nullptr;
 	RefCntAutoPtr<ISampler>              probeSampler;     // linear-clamp; attached to probe/fallback cube SRVs
+
+	// G-buffer prepass (single-sample) for screen-space reflections: normal(oct)+roughness+metalness + depth.
+	// Rendered per SSR camera before the colour pass; the "ssr" post effect samples it. Own 1x depth -> no MSAA
+	// depth resolve, and the colour/custom shaders stay untouched (a dedicated gbuffer.ps fills it).
+	RefCntAutoPtr<ITexture>             gbufColor, gbufDepth;
+	ITextureView*                       gbufRTV = nullptr, *gbufDSV = nullptr, *gbufSRV = nullptr, *gbufDepthSRV = nullptr;
+	int                                 gbufW = 0, gbufH = 0;
+	bool                                gbufActive = false;   // a valid prepass ran for the current camera
+	RefCntAutoPtr<IPipelineState>       gbufPSO;
+	RefCntAutoPtr<IShaderResourceBinding> gbufSRB;
+	IShaderResourceVariable*            gbufMRVar = nullptr;   // PS g_MetalRough (dynamic)
+	RefCntAutoPtr<IBuffer>              ssrCB;                 // SSR matrices (view/proj/invProj/res)
+	void EnsureGBuffer(int w, int h);
+	bool BuildGBufferPipe();
+	void SetCameraViewProj(const NukeCameraDesc& cam, int w, int h);   // curView/curProj/curCamPos (shared: camera + gbuffer)
+	bool CameraSize(const NukeCameraDesc& cam, int& w, int& h);
+	void RunSSR(PostPipe& pp, ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, const std::vector<float>& params);
 	bool        probeActive = false;     // a probe cube is bound (and not currently capturing)
 	ITextureView* probeCubeSRV = nullptr;
 	float       probePos[3] = {0,0,0};
 	float       probeIntensity = 1.0f;
 	float       probeMaxMip = 0.0f;
+	float       probeBoxHalf[3] = {0,0,0};   // parallax box half-extents (0 = no parallax correction)
 	bool                                  hdrOutput = false;   // requested HDR10 display output (Player only, before init)
 	bool                                  hdr10Active = false; // an HDR10 swap chain is actually live (display is HDR)
 	float                                 hdrPaperWhite = 200.0f;   // diffuse-white nits for the HDR10 encode
@@ -203,7 +222,7 @@ struct NukeDiligent::Impl
 	struct FrameCBData { float camPos[4]; float ambient[4]; float lightCount[4]; GPULight lights[kMaxLights];
 	                     float shadowVP[16 * 4]; float shadowParams[4];        // 4 = SHADOW_SLOTS
 	                     float skyTop[4]; float skyHorizon[4]; float skyGround[4]; float skyParams[4];      // IBL
-	                     float probePos[4]; float probeParams[4]; };   // reflection probe: pos.xyz+active, intensity+maxMip
+	                     float probePos[4]; float probeParams[4]; float probeBox[4]; };   // probe: pos.xyz+active, intensity+maxMip, boxHalf.xyz+valid
 	void WriteFrameCB(const Diligent::float3& P);   // fill worldFrameCB (lights/shadows/sky/probe) — shared by camera + cube-face passes
 	float                                 curCamPos[3] = {0, 0, 0};  // set in beginCamera (PBR view dir)
 	uint64_t                              curTarget = 0;             // RT id bound by beginCamera (feedback guard)
@@ -1073,6 +1092,9 @@ void NukeDiligent::Impl::CreatePostResources()
 	// and PostFrame (resolution / time, for blur kernels & animated effects).
 	if (!postParamsCB) { BufferDesc d; d.Name = "PostParams"; d.Size = 256; d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &postParamsCB); }
 	if (!postFrameCB)  { BufferDesc d; d.Name = "PostFrame";  d.Size = sizeof(float) * 8; d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &postFrameCB); }
+	// SSR matrices (view/proj/invProj + resolution), filled per camera in RunSSR.
+	if (!ssrCB) { BufferDesc d; d.Name = "SSRCB"; d.Size = sizeof(float) * (16 * 3 + 4); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &ssrCB); }
+	BuildGBufferPipe();   // gbuffer.ps + world.vs (shares worldCB/worldMatCB) — for the SSR prepass
 
 	// Build one post PSO per output format: RGBA8 for RT targets, swap-chain format for the backbuffer.
 	auto buildPost = [&](TEXTURE_FORMAT fmt, const char* name,
@@ -1186,24 +1208,152 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
 	gp.DepthStencilDesc.DepthEnable = False;
 	gp.InputLayout.NumElements = 0;
-	ShaderResourceVariableDesc vars[] = {{SHADER_TYPE_PIXEL, "g_Source", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}};
-	ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 1;
+	const bool ssr = (name == "ssr");   // built-in: also samples the G-buffer + depth + camera matrices (SSRCB)
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP;
-	ImmutableSamplerDesc imm[] = {{SHADER_TYPE_PIXEL, "g_Source", samp}};
-	ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+	std::vector<ShaderResourceVariableDesc> vars = {{SHADER_TYPE_PIXEL, "g_Source", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}};
+	std::vector<ImmutableSamplerDesc>       imms = {{SHADER_TYPE_PIXEL, "g_Source", samp}};
+	if (ssr)
+	{
+		vars.push_back({SHADER_TYPE_PIXEL, "g_GBuffer", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+		vars.push_back({SHADER_TYPE_PIXEL, "g_Depth",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+		imms.push_back({SHADER_TYPE_PIXEL, "g_GBuffer", samp});
+		imms.push_back({SHADER_TYPE_PIXEL, "g_Depth",   samp});
+	}
+	ci.PSODesc.ResourceLayout.Variables = vars.data(); ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
+	ci.PSODesc.ResourceLayout.ImmutableSamplers = imms.data(); ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)imms.size();
 	ci.pVS = v; ci.pPS = p;
 	PostPipe pp;
 	device->CreateGraphicsPipelineState(ci, &pp.pso);
 	if (!pp.pso) { cout << "[NukeDiligent]\tpost effect PSO build failed" << endl; return 0; }
 	if (auto* c = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostParams")) c->Set(postParamsCB);
 	if (auto* f = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostFrame"))  f->Set(postFrameCB);
+	if (ssr) if (auto* s = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "SSRCB")) s->Set(ssrCB);
 	pp.pso->CreateShaderResourceBinding(&pp.srb, true);
 	pp.srcVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Source");
+	if (ssr) { pp.gbufVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GBuffer"); pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.isSSR = true; }
 	pp.isBloom = (name == "bloom");   // built-in multi-pass effect; the renderer runs the passes itself
 	uint64_t h = nextShaderHandle++;
 	postPipes[h] = std::move(pp);
 	return h;
+}
+
+// G-buffer targets for the SSR prepass: RGBA16F colour (octN.xy, rough, metal) + D32 depth, both 1x (single
+// sample) and shader-readable. Resized to the current camera target.
+void NukeDiligent::Impl::EnsureGBuffer(int w, int h)
+{
+	if (w <= 0 || h <= 0) return;
+	if (gbufColor && gbufW == w && gbufH == h) return;
+	gbufW = w; gbufH = h;
+	gbufColor.Release(); gbufDepth.Release();
+	gbufRTV = gbufSRV = gbufDSV = gbufDepthSRV = nullptr;
+
+	TextureDesc cd; cd.Name = "GBuffer"; cd.Type = RESOURCE_DIM_TEX_2D; cd.Width = (Uint32)w; cd.Height = (Uint32)h;
+	cd.Format = TEX_FORMAT_RGBA16_FLOAT; cd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+	device->CreateTexture(cd, nullptr, &gbufColor);
+	if (gbufColor) { gbufRTV = gbufColor->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); gbufSRV = gbufColor->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
+
+	TextureDesc dd; dd.Name = "GBuffer Depth"; dd.Type = RESOURCE_DIM_TEX_2D; dd.Width = (Uint32)w; dd.Height = (Uint32)h;
+	dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE;
+	device->CreateTexture(dd, nullptr, &gbufDepth);
+	if (gbufDepth) { gbufDSV = gbufDepth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL); gbufDepthSRV = gbufDepth->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
+}
+
+// G-buffer prepass pipeline: world.vs (shares worldCB) + gbuffer.ps (shares worldMatCB). Single-sample, depth
+// write on; outputs the packed surface buffer. Rebuild-safe.
+bool NukeDiligent::Impl::BuildGBufferPipe()
+{
+	gbufPSO.Release(); gbufSRB.Release(); gbufMRVar = nullptr;
+	std::string vsSrc = shaderSource("world.vs"), psSrc = shaderSource("gbuffer.ps");
+	if (vsSrc.empty() || psSrc.empty()) return false;
+	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	RefCntAutoPtr<IShader> vs, ps;
+	sci.Desc = {"GBuffer VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); device->CreateShader(sci, &vs);
+	sci.Desc = {"GBuffer PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); device->CreateShader(sci, &ps);
+	if (!vs || !ps) return false;
+
+	GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "GBuffer PSO";
+	auto& gp = ci.GraphicsPipeline;
+	gp.NumRenderTargets = 1; gp.RTVFormats[0] = TEX_FORMAT_RGBA16_FLOAT; gp.DSVFormat = TEX_FORMAT_D32_FLOAT;
+	gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+	gp.RasterizerDesc.CullMode = CULL_MODE_BACK;
+	gp.DepthStencilDesc.DepthEnable = True; gp.DepthStencilDesc.DepthWriteEnable = True;
+	gp.SmplDesc.Count = 1;   // 1x — its own depth, no MSAA resolve needed for SSR
+	LayoutElement layout[] = { {0, 0, 3, VT_FLOAT32}, {1, 1, 3, VT_FLOAT32}, {2, 2, 2, VT_FLOAT32} };
+	gp.InputLayout.NumElements = 3; gp.InputLayout.LayoutElements = layout;
+
+	ShaderResourceVariableDesc vars[] = { {SHADER_TYPE_PIXEL, "g_MetalRough", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC} };
+	ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 1;
+	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
+	samp.AddressU = TEXTURE_ADDRESS_WRAP; samp.AddressV = TEXTURE_ADDRESS_WRAP;
+	ImmutableSamplerDesc imm[] = { {SHADER_TYPE_PIXEL, "g_Tex", samp} };
+	ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+	ci.pVS = vs; ci.pPS = ps;
+	device->CreateGraphicsPipelineState(ci, &gbufPSO);
+	if (!gbufPSO) { cout << "[NukeDiligent]\tgbuffer PSO build failed" << endl; return false; }
+	if (auto* c = gbufPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))    c->Set(worldCB);
+	if (auto* m = gbufPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB")) m->Set(worldMatCB);
+	gbufPSO->CreateShaderResourceBinding(&gbufSRB, true);
+	gbufMRVar = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
+	return true;
+}
+
+// Camera basis -> curView/curProj/curCamPos. Shared by beginCamera and the SSR gbuffer prepass so both use the
+// exact same transform (left-handed look-at; same projection as beginCamera).
+void NukeDiligent::Impl::SetCameraViewProj(const NukeCameraDesc& cam, int w, int h)
+{
+	const float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
+	float3 F = normalize(float3(cam.camFwd[0], cam.camFwd[1], cam.camFwd[2]));
+	float3 U = float3(cam.camUp[0], cam.camUp[1], cam.camUp[2]);
+	float3 R = normalize(cross(U, F)); U = cross(F, R);
+	curView = float4x4(R.x, U.x, F.x, 0.f, R.y, U.y, F.y, 0.f, R.z, U.z, F.z, 0.f, -dot(P, R), -dot(P, U), -dot(P, F), 1.f);
+	curProj = float4x4::Projection(cam.fov, aspect, cam.nearZ, cam.farZ, false);
+	curCamPos[0] = P.x; curCamPos[1] = P.y; curCamPos[2] = P.z;
+}
+
+// Target size for a camera (matches beginCamera): backbuffer (target 0) or the off-screen RT.
+bool NukeDiligent::Impl::CameraSize(const NukeCameraDesc& cam, int& w, int& h)
+{
+	if (cam.target == 0)
+	{
+		if (!swapChain) return false;
+		w = (int)swapChain->GetDesc().Width; h = (int)swapChain->GetDesc().Height;
+	}
+	else
+	{
+		auto it = rts.find(cam.target);
+		if (it == rts.end()) return false;
+		w = it->second.w; h = it->second.h;
+	}
+	return w > 0 && h > 0;
+}
+
+// Screen-space reflections pass: ray-march the prepass G-buffer/depth, blend onto the chain colour. Falls back
+// to a passthrough (handled by the caller) when no prepass ran.
+void NukeDiligent::Impl::RunSSR(PostPipe& pp, ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, const std::vector<float>& params)
+{
+	{
+		struct SSRData { float4x4 view, proj, invProj; float res[4]; };
+		MapHelper<SSRData> cb(context, ssrCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		cb->view = curView; cb->proj = curProj; cb->invProj = curProj.Inverse();
+		cb->res[0] = (float)w; cb->res[1] = (float)h; cb->res[2] = w ? 1.0f / w : 0.0f; cb->res[3] = h ? 1.0f / h : 0.0f;
+	}
+	{
+		MapHelper<float> cbp(context, postParamsCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		int n = (int)params.size(); if (n > 64) n = 64;
+		for (int k = 0; k < 64; ++k) cbp[k] = (k < n) ? params[k] : 0.0f;
+	}
+	context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+	context->SetViewports(1, &vp, w, h);
+	if (pp.srcVar)   pp.srcVar->Set(srcSRV);
+	if (pp.gbufVar)  pp.gbufVar->Set(gbufSRV);
+	if (pp.depthVar) pp.depthVar->Set(gbufDepthSRV);
+	context->SetPipelineState(pp.pso);
+	context->CommitShaderResources(pp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
+	context->Draw(da);
 }
 
 void NukeDiligent::Impl::EnsureScratch(int w, int h)
@@ -1811,6 +1961,8 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 	const bool probe = probeActive && probeCubeSRV;   // off during the probe's own capture -> no feedback
 	fb->probePos[0] = probePos[0]; fb->probePos[1] = probePos[1]; fb->probePos[2] = probePos[2]; fb->probePos[3] = probe ? 1.0f : 0.0f;
 	fb->probeParams[0] = probeIntensity; fb->probeParams[1] = probeMaxMip; fb->probeParams[2] = 0; fb->probeParams[3] = 0;
+	const bool box = probe && (probeBoxHalf[0] > 0.f || probeBoxHalf[1] > 0.f || probeBoxHalf[2] > 0.f);
+	fb->probeBox[0] = probeBoxHalf[0]; fb->probeBox[1] = probeBoxHalf[1]; fb->probeBox[2] = probeBoxHalf[2]; fb->probeBox[3] = box ? 1.0f : 0.0f;
 }
 
 void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
@@ -1856,22 +2008,10 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
 	ctx->SetViewports(1, &vp, w, h);
 
-	const float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
-	// View from the camera's basis (left-handed look-at).
-	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
-	float3 F = normalize(float3(cam.camFwd[0], cam.camFwd[1], cam.camFwd[2]));
-	float3 U = float3(cam.camUp[0], cam.camUp[1], cam.camUp[2]);
-	float3 R = normalize(cross(U, F));
-	U = cross(F, R);
-	m_impl->curView = float4x4(
-		R.x, U.x, F.x, 0.f,
-		R.y, U.y, F.y, 0.f,
-		R.z, U.z, F.z, 0.f,
-		-dot(P, R), -dot(P, U), -dot(P, F), 1.f);
-	m_impl->curProj = float4x4::Projection(cam.fov, aspect, cam.nearZ, cam.farZ, false);
+	m_impl->SetCameraViewProj(cam, w, h);   // curView/curProj/curCamPos (shared with the SSR gbuffer prepass)
 
 	// PBR lighting buffer for this pass: camera pos + ambient + scene lights (default sun if none).
-	m_impl->curCamPos[0] = P.x; m_impl->curCamPos[1] = P.y; m_impl->curCamPos[2] = P.z;
+	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
 	m_impl->WriteFrameCB(P);
 
 	m_impl->DrawSky();   // procedural sky behind the scene (after clear, before geometry)
@@ -2023,6 +2163,64 @@ void NukeDiligent::renderShadowObject(Mesh* mesh, const float pos[3], const floa
 
 void NukeDiligent::endShadowPass() { /* the next beginCamera rebinds the camera targets */ }
 
+// --- SSR G-buffer prepass (single-sample): normal/roughness/metalness + depth, before the colour pass --------
+void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
+{
+	m_impl->gbufActive = false;
+	if (!m_impl->gbufPSO) return;
+	int w = 0, h = 0;
+	if (!m_impl->CameraSize(cam, w, h)) return;
+	m_impl->EnsureGBuffer(w, h);
+	if (!m_impl->gbufRTV || !m_impl->gbufDSV) return;
+	m_impl->SetCameraViewProj(cam, w, h);
+	IDeviceContext* ctx = m_impl->context;
+	ctx->SetRenderTargets(1, &m_impl->gbufRTV, m_impl->gbufDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	const float clr[4] = { 0, 0, 0, 0 };
+	ctx->ClearRenderTarget(m_impl->gbufRTV, clr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ctx->ClearDepthStencil(m_impl->gbufDSV, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+	ctx->SetViewports(1, &vp, w, h);
+	m_impl->gbufActive = true;
+}
+
+void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3])
+{
+	if (!m_impl->gbufActive || !m_impl->gbufPSO) return;
+	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
+	if (!gp) return;
+	Impl::MeshGPU& g = *gp;
+
+	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
+	               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
+	               * float4x4::Translation(pos[0], pos[1], pos[2]);
+	float4x4 wvp = world * m_impl->curView * m_impl->curProj;
+	struct CBData { float4x4 wvp; float4x4 world; };
+	{ MapHelper<CBData> cb(m_impl->context, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD); cb->wvp = wvp; cb->world = world; }
+
+	float metallic = 0.0f, roughness = 0.6f; ITextureView* mrsrv = nullptr;
+	if (mat) { metallic = mat->metallic; roughness = mat->roughness; if (mat->mr) mrsrv = m_impl->GetTexSRV(mat->mr); }
+	{
+		MapHelper<Uint8> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		Uint8* p = mb; memset(p, 0, Impl::kMatCBBytes);
+		float prm[4]  = { 0, 0, metallic, roughness };         // g_Params  (metallic.z, roughness.w)
+		memcpy(p + 16, prm, sizeof(float) * 4);
+		float prm2[4] = { mrsrv ? 1.0f : 0.0f, 0, 0, 1.0f };   // g_Params2 (hasMR.x)
+		memcpy(p + 32, prm2, sizeof(float) * 4);
+	}
+	if (m_impl->gbufMRVar)
+		m_impl->gbufMRVar->Set(mrsrv ? mrsrv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+
+	IDeviceContext* ctx = m_impl->context;
+	IBuffer* vbs[] = { g.pos, g.nrm, g.uv }; Uint64 offs[] = { 0, 0, 0 };
+	ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	ctx->SetPipelineState(m_impl->gbufPSO);
+	ctx->CommitShaderResources(m_impl->gbufSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{ (Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES };
+	ctx->Draw(da);
+}
+
+void NukeDiligent::endGBufferPass() { /* gbufActive stays set so endCamera's SSR pass can sample it; beginCamera rebinds the colour target */ }
+
 void NukeDiligent::endCamera()
 {
 	// 1) Resolve the multisampled HDR color into the single-sample HDR texture (post-pass input).
@@ -2049,7 +2247,12 @@ void NukeDiligent::endCamera()
 			Diligent::ITexture* dstTex = m_impl->scratch[idx % 2];
 			if (!dstTex) break;
 			ITextureView* dstRTV = dstTex->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
-			if (pit->second.isBloom)   // built-in multi-pass bloom (params: x=threshold, y=intensity)
+			if (pit->second.isSSR)     // built-in screen-space reflections (samples the prepass G-buffer + depth)
+			{
+				if (!m_impl->gbufActive) continue;   // no prepass ran -> skip this stage (src passes through unchanged)
+				m_impl->RunSSR(pit->second, srcSRV, dstRTV, w, h, cs.params);
+			}
+			else if (pit->second.isBloom)   // built-in multi-pass bloom (params: x=threshold, y=intensity)
 			{
 				float thr = cs.params.size() > 0 ? cs.params[0] : 1.0f;
 				float inten = cs.params.size() > 1 ? cs.params[1] : 0.6f;
@@ -2223,7 +2426,7 @@ void NukeDiligent::endCubeFace(uint64_t cube, int face)
 		m_impl->context->GenerateMips(it->second.srv);
 }
 
-void NukeDiligent::setReflectionProbe(uint64_t cube, const float pos[3], float intensity, float farZ)
+void NukeDiligent::setReflectionProbe(uint64_t cube, const float pos[3], float intensity, float farZ, const float boxHalf[3])
 {
 	(void)farZ;
 	auto it = (cube != 0) ? m_impl->cubes.find(cube) : m_impl->cubes.end();
@@ -2234,8 +2437,9 @@ void NukeDiligent::setReflectionProbe(uint64_t cube, const float pos[3], float i
 		m_impl->probePos[0] = pos[0]; m_impl->probePos[1] = pos[1]; m_impl->probePos[2] = pos[2];
 		m_impl->probeIntensity = intensity;
 		m_impl->probeMaxMip = (float)(it->second.mips - 1);
+		m_impl->probeBoxHalf[0] = boxHalf ? boxHalf[0] : 0.f; m_impl->probeBoxHalf[1] = boxHalf ? boxHalf[1] : 0.f; m_impl->probeBoxHalf[2] = boxHalf ? boxHalf[2] : 0.f;
 	}
-	else { m_impl->probeActive = false; m_impl->probeCubeSRV = nullptr; }
+	else { m_impl->probeActive = false; m_impl->probeCubeSRV = nullptr; m_impl->probeBoxHalf[0] = m_impl->probeBoxHalf[1] = m_impl->probeBoxHalf[2] = 0.f; }
 }
 
 void NukeDiligent::setShadowSettings(int resolution, float distance, float depthBias, float normalBias, float softness)

@@ -45,7 +45,10 @@ public:
 	uint64_t createReflectionCube(int resolution) override;
 	void beginCubeFace(uint64_t cube, int face, const float pos[3], float nearZ, float farZ) override;
 	void endCubeFace(uint64_t cube, int face) override;
-	void setReflectionProbe(uint64_t cube, const float pos[3], float intensity, float farZ) override;
+	void setReflectionProbe(uint64_t cube, const float pos[3], float intensity, float farZ, const float boxHalf[3]) override;
+	void beginGBufferPass(const NukeCameraDesc& cam) override;
+	void renderGBufferObject(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3]) override;
+	void endGBufferPass() override;
 	uint64_t createPostPipeline(const char* name, const char* ps) override;
 	void     setPostChain(const NukePostStage* stages, int count) override;
 	void setOnFileDrop(bst::function<void(const char*)> cb) override;
