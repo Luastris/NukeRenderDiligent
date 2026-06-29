@@ -185,7 +185,12 @@ struct NukeDiligent::Impl
 	std::vector<NukeLight>                lights;      // scene lights (setLights); empty -> default sun
 
 	// --- Shadow maps (directional + spot share a 2D array; one slice per shadow-casting light) -----
-	static const int                      SHADOW_RES   = 2048;
+	int                                   shadowRes    = 2048;   // global, World-Settings-driven (rebuilds on change)
+	int                                   pendingShadowRes = 0;  // requested resolution; applied at render() top
+	float                                 shadowDistance = 60.0f; // directional ortho extent / range
+	float                                 shadowDepthBias = 0.0015f;
+	float                                 shadowNormalBias = 0.0f; // world-units offset along N at sample time
+	float                                 shadowSoftness = 1.0f;   // PCF step multiplier
 	static const int                      SHADOW_SLOTS = 4;
 	RefCntAutoPtr<ITexture>               shadowTex;             // Texture2DArray, D32, SHADOW_SLOTS slices
 	RefCntAutoPtr<ITextureView>           shadowSliceDSV[SHADOW_SLOTS];   // per-slice depth targets
@@ -630,9 +635,18 @@ void NukeDiligent::Impl::RebuildForMSAA()
 
 void NukeDiligent::Impl::CreateShadowResources()
 {
+	// Release prior objects so this can be re-called (e.g. a shadow-resolution change) without Diligent's
+	// "overwriting reference" assert.
+	shadowTex.Release(); shadowCmpSampler.Release();
+	for (auto& v : shadowSliceDSV) v.Release();
+	shadowCubeTex.Release(); shadowCubeCmpSampler.Release();
+	for (auto& v : cubeFaceDSV) v.Release();
+	shadowVSCB.Release(); shadowPSCB.Release(); shadowPSO.Release(); shadowSRB.Release();
+	shadowSRV = nullptr; shadowCubeSRV = nullptr;
+
 	for (int s = 0; s < SHADOW_SLOTS; ++s) lightSlot[s] = -1;
 	TextureDesc td; td.Name = "Shadow Maps"; td.Type = RESOURCE_DIM_TEX_2D_ARRAY;
-	td.Width = SHADOW_RES; td.Height = SHADOW_RES; td.ArraySize = SHADOW_SLOTS; td.MipLevels = 1;
+	td.Width = shadowRes; td.Height = shadowRes; td.ArraySize = SHADOW_SLOTS; td.MipLevels = 1;
 	td.Format = TEX_FORMAT_D32_FLOAT;
 	td.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE;
 	device->CreateTexture(td, nullptr, &shadowTex);
@@ -658,7 +672,7 @@ void NukeDiligent::Impl::CreateShadowResources()
 	// Point-light shadows: a cube depth array (6 faces per cube), sampled by direction in the world pass.
 	for (int i = 0; i < kMaxLights; ++i) lightCube[i] = -1;
 	TextureDesc ctd; ctd.Name = "Shadow Cubes"; ctd.Type = RESOURCE_DIM_TEX_CUBE_ARRAY;
-	ctd.Width = SHADOW_RES / 2; ctd.Height = SHADOW_RES / 2; ctd.ArraySize = MAX_POINT_SHADOWS * 6; ctd.MipLevels = 1;
+	ctd.Width = shadowRes / 2; ctd.Height = shadowRes / 2; ctd.ArraySize = MAX_POINT_SHADOWS * 6; ctd.MipLevels = 1;
 	ctd.Format = TEX_FORMAT_D32_FLOAT; ctd.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE;
 	device->CreateTexture(ctd, nullptr, &shadowCubeTex);
 	if (shadowCubeTex)
@@ -725,7 +739,7 @@ void NukeDiligent::Impl::CreateShadowResources()
 		if (auto* v = shadowSRB->GetVariableByName(SHADER_TYPE_PIXEL,  "ShadowPSCB")) v->Set(shadowPSCB);
 		shadowPsTexVar = shadowSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 	}
-	cout << "[NukeDiligent]\tshadow map " << SHADOW_RES << "x" << SHADOW_RES << (shadowPSO ? " ready" : " FAILED") << endl;
+	cout << "[NukeDiligent]\tshadow map " << shadowRes << "x" << shadowRes << (shadowPSO ? " ready" : " FAILED") << endl;
 }
 
 void NukeDiligent::Impl::CreateSkyResources()
@@ -1396,6 +1410,17 @@ int NukeDiligent::render()
 		}
 		m_impl->pendingSamples = -1; m_impl->pendingHDR = -1;
 	}
+	// Deferred shadow-resolution change (rebuilds the shadow maps; never mid-frame).
+	if (m_impl->pendingShadowRes > 0)
+	{
+		if (m_impl->pendingShadowRes != m_impl->shadowRes)
+		{
+			m_impl->shadowRes = m_impl->pendingShadowRes;
+			m_impl->CreateShadowResources();
+			std::cout << "[NukeDiligent]\tshadow res -> " << m_impl->shadowRes << std::endl;
+		}
+		m_impl->pendingShadowRes = 0;
+	}
 
 	// 0) Clear the backbuffer up front. In the editor it's the UI background (the world
 	//    goes to off-screen RTs); in the Player the world renders straight to it, where
@@ -1792,9 +1817,9 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 		for (int s = 0; s < Impl::SHADOW_SLOTS; ++s)
 			memcpy(fb->shadowVP + s * 16, &m_impl->slotVP[s], sizeof(float) * 16);
 		fb->shadowParams[0] = (float)m_impl->numShadowSlots;
-		fb->shadowParams[1] = 0.f;
-		fb->shadowParams[2] = 1.0f / (float)Impl::SHADOW_RES;
-		fb->shadowParams[3] = 0.0015f;
+		fb->shadowParams[1] = m_impl->shadowNormalBias;                              // world-units offset along N
+		fb->shadowParams[2] = (1.0f / (float)m_impl->shadowRes) * m_impl->shadowSoftness;  // PCF step (softness)
+		fb->shadowParams[3] = m_impl->shadowDepthBias;
 		// Sky gradient for IBL (procedural-sky ambient + reflections in the world PS).
 		for (int k = 0; k < 3; ++k) { fb->skyTop[k] = m_impl->sky.top[k]; fb->skyHorizon[k] = m_impl->sky.horizon[k]; fb->skyGround[k] = m_impl->sky.ground[k]; }
 		fb->skyParams[0] = m_impl->sky.skyIntensity; fb->skyParams[1] = (m_impl->sky.mode == 1) ? 1.0f : 0.0f;
@@ -1837,7 +1862,7 @@ void NukeDiligent::setLights(const NukeLight* lights, int count)
 		float4x4 proj;
 		if (L.type == 0)   // directional: ortho centred on the origin
 		{
-			const float dist = 60.0f, extent = 60.0f;
+			const float dist = m_impl->shadowDistance, extent = m_impl->shadowDistance;
 			P = d * (-dist);
 			proj = float4x4::Ortho(extent, extent, 0.1f, dist * 2.0f, false);
 		}
@@ -1900,13 +1925,13 @@ void NukeDiligent::beginShadowPass(int pass)
 	if (pass < m_impl->numShadowSlots)   // a 2D (directional/spot) shadow slice
 	{
 		m_impl->curShadowVP = m_impl->slotVP[pass];
-		dsv = m_impl->shadowSliceDSV[pass]; res = Impl::SHADOW_RES;
+		dsv = m_impl->shadowSliceDSV[pass]; res = m_impl->shadowRes;
 	}
 	else                                 // a point-light cube face
 	{
 		int c = pass - m_impl->numShadowSlots;
 		m_impl->curShadowVP = m_impl->cubeFaceVP[c];
-		dsv = m_impl->cubeFaceDSV[c]; res = Impl::SHADOW_RES / 2;
+		dsv = m_impl->cubeFaceDSV[c]; res = m_impl->shadowRes / 2;
 	}
 	if (!dsv) return;
 	ctx->SetRenderTargets(0, nullptr, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -2067,6 +2092,16 @@ void NukeDiligent::setHDRNits(float paperWhite, float peak)
 {
 	m_impl->hdrPaperWhite = paperWhite > 1.0f ? paperWhite : 1.0f;
 	m_impl->hdrPeak = peak > m_impl->hdrPaperWhite ? peak : m_impl->hdrPaperWhite;
+}
+
+void NukeDiligent::setShadowSettings(int resolution, float distance, float depthBias, float normalBias, float softness)
+{
+	int res = resolution < 256 ? 256 : (resolution > 8192 ? 8192 : resolution);
+	if (res != m_impl->shadowRes) m_impl->pendingShadowRes = res;   // applied at render() top (rebuilds the maps)
+	m_impl->shadowDistance   = distance > 1.0f ? distance : 1.0f;
+	m_impl->shadowDepthBias  = depthBias;
+	m_impl->shadowNormalBias = normalBias;
+	m_impl->shadowSoftness   = softness > 0.0f ? softness : 0.0f;
 }
 
 void NukeDiligent::getViewProj(float* view16, float* proj16)
