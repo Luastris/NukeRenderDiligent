@@ -42,6 +42,7 @@ public:
 	bool getHDROutput() override;
 	void setHDRNits(float paperWhite, float peak) override;
 	void setShadowSettings(int resolution, float distance, float depthBias, float normalBias, float softness) override;
+	void setRTReflection(float intensity, float maxDist, int bounces, float roughCutoff) override;
 	uint64_t createReflectionCube(int resolution) override;
 	void beginCubeFace(uint64_t cube, int face, const float pos[3], float nearZ, float farZ) override;
 	void endCubeFace(uint64_t cube, int face) override;

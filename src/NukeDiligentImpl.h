@@ -221,6 +221,8 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IShaderBindingTable>    rtSBT;               // shader binding table (ray-gen + miss + hit group)
 	RefCntAutoPtr<ITexture>               rtOutTex;            // UAV the ray-gen writes the composited reflection into
 	int                                   rtOutW = 0, rtOutH = 0;
+	// Global RTX reflection quality (Project Settings -> config/main.json, pushed via setRTReflection).
+	float rtCfgIntensity = 1.0f; float rtCfgMaxDist = 100.0f; int rtCfgBounces = 3; float rtCfgRoughCut = 0.6f;
 	bool BuildRTPipeline();                                    // build rtPSO/rtSRB/rtSBT (needs shaderFactory + DXC)
 	void EnsureRTOutput(int w, int h);                         // (re)create the RGBA16F UAV output at viewport size
 	void RunRTReflectPipeline(ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params);

@@ -156,6 +156,12 @@ void NukeDiligent::Impl::EnsureRTFallback()
 
 bool NukeDiligent::rtAvailable() { return m_impl->rtSupported; }
 
+void NukeDiligent::setRTReflection(float intensity, float maxDist, int bounces, float roughCutoff)
+{
+	m_impl->rtCfgIntensity = intensity; m_impl->rtCfgMaxDist = maxDist;
+	m_impl->rtCfgBounces = bounces; m_impl->rtCfgRoughCut = roughCutoff;
+}
+
 void NukeDiligent::beginRTScene()
 {
 	if (!m_impl->rtSupported) return;
@@ -487,10 +493,10 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		MapHelper<CB> cb(context, rtRefCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		cb->ip  = curProj.Inverse(); cb->iv = curView.Inverse();
 		cb->cam = float4(curCamPos[0], curCamPos[1], curCamPos[2], 1.0f);
-		float intensity = params.size() > 0 ? params[0] : 1.0f;
-		float maxDist   = params.size() > 1 ? params[1] : 100.0f;
-		float maxDepth  = params.size() > 2 ? params[2] : 3.0f;   // recursion bounces (mirror-in-mirror)
-		float roughCut  = params.size() > 3 ? params[3] : 0.6f;   // reflections fade out toward this roughness
+		float intensity = rtCfgIntensity;   // GLOBAL settings (Project Settings -> config), not the per-effect chip
+		float maxDist   = rtCfgMaxDist;
+		float maxDepth  = (float)rtCfgBounces;
+		float roughCut  = rtCfgRoughCut;
 		maxDepth = (maxDepth < 1.0f) ? 1.0f : (maxDepth > 7.0f ? 7.0f : maxDepth);   // PSO MaxRecursionDepth = 8
 		if (roughCut < 0.05f) roughCut = 0.05f;
 		cb->prm = float4(intensity, maxDist, maxDepth, roughCut);
