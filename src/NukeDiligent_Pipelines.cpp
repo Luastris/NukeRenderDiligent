@@ -394,8 +394,21 @@ void NukeDiligent::Impl::RebuildForMSAA()
 		if (kv.second.w > 0 && kv.second.h > 0) kv.second = MakeRT(kv.second.w, kv.second.h);
 }
 
-uint64_t NukeDiligent::createShaderPipeline(const char* vs, const char* ps)
+uint64_t NukeDiligent::createShaderPipeline(const char* name, const char* vs, const char* ps)
 {
 	if (!vs || !ps) return 0;
-	return m_impl->MakeWorldPSO(vs, ps, "Shader");   // world-type PSO (layout/CBs) from custom VS+PS
+	uint64_t h = m_impl->MakeWorldPSO(vs, ps, "Shader");   // world-type PSO (layout/CBs) from custom VS+PS
+	// A shader that ships "<name>.surf.hlsl" gets an auto-generated RT closest-hit (per-shader reflections).
+	if (h && name && *name && m_impl->rtSupported && m_impl->shaderFactory)
+	{
+		RefCntAutoPtr<IFileStream> stream;
+		m_impl->shaderFactory->CreateInputStream2((std::string(name) + ".surf.hlsl").c_str(),
+		                                          CREATE_SHADER_SOURCE_INPUT_STREAM_FLAG_SILENT, &stream);
+		if (stream)
+		{
+			std::string& slot = m_impl->rtSurfShaders[name];
+			if (slot != ps) { slot = ps; m_impl->rtPipelineDirty = true; }   // (re)build the RT pipeline to add/refresh this hit group
+		}
+	}
+	return h;
 }

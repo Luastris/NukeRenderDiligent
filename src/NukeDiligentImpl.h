@@ -68,6 +68,7 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<ISwapChain>     swapChain;
 	bool                          useD3D12 = false;   // active backend (set in init from WindowDesc.backend)
 	bool                          rtSupported = false; // device reports ray-tracing capability (D3D12 + RT-capable GPU)
+	RefCntAutoPtr<IShaderSourceInputStreamFactory> shaderFactory;   // resolves #include + loads RT shaders from the shaders dir
 
 	std::vector<boost::function<void(void)>> onGUI;
 	std::vector<boost::function<void(void)>> onRender;
@@ -180,13 +181,14 @@ struct NukeDiligent::Impl
 	IShaderResourceVariable*            gbufMRVar = nullptr;   // PS g_MetalRough (dynamic)
 	RefCntAutoPtr<IBuffer>              ssrCB;                 // SSR matrices (view/proj/invProj/res)
 	RefCntAutoPtr<IBuffer>              rtRefCB;               // RT reflections (invViewProj, light, ambient, sky)
-	void RunRTReflect(PostPipe& pp, ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, const std::vector<float>& params);
 
 	// --- Ray tracing (D3D12) ---------------------------------------------------------------------------------
 	std::unordered_map<Mesh*, RefCntAutoPtr<IBottomLevelAS>> blasCache;   // BLAS per mesh (built once, reused)
 	RefCntAutoPtr<ITopLevelAS>         tlas;                  // scene TLAS (rebuilt per frame)
 	RefCntAutoPtr<IBuffer>             tlasScratch, tlasInstanceBuf;
 	Uint32                             tlasMaxInstances = 0;
+	size_t                             lastTlasSig = 0;        // topology signature (count + BLAS set) -> refit when unchanged
+	uint32_t                           tlasFrameCtr = 0;       // periodic full rebuild counter (refit hygiene)
 	std::vector<TLASBuildInstanceData> rtInstances;           // accumulated between beginRTScene/buildRTScene
 	std::vector<std::string>           rtInstanceNames;        // stable storage backing TLASBuildInstanceData::InstanceName
 	bool                               rtSceneReady = false;   // a valid TLAS is built for the current frame
@@ -197,7 +199,8 @@ struct NukeDiligent::Impl
 
 	// RT reflection hit shading: per-instance geometry (normals) + material, so a ray hit can be shaded.
 	// Normals of every referenced mesh are concatenated into one raw buffer; each instance stores its byte offset.
-	struct RTInstanceData { uint32_t nrmOffset, uvOffset, texIndex, pad; float albedoMetal[4]; float emissiveRough[4]; };
+	// matByteOffset = this instance's MatCB block in g_MatBytes (auto-gen hit shaders load their params from it).
+	struct RTInstanceData { uint32_t nrmOffset, uvOffset, texIndex, matByteOffset; float albedoMetal[4]; float emissiveRough[4]; };
 	std::unordered_map<Mesh*, uint32_t> meshNrmByteOffset;     // mesh -> byte offset of its normals in rtNrmBuf
 	std::unordered_map<Mesh*, uint32_t> meshUVByteOffset;      // mesh -> byte offset of its uvs in rtUVBuf
 	std::vector<float>                  allNrmCPU, allUVCPU;    // concatenated mesh normals / uvs (grow as meshes appear)
@@ -211,6 +214,27 @@ struct NukeDiligent::Impl
 	std::unordered_map<Texture*, uint32_t> matTexSlot;         // engine texture -> slot in the bindless array
 	std::vector<ITextureView*>          matTexSRVs;            // unique material albedo SRVs (<= kMaxMatTex)
 	std::vector<Texture*>               matTexPtr;             // engine texture per slot (re-resolve SRV each frame -> animation)
+
+	// --- RT reflection PIPELINE (real DXR: ray-gen + miss + closest-hit + SBT, native recursion) -------------
+	RefCntAutoPtr<IPipelineState>         rtPSO;               // ray-tracing PSO (rt_rgen/rt_rmiss/rt_rchit)
+	RefCntAutoPtr<IShaderResourceBinding> rtSRB;               // dynamic resources (TLAS, gbuffer, bindless, output)
+	RefCntAutoPtr<IShaderBindingTable>    rtSBT;               // shader binding table (ray-gen + miss + hit group)
+	RefCntAutoPtr<ITexture>               rtOutTex;            // UAV the ray-gen writes the composited reflection into
+	int                                   rtOutW = 0, rtOutH = 0;
+	bool BuildRTPipeline();                                    // build rtPSO/rtSRB/rtSBT (needs shaderFactory + DXC)
+	void EnsureRTOutput(int w, int h);                         // (re)create the RGBA16F UAV output at viewport size
+	void RunRTReflectPipeline(ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params);
+	// Auto-generated per-shader RT closest-hits. A material shader with a "<name>.surf.hlsl" gets its own hit
+	// group, built by GenChitSource() from the shader's MatCB schema + that surface file (no hand-written .rchit).
+	std::unordered_map<std::string, std::string> rtSurfShaders;  // shader name -> its PS source (has the MatCB schema)
+	std::unordered_map<std::string, std::string> shaderHitGroup; // shader name -> hit-group name in the RT PSO
+	std::string GenChitSource(const std::string& name, const std::string& psSource);  // codegen the closest-hit HLSL
+	bool rtPipelineDirty = false;                              // a new surf shader appeared -> rebuild rtPSO
+	std::vector<std::string> rtInstShaderGuid;                 // per-instance material shader name (-> hit group), parallel to rtInstances
+	std::vector<uint8_t>     allMatCPU;                        // concatenated per-instance MatCB blocks (kMatBlock each)
+	static const uint32_t    kMatBlock = 256;                  // per-instance material byte block (matches MatCB capacity)
+	RefCntAutoPtr<IBuffer>   rtMatBuf;  IBufferView* rtMatSRV = nullptr;  // g_MatBytes (per-instance MatCB blocks)
+	uint32_t                 rtMatCapacity = 0;
 	void EnsureGBuffer(int w, int h);
 	bool BuildGBufferPipe();
 	void SetCameraViewProj(const NukeCameraDesc& cam, int w, int h);   // curView/curProj/curCamPos (shared: camera + gbuffer)
@@ -226,6 +250,8 @@ struct NukeDiligent::Impl
 	bool                                  hdr10Active = false; // an HDR10 swap chain is actually live (display is HDR)
 	float                                 hdrPaperWhite = 200.0f;   // diffuse-white nits for the HDR10 encode
 	float                                 hdrPeak = 1000.0f;        // highlight peak nits
+	float                                 toneExposure = 1.0f;      // SDR tonemap exposure multiplier
+	float                                 toneWhite = 1.0f;         // SDR tonemap white point (linear value mapped to pure white)
 	void CreatePostResources();
 	void RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV, int w, int h, bool toBackbuffer);
 	void SetupHDROutput();   // after swap-chain creation: set the HDR10 colour space if the display supports it

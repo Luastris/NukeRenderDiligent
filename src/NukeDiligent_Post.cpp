@@ -173,6 +173,8 @@ void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV,
 		for (int k = 0; k < 8; ++k) cb[k] = 0.0f;
 		cb[1] = mode;
 		cb[2] = hdrPaperWhite; cb[3] = hdrPeak;   // HDR10 mapping (post.ps mode 2)
+		cb[4] = toneExposure;   // g_Grade.x = exposure
+		cb[5] = toneWhite;      // g_Grade.y = tonemap white point (linear value -> pure white). TODO: expose in World Settings
 	}
 	context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
@@ -187,12 +189,16 @@ void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV,
 // Build a custom post-effect pipeline from a fullscreen PS (samples g_Source, params in PostParams).
 uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::string& ps)
 {
+	if (name == "rtreflect")   // built-in RT reflections: a real ray-tracing pipeline (rt_rgen/rmiss/rchit + SBT), not a post PS
+	{
+		if (!rtSupported || !BuildRTPipeline()) return 0;
+		PostPipe pp; pp.isRTRef = true;
+		uint64_t h = nextShaderHandle++; postPipes[h] = std::move(pp);
+		return h;
+	}
 	std::string vs = shaderSource("post.vs");
 	if (vs.empty() || ps.empty()) return 0;
-	const bool rtref = (name == "rtreflect");   // built-in RT reflections — needs DXR + DXC (SM6.5)
-	if (rtref && !rtSupported) return 0;         // skip the effect when ray tracing isn't available
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
-	if (rtref) { sci.ShaderCompiler = SHADER_COMPILER_DXC; sci.HLSLVersion = ShaderVersion{6, 5}; }
 	RefCntAutoPtr<IShader> v, p;
 	sci.Desc = {"Post Effect VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); device->CreateShader(sci, &v);
 	sci.Desc = {"Post Effect PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &p);
@@ -223,21 +229,6 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 		imms.push_back({SHADER_TYPE_PIXEL, "g_GBuffer", psamp});
 		imms.push_back({SHADER_TYPE_PIXEL, "g_Depth",   psamp});
 	}
-	if (rtref)
-	{
-		vars.push_back({SHADER_TYPE_PIXEL, "g_GBuffer",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
-		vars.push_back({SHADER_TYPE_PIXEL, "g_Depth",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
-		vars.push_back({SHADER_TYPE_PIXEL, "g_Probe",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
-		vars.push_back({SHADER_TYPE_PIXEL, "g_TLAS",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
-		vars.push_back({SHADER_TYPE_PIXEL, "g_Instances",SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
-		vars.push_back({SHADER_TYPE_PIXEL, "g_AllNrm",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
-		vars.push_back({SHADER_TYPE_PIXEL, "g_AllUV",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
-		vars.push_back({SHADER_TYPE_PIXEL, "g_MatTex",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // bindless albedo array
-		imms.push_back({SHADER_TYPE_PIXEL, "g_GBuffer",  psamp});
-		imms.push_back({SHADER_TYPE_PIXEL, "g_Depth",    psamp});
-		imms.push_back({SHADER_TYPE_PIXEL, "g_Probe",    samp});
-		imms.push_back({SHADER_TYPE_PIXEL, "g_MatTex",   samp});
-	}
 	ci.PSODesc.ResourceLayout.Variables = vars.data(); ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
 	ci.PSODesc.ResourceLayout.ImmutableSamplers = imms.data(); ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)imms.size();
 	ci.pVS = v; ci.pPS = p;
@@ -247,23 +238,9 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	if (auto* c = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostParams")) c->Set(postParamsCB);
 	if (auto* f = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostFrame"))  f->Set(postFrameCB);
 	if (ssr) if (auto* s = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "SSRCB")) s->Set(ssrCB);
-	if (rtref) { if (auto* s = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "RTRefCB")) s->Set(rtRefCB);
-	             if (auto* f = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "FrameCB")) f->Set(worldFrameCB); }
 	pp.pso->CreateShaderResourceBinding(&pp.srb, true);
 	pp.srcVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Source");
 	if (ssr) { pp.gbufVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GBuffer"); pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.isSSR = true; }
-	if (rtref)
-	{
-		pp.gbufVar   = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GBuffer");
-		pp.depthVar  = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth");
-		pp.rtProbeVar= pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Probe");
-		pp.tlasVar   = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_TLAS");
-		pp.instVar   = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Instances");
-		pp.nrmVar    = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_AllNrm");
-		pp.uvVar     = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_AllUV");
-		pp.matTexVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_MatTex");
-		pp.isRTRef   = true;
-	}
 	pp.isBloom = (name == "bloom");   // built-in multi-pass effect; the renderer runs the passes itself
 	uint64_t h = nextShaderHandle++;
 	postPipes[h] = std::move(pp);

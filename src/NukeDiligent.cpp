@@ -111,9 +111,10 @@ int NukeDiligent::init(const WindowDesc& desc)
 	// window (the Player) — "RTV format does not match PSO" spam. Keep one format everywhere.
 	// HDR10 display output (Player): a 10-bit backbuffer carries the PQ-encoded HDR signal. Plain RGBA8 otherwise.
 	SCDesc.ColorBufferFormat = m_impl->hdrOutput ? TEX_FORMAT_RGB10A2_UNORM : TEX_FORMAT_RGBA8_UNORM;
+	IEngineFactory* engFactory = nullptr;
 	if (m_impl->useD3D12)
 	{
-		auto* pFactory = GetEngineFactoryD3D12();
+		auto* pFactory = GetEngineFactoryD3D12(); engFactory = pFactory;
 		EngineD3D12CreateInfo EngineCI;
 		pFactory->CreateDeviceAndContextsD3D12(EngineCI, &m_impl->device, &m_impl->context);
 		if (!m_impl->device) { cout << "[NukeDiligent]\tD3D12 device creation failed" << endl; return 1; }
@@ -122,7 +123,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 	}
 	else
 	{
-		auto* pFactory = GetEngineFactoryD3D11();
+		auto* pFactory = GetEngineFactoryD3D11(); engFactory = pFactory;
 		EngineD3D11CreateInfo EngineCI;
 		pFactory->CreateDeviceAndContextsD3D11(EngineCI, &m_impl->device, &m_impl->context);
 		if (!m_impl->device) { cout << "[NukeDiligent]\tD3D11 device creation failed" << endl; return 1; }
@@ -130,6 +131,8 @@ int NukeDiligent::init(const WindowDesc& desc)
 		                               FullScreenModeDesc{}, Window, &m_impl->swapChain);
 	}
 	if (!m_impl->swapChain) { cout << "[NukeDiligent]\tswap chain creation failed" << endl; return 1; }
+	// Shader #include resolver (+ RT shader loader): resolves "rt_common.hlsl" etc. from the shaders directory.
+	if (engFactory) engFactory->CreateDefaultShaderSourceStreamFactory("shaders", &m_impl->shaderFactory);
 	// Ray tracing needs the D3D12 backend AND a capable GPU/driver (RTX / DXR1.1).
 	m_impl->rtSupported = m_impl->useD3D12 && m_impl->device &&
 	                      (m_impl->device->GetAdapterInfo().RayTracing.CapFlags & RAY_TRACING_CAP_FLAG_STANDALONE_SHADERS) != 0;

@@ -214,7 +214,7 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 	fb->shadowParams[3] = shadowDepthBias;
 	for (int k = 0; k < 3; ++k) { fb->skyTop[k] = sky.top[k]; fb->skyHorizon[k] = sky.horizon[k]; fb->skyGround[k] = sky.ground[k]; }
 	fb->skyParams[0] = sky.skyIntensity; fb->skyParams[1] = (sky.mode == 1) ? 1.0f : 0.0f;
-	fb->skyParams[2] = hdr ? 0.0f : 1.0f; fb->skyParams[3] = 0;
+	fb->skyParams[2] = hdr ? 0.0f : 1.0f; fb->skyParams[3] = sky.whitePoint;   // .w = SDR tonemap white point (world.ps HDR-off path)
 	const bool probe = probeActive && probeCubeSRV;   // off during the probe's own capture -> no feedback
 	fb->probePos[0] = probePos[0]; fb->probePos[1] = probePos[1]; fb->probePos[2] = probePos[2]; fb->probePos[3] = probe ? 1.0f : 0.0f;
 	fb->probeParams[0] = probeIntensity; fb->probeParams[1] = probeMaxMip; fb->probeParams[2] = 0; fb->probeParams[3] = 0;
@@ -274,7 +274,7 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	m_impl->DrawSky();   // procedural sky behind the scene (after clear, before geometry)
 }
 
-void NukeDiligent::setSky(const NukeSky& s) { m_impl->sky = s; }
+void NukeDiligent::setSky(const NukeSky& s) { m_impl->sky = s; m_impl->toneExposure = s.exposure; m_impl->toneWhite = s.whitePoint; }
 
 void NukeDiligent::endCamera()
 {
@@ -298,7 +298,8 @@ void NukeDiligent::endCamera()
 		for (auto& cs : m_impl->postChain)
 		{
 			auto pit = m_impl->postPipes.find(cs.pipeline);
-			if (pit == m_impl->postPipes.end() || !pit->second.pso) continue;
+			if (pit == m_impl->postPipes.end()) continue;
+			if (!pit->second.pso && !pit->second.isRTRef) continue;   // RT reflections run a ray-tracing pipeline, not a graphics PSO
 			Diligent::ITexture* dstTex = m_impl->scratch[idx % 2];
 			if (!dstTex) break;
 			ITextureView* dstRTV = dstTex->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
@@ -307,10 +308,10 @@ void NukeDiligent::endCamera()
 				if (!m_impl->gbufActive) continue;   // no prepass ran -> skip this stage (src passes through unchanged)
 				m_impl->RunSSR(pit->second, srcSRV, dstRTV, w, h, cs.params);
 			}
-			else if (pit->second.isRTRef)   // built-in ray-traced reflections (TLAS query + hit shading)
+			else if (pit->second.isRTRef)   // built-in ray-traced reflections (real DXR pipeline: rt_rgen/rmiss/rchit + SBT)
 			{
-				if (!m_impl->gbufActive || !m_impl->rtSceneReady) continue;   // needs the gbuffer prepass + a TLAS
-				m_impl->RunRTReflect(pit->second, srcSRV, dstRTV, w, h, cs.params);
+				if (!m_impl->gbufActive) continue;   // needs the gbuffer prepass (reflector roughness/metalness); no TLAS -> passthrough inside
+				m_impl->RunRTReflectPipeline(srcSRV, dstTex, w, h, cs.params);
 			}
 			else if (pit->second.isBloom)   // built-in multi-pass bloom (params: x=threshold, y=intensity)
 			{
