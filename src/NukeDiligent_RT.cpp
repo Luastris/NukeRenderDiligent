@@ -80,6 +80,49 @@ void NukeDiligent::Impl::EnsureRTFallback()
 	context->BuildTLAS(ba);
 }
 
+// RT reflections pass: ray-query the TLAS per pixel, shade the hit, blend onto the chain colour.
+void NukeDiligent::Impl::RunRTReflect(PostPipe& pp, ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, const std::vector<float>& params)
+{
+	// clip->view (invProj) + view->world (invView), two-step = numerically stable vs inverting view*proj.
+	{ struct CB { float4x4 invProj, invView; }; MapHelper<CB> cb(context, rtRefCB, MAP_WRITE, MAP_FLAG_DISCARD);
+	  cb->invProj = curProj.Inverse(); cb->invView = curView.Inverse(); }
+	{
+		MapHelper<float> p(context, postParamsCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		int n = (int)params.size(); if (n > 64) n = 64; for (int k = 0; k < 64; ++k) p[k] = (k < n) ? params[k] : 0.0f;
+	}
+	context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+	context->SetViewports(1, &vp, w, h);
+	if (pp.srcVar)     pp.srcVar->Set(srcSRV);
+	if (pp.gbufVar)    pp.gbufVar->Set(gbufSRV);
+	if (pp.depthVar)   pp.depthVar->Set(gbufDepthSRV);
+	if (pp.rtProbeVar) pp.rtProbeVar->Set((probeActive && probeCubeSRV) ? probeCubeSRV : fallbackCubeSRV);
+	if (pp.tlasVar)    pp.tlasVar->Set((rtSceneReady && tlas) ? (IDeviceObject*)tlas.RawPtr() : (IDeviceObject*)fallbackTLAS.RawPtr());
+	if (pp.instVar)    pp.instVar->Set(rtInstSRV);
+	if (pp.nrmVar)     pp.nrmVar->Set(rtNrmSRV);
+	if (pp.uvVar)      pp.uvVar->Set(rtUVSRV ? rtUVSRV : rtNrmSRV);   // (rtNrmSRV is a valid non-null fallback)
+	if (pp.matTexVar)  // fixed bindless array: real albedo SRVs + white fallback in the unused slots
+	{
+		ITextureView* white = whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+		IDeviceObject* arr[Impl::kMaxMatTex];
+		for (uint32_t k = 0; k < kMaxMatTex; ++k)
+		{
+			if (k < matTexSRVs.size())
+			{
+				ITextureView* s = GetTexSRV(matTexPtr[k]);   // re-resolve each frame -> animated (GIF) textures update
+				if (s) matTexSRVs[k] = s;
+				arr[k] = matTexSRVs[k] ? matTexSRVs[k] : white;
+			}
+			else arr[k] = white;
+		}
+		pp.matTexVar->SetArray(arr, 0, kMaxMatTex);
+	}
+	context->SetPipelineState(pp.pso);
+	context->CommitShaderResources(pp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
+	context->Draw(da);
+}
+
 bool NukeDiligent::rtAvailable() { return m_impl->rtSupported; }
 
 void NukeDiligent::beginRTScene()
@@ -88,14 +131,44 @@ void NukeDiligent::beginRTScene()
 	m_impl->EnsureRTFallback();
 	m_impl->rtInstances.clear();
 	m_impl->rtInstanceNames.clear();
+	m_impl->rtInstData.clear();
 	m_impl->rtSceneReady = false;
 }
 
-void NukeDiligent::addRTInstance(Mesh* mesh, const float pos[3], const float quat[4], const float scale[3])
+void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3])
 {
 	if (!m_impl->rtSupported) return;
 	IBottomLevelAS* blas = m_impl->GetMeshBLAS(mesh);
-	if (!blas) return;
+	if (!blas || !mesh->normalArray || mesh->numVerts < 3) return;
+
+	// Register this mesh's normals + uvs in the concatenated buffers (once per unique mesh).
+	uint32_t nrmOff, uvOff;
+	auto nit = m_impl->meshNrmByteOffset.find(mesh);
+	if (nit == m_impl->meshNrmByteOffset.end())
+	{
+		nrmOff = (uint32_t)(m_impl->allNrmCPU.size() * sizeof(float));
+		m_impl->allNrmCPU.insert(m_impl->allNrmCPU.end(), mesh->normalArray, mesh->normalArray + (size_t)mesh->numVerts * 3);
+		m_impl->meshNrmByteOffset[mesh] = nrmOff;
+		uvOff = (uint32_t)(m_impl->allUVCPU.size() * sizeof(float));
+		if (mesh->uvArray) m_impl->allUVCPU.insert(m_impl->allUVCPU.end(), mesh->uvArray, mesh->uvArray + (size_t)mesh->numVerts * 2);
+		else               m_impl->allUVCPU.insert(m_impl->allUVCPU.end(), (size_t)mesh->numVerts * 2, 0.0f);
+		m_impl->meshUVByteOffset[mesh] = uvOff;
+		m_impl->allNrmDirty = true;
+	}
+	else { nrmOff = nit->second; uvOff = m_impl->meshUVByteOffset[mesh]; }
+
+	// Material albedo texture -> bindless slot (flat color when none / table full).
+	uint32_t texIdx = 0xFFFFFFFFu;
+	if (mat && mat->diff)
+	{
+		auto tit = m_impl->matTexSlot.find(mat->diff);
+		if (tit != m_impl->matTexSlot.end()) texIdx = tit->second;
+		else if (m_impl->matTexSRVs.size() < Impl::kMaxMatTex)
+		{
+			ITextureView* srv = m_impl->GetTexSRV(mat->diff);
+			if (srv) { texIdx = (uint32_t)m_impl->matTexSRVs.size(); m_impl->matTexSRVs.push_back(srv); m_impl->matTexPtr.push_back(mat->diff); m_impl->matTexSlot[mat->diff] = texIdx; }
+		}
+	}
 
 	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
 	               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
@@ -105,8 +178,22 @@ void NukeDiligent::addRTInstance(Mesh* mesh, const float pos[3], const float qua
 	inst.pBLAS    = blas;
 	inst.Mask     = 0xFF;
 	inst.Flags    = RAYTRACING_INSTANCE_NONE;
-	inst.CustomId = 0;
+	inst.CustomId = (Uint32)m_impl->rtInstances.size();   // -> g_Instances index (CommittedInstanceID in the shader)
 	inst.ContributionToHitGroupIndex = 0;   // USER_DEFINED binding: must be explicit (not TLAS_INSTANCE_OFFSET_AUTO)
+
+	// Per-instance material for hit shading.
+	Impl::RTInstanceData d{}; d.nrmOffset = nrmOff; d.uvOffset = uvOff; d.texIndex = texIdx;
+	d.pad = (mat && mat->shaderGuid == "unlit") ? 1u : 0u;   // unlit -> flat base colour in reflections
+	float alb[3] = {1, 1, 1}, em[3] = {0, 0, 0}; float metal = 0.0f, rough = 0.6f, emI = 0.0f;
+	if (mat)
+	{
+		alb[0] = (float)mat->color.r; alb[1] = (float)mat->color.g; alb[2] = (float)mat->color.b;
+		metal = mat->metallic; rough = mat->roughness;
+		em[0] = (float)mat->emissive.r; em[1] = (float)mat->emissive.g; em[2] = (float)mat->emissive.b; emI = mat->emissiveIntensity;
+	}
+	d.albedoMetal[0] = alb[0]; d.albedoMetal[1] = alb[1]; d.albedoMetal[2] = alb[2]; d.albedoMetal[3] = metal;
+	d.emissiveRough[0] = em[0] * emI; d.emissiveRough[1] = em[1] * emI; d.emissiveRough[2] = em[2] * emI; d.emissiveRough[3] = rough;
+	m_impl->rtInstData.push_back(d);
 	// InstanceMatrix is 3x4 row-major (rotation | translation). Our world matrix is row-vector (v*M), so the
 	// instance row r / col c = world.m[c][r] (transpose of the upper 3x3, translation from row 3).
 	for (int r = 0; r < 3; ++r)
@@ -155,5 +242,41 @@ void NukeDiligent::buildRTScene()
 	ba.InstanceBufferTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
 	ba.ScratchBufferTransitionMode  = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
 	d->context->BuildTLAS(ba);
+
+	// Concatenated normals (immutable; rebuilt only when a new mesh appeared).
+	if (d->allNrmDirty && !d->allNrmCPU.empty())
+	{
+		d->rtNrmBuf.Release(); d->rtNrmSRV = nullptr;
+		BufferDesc bd; bd.Name = "RT Normals"; bd.Usage = USAGE_IMMUTABLE; bd.BindFlags = BIND_SHADER_RESOURCE;
+		bd.Mode = BUFFER_MODE_RAW; bd.Size = (Uint64)d->allNrmCPU.size() * sizeof(float);
+		BufferData bdat{d->allNrmCPU.data(), bd.Size};
+		d->device->CreateBuffer(bd, &bdat, &d->rtNrmBuf);
+		if (d->rtNrmBuf) d->rtNrmSRV = d->rtNrmBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE);
+
+		d->rtUVBuf.Release(); d->rtUVSRV = nullptr;
+		if (!d->allUVCPU.empty())
+		{
+			BufferDesc ud; ud.Name = "RT UVs"; ud.Usage = USAGE_IMMUTABLE; ud.BindFlags = BIND_SHADER_RESOURCE;
+			ud.Mode = BUFFER_MODE_RAW; ud.Size = (Uint64)d->allUVCPU.size() * sizeof(float);
+			BufferData udat{d->allUVCPU.data(), ud.Size};
+			d->device->CreateBuffer(ud, &udat, &d->rtUVBuf);
+			if (d->rtUVBuf) d->rtUVSRV = d->rtUVBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE);
+		}
+		d->allNrmDirty = false;
+	}
+	// Per-instance data (rebuilt each frame; grows capacity as needed).
+	if (!d->rtInstBuf || d->rtInstCapacity < count)
+	{
+		d->rtInstBuf.Release(); d->rtInstSRV = nullptr; d->rtInstCapacity = count;
+		BufferDesc bd; bd.Name = "RT Instances"; bd.Usage = USAGE_DEFAULT; bd.BindFlags = BIND_SHADER_RESOURCE;
+		bd.Mode = BUFFER_MODE_STRUCTURED; bd.ElementByteStride = sizeof(Impl::RTInstanceData);
+		bd.Size = (Uint64)sizeof(Impl::RTInstanceData) * count;
+		d->device->CreateBuffer(bd, nullptr, &d->rtInstBuf);
+		if (d->rtInstBuf) d->rtInstSRV = d->rtInstBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE);
+	}
+	if (d->rtInstBuf && !d->rtInstData.empty())
+		d->context->UpdateBuffer(d->rtInstBuf, 0, (Uint64)sizeof(Impl::RTInstanceData) * d->rtInstData.size(),
+		                         d->rtInstData.data(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+
 	d->rtSceneReady = true;
 }

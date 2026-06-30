@@ -307,6 +307,11 @@ void NukeDiligent::endCamera()
 				if (!m_impl->gbufActive) continue;   // no prepass ran -> skip this stage (src passes through unchanged)
 				m_impl->RunSSR(pit->second, srcSRV, dstRTV, w, h, cs.params);
 			}
+			else if (pit->second.isRTRef)   // built-in ray-traced reflections (TLAS query + hit shading)
+			{
+				if (!m_impl->gbufActive || !m_impl->rtSceneReady) continue;   // needs the gbuffer prepass + a TLAS
+				m_impl->RunRTReflect(pit->second, srcSRV, dstRTV, w, h, cs.params);
+			}
 			else if (pit->second.isBloom)   // built-in multi-pass bloom (params: x=threshold, y=intensity)
 			{
 				float thr = cs.params.size() > 0 ? cs.params[0] : 1.0f;

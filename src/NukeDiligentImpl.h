@@ -122,7 +122,11 @@ struct NukeDiligent::Impl
 	IShaderResourceVariable*              postHdrVarBB = nullptr;
 	// Custom post-effect chain (one fullscreen pipeline per effect; ping-ponged in HDR before the final tonemap).
 	struct PostPipe { RefCntAutoPtr<IPipelineState> pso; RefCntAutoPtr<IShaderResourceBinding> srb; IShaderResourceVariable* srcVar = nullptr; bool isBloom = false;
-	                  IShaderResourceVariable* gbufVar = nullptr; IShaderResourceVariable* depthVar = nullptr; bool isSSR = false; };
+	                  IShaderResourceVariable* gbufVar = nullptr; IShaderResourceVariable* depthVar = nullptr; bool isSSR = false;
+	                  bool isRTRef = false;   // built-in ray-traced reflections (D3D12)
+	                  IShaderResourceVariable* tlasVar = nullptr; IShaderResourceVariable* instVar = nullptr;
+	                  IShaderResourceVariable* nrmVar = nullptr;  IShaderResourceVariable* rtProbeVar = nullptr;
+	                  IShaderResourceVariable* uvVar = nullptr;   IShaderResourceVariable* matTexVar = nullptr; };
 	std::unordered_map<uint64_t, PostPipe> postPipes;
 	RefCntAutoPtr<IBuffer>                postParamsCB;   // shared PostParams (per-effect params, 256B)
 	RefCntAutoPtr<IBuffer>                postFrameCB;    // shared PostFrame (resolution / time)
@@ -175,6 +179,8 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IShaderResourceBinding> gbufSRB;
 	IShaderResourceVariable*            gbufMRVar = nullptr;   // PS g_MetalRough (dynamic)
 	RefCntAutoPtr<IBuffer>              ssrCB;                 // SSR matrices (view/proj/invProj/res)
+	RefCntAutoPtr<IBuffer>              rtRefCB;               // RT reflections (invViewProj, light, ambient, sky)
+	void RunRTReflect(PostPipe& pp, ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, const std::vector<float>& params);
 
 	// --- Ray tracing (D3D12) ---------------------------------------------------------------------------------
 	std::unordered_map<Mesh*, RefCntAutoPtr<IBottomLevelAS>> blasCache;   // BLAS per mesh (built once, reused)
@@ -188,6 +194,23 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>             fbTlasScratch, fbTlasInst;
 	IBottomLevelAS* GetMeshBLAS(Mesh* mesh);                   // get-or-build the BLAS for a mesh (from its pos buffer)
 	void EnsureRTFallback();                                   // build the empty fallback TLAS once
+
+	// RT reflection hit shading: per-instance geometry (normals) + material, so a ray hit can be shaded.
+	// Normals of every referenced mesh are concatenated into one raw buffer; each instance stores its byte offset.
+	struct RTInstanceData { uint32_t nrmOffset, uvOffset, texIndex, pad; float albedoMetal[4]; float emissiveRough[4]; };
+	std::unordered_map<Mesh*, uint32_t> meshNrmByteOffset;     // mesh -> byte offset of its normals in rtNrmBuf
+	std::unordered_map<Mesh*, uint32_t> meshUVByteOffset;      // mesh -> byte offset of its uvs in rtUVBuf
+	std::vector<float>                  allNrmCPU, allUVCPU;    // concatenated mesh normals / uvs (grow as meshes appear)
+	bool                                allNrmDirty = false;
+	RefCntAutoPtr<IBuffer>              rtNrmBuf;     IBufferView* rtNrmSRV  = nullptr;   // ByteAddressBuffer (all normals)
+	RefCntAutoPtr<IBuffer>              rtUVBuf;      IBufferView* rtUVSRV   = nullptr;   // ByteAddressBuffer (all uvs)
+	RefCntAutoPtr<IBuffer>              rtInstBuf;    IBufferView* rtInstSRV = nullptr;   // StructuredBuffer<RTInstanceData>
+	std::vector<RTInstanceData>         rtInstData;            // parallel to rtInstances, rebuilt per frame
+	uint32_t                            rtInstCapacity = 0;
+	static const uint32_t               kMaxMatTex = 64;       // bindless material albedo textures (fixed array)
+	std::unordered_map<Texture*, uint32_t> matTexSlot;         // engine texture -> slot in the bindless array
+	std::vector<ITextureView*>          matTexSRVs;            // unique material albedo SRVs (<= kMaxMatTex)
+	std::vector<Texture*>               matTexPtr;             // engine texture per slot (re-resolve SRV each frame -> animation)
 	void EnsureGBuffer(int w, int h);
 	bool BuildGBufferPipe();
 	void SetCameraViewProj(const NukeCameraDesc& cam, int w, int h);   // curView/curProj/curCamPos (shared: camera + gbuffer)
