@@ -78,5 +78,13 @@ add_custom_command(TARGET NukeRenderDiligent POST_BUILD
     # glfw3.dll is this module's runtime dependency — deploy it next to the exe.
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${VCPKG_INSTALLED}/$<$<CONFIG:Debug>:debug/>bin/glfw3.dll" "${EDITOR_DIR}/"
-    COMMENT "Deploying NukeRenderDiligent.dll + glfw3.dll"
+    # DXC (dxcompiler.dll + dxil.dll): Diligent LoadLibrary's dxcompiler.dll by bare name at
+    # runtime to compile SM6.5 shaders (RayTracingAccelerationStructure etc). It is NOT a system
+    # DLL and NOT on the default search path, so it must sit next to the exe. Vendored (deps/dxc)
+    # so shipped builds are self-sufficient — same DLL for Debug/Release (config-agnostic tool).
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/deps/dxc/dxcompiler.dll" "${EDITOR_DIR}/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/deps/dxc/dxil.dll" "${EDITOR_DIR}/"
+    COMMENT "Deploying NukeRenderDiligent.dll + glfw3.dll + DXC (dxcompiler/dxil)"
 )
