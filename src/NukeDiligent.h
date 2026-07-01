@@ -48,11 +48,13 @@ public:
 	void endCubeFace(uint64_t cube, int face) override;
 	void setReflectionProbe(uint64_t cube, const float pos[3], float intensity, float farZ, const float boxHalf[3]) override;
 	void beginGBufferPass(const NukeCameraDesc& cam) override;
-	void renderGBufferObject(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3]) override;
+	void renderGBufferObject(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
+	                         const float prevPos[3] = nullptr, const float prevQuat[4] = nullptr, const float prevScale[3] = nullptr) override;
 	void endGBufferPass() override;
 	bool rtAvailable() override;
 	void beginRTScene() override;
 	void addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections = true) override;
+	void setCameraTAA(bool enabled) override;
 	void buildRTScene() override;
 	uint64_t createPostPipeline(const char* name, const char* ps) override;
 	void     setPostChain(const NukePostStage* stages, int count) override;

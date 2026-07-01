@@ -89,7 +89,7 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 {
 	// Shared constant buffers (bound as static vars on EVERY world PSO).
 	BufferDesc cbd;
-	cbd.Name = "World CB"; cbd.Size = sizeof(float4x4) * 2; cbd.Usage = USAGE_DYNAMIC;
+	cbd.Name = "World CB"; cbd.Size = sizeof(float4x4) * 3; cbd.Usage = USAGE_DYNAMIC;   // wvp, world, prevWVP (gbuffer velocity)
 	cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(cbd, nullptr, &worldCB);
 

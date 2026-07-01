@@ -517,7 +517,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	{   // RTRefCB: clip->view + view->world + camera + (intensity, maxDist, maxDepth)
 		struct CB { float4x4 ip, iv; float4 cam; float4 prm; };
 		MapHelper<CB> cb(context, rtRefCB, MAP_WRITE, MAP_FLAG_DISCARD);
-		cb->ip  = curProj.Inverse(); cb->iv = curView.Inverse();
+		cb->ip  = curProjNoJitter.Inverse(); cb->iv = curView.Inverse();   // unjittered — matches the unjittered gbuffer depth (TAA jitter must not leak into RT reflections)
 		cb->cam = float4(curCamPos[0], curCamPos[1], curCamPos[2], 1.0f);
 		float intensity = rtCfgIntensity;   // GLOBAL settings (Project Settings -> config), not the per-effect chip
 		float maxDist   = rtCfgMaxDist;

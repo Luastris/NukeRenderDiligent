@@ -89,6 +89,7 @@ void NukeDiligent::Impl::CreatePostResources()
 	// SSR matrices (view/proj/invProj + resolution), filled per camera in RunSSR.
 	if (!ssrCB) { BufferDesc d; d.Name = "SSRCB"; d.Size = sizeof(float) * (16 * 3 + 4); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &ssrCB); }
 	if (!rtRefCB) { BufferDesc d; d.Name = "RTRefCB"; d.Size = sizeof(float) * (16 + 4 * 8); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &rtRefCB); }
+	if (!taaCB) { BufferDesc d; d.Name = "TAACB"; d.Size = sizeof(float) * (16 * 4 + 4 * 2); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &taaCB); }
 	BuildGBufferPipe();   // gbuffer.ps + world.vs (shares worldCB/worldMatCB) — for the SSR prepass
 
 	// Build one post PSO per output format: RGBA8 for RT targets, swap-chain format for the backbuffer.
@@ -213,6 +214,7 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	gp.DepthStencilDesc.DepthEnable = False;
 	gp.InputLayout.NumElements = 0;
 	const bool ssr = (name == "ssr");   // built-in: also samples the G-buffer + depth + camera matrices (SSRCB)
+	const bool taa = (name == "taa");   // built-in: samples depth + a history texture + camera matrices (TAACB)
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP;
 	// POINT sampler for depth + G-buffer: linear filtering of depth/normal across a curved surface (sphere) blends
@@ -229,6 +231,15 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 		imms.push_back({SHADER_TYPE_PIXEL, "g_GBuffer", psamp});
 		imms.push_back({SHADER_TYPE_PIXEL, "g_Depth",   psamp});
 	}
+	if (taa)
+	{
+		vars.push_back({SHADER_TYPE_PIXEL, "g_Depth",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+		vars.push_back({SHADER_TYPE_PIXEL, "g_History",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+		vars.push_back({SHADER_TYPE_PIXEL, "g_Velocity", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+		imms.push_back({SHADER_TYPE_PIXEL, "g_Depth",    psamp});   // point: exact depth for reprojection
+		imms.push_back({SHADER_TYPE_PIXEL, "g_History",  samp});    // linear: bilinear history sampling
+		imms.push_back({SHADER_TYPE_PIXEL, "g_Velocity", psamp});   // point: exact motion vector
+	}
 	ci.PSODesc.ResourceLayout.Variables = vars.data(); ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
 	ci.PSODesc.ResourceLayout.ImmutableSamplers = imms.data(); ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)imms.size();
 	ci.pVS = v; ci.pPS = p;
@@ -238,9 +249,11 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	if (auto* c = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostParams")) c->Set(postParamsCB);
 	if (auto* f = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostFrame"))  f->Set(postFrameCB);
 	if (ssr) if (auto* s = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "SSRCB")) s->Set(ssrCB);
+	if (taa) if (auto* s = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "TAACB")) s->Set(taaCB);
 	pp.pso->CreateShaderResourceBinding(&pp.srb, true);
 	pp.srcVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Source");
 	if (ssr) { pp.gbufVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GBuffer"); pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.isSSR = true; }
+	if (taa) { pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.histVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_History"); pp.velVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Velocity"); pp.isTAA = true; }
 	pp.isBloom = (name == "bloom");   // built-in multi-pass effect; the renderer runs the passes itself
 	uint64_t h = nextShaderHandle++;
 	postPipes[h] = std::move(pp);

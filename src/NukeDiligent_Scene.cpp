@@ -271,6 +271,12 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	ctx->SetViewports(1, &vp, w, h);
 
 	m_impl->SetCameraViewProj(cam, w, h);   // curView/curProj/curCamPos (shared with the SSR gbuffer prepass)
+	m_impl->curProjNoJitter = m_impl->curProj;   // unjittered — TAA reprojection + the depth prepass use this
+	if (m_impl->curTAA && w > 0 && h > 0)        // TAA: jitter the COLOUR projection sub-pixel (Halton); depth stays clean
+	{
+		m_impl->curProj.m[2][0] += m_impl->curJitterX * 2.0f / (float)w;   // pixel -> NDC (row-vector: clip.x += vz*offset)
+		m_impl->curProj.m[2][1] += m_impl->curJitterY * 2.0f / (float)h;
+	}
 
 	// PBR lighting buffer for this pass: camera pos + ambient + scene lights (default sun if none).
 	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
@@ -280,6 +286,21 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 }
 
 void NukeDiligent::setSky(const NukeSky& s) { m_impl->sky = s; m_impl->toneExposure = s.exposure; m_impl->toneWhite = s.whitePoint; }
+
+// Halton low-discrepancy sequence (1-based index) — even sub-pixel coverage for the TAA jitter.
+static float Halton(int i, int b) { float f = 1.0f, r = 0.0f; while (i > 0) { f /= b; r += f * (i % b); i /= b; } return r; }
+
+// Enable/disable TAA for the camera about to render. When enabled, advance the jitter (Halton 2,3; ±0.5 px) so the
+// next beginCamera offsets the colour projection. Called by World::Render per camera before the prepass/beginCamera.
+void NukeDiligent::setCameraTAA(bool enabled)
+{
+	m_impl->curTAA = enabled;
+	if (!enabled) return;
+	int idx = (m_impl->taaFrame % 8) + 1;   // period-8 Halton
+	++m_impl->taaFrame;
+	m_impl->curJitterX = Halton(idx, 2) - 0.5f;
+	m_impl->curJitterY = Halton(idx, 3) - 0.5f;
+}
 
 void NukeDiligent::endCamera()
 {
@@ -317,6 +338,11 @@ void NukeDiligent::endCamera()
 			{
 				if (!m_impl->gbufActive) continue;   // needs the gbuffer prepass (reflector roughness/metalness); no TLAS -> passthrough inside
 				m_impl->RunRTReflectPipeline(srcSRV, dstTex, w, h, cs.params);
+			}
+			else if (pit->second.isTAA)   // built-in temporal AA (jittered accumulation; needs the depth prepass)
+			{
+				if (!m_impl->gbufActive) continue;   // no depth prepass -> skip (src passes through)
+				m_impl->RunTAA(pit->second, srcSRV, dstTex, w, h, cs.params);
 			}
 			else if (pit->second.isBloom)   // built-in multi-pass bloom (params: x=threshold, y=intensity)
 			{

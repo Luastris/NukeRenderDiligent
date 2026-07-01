@@ -8,13 +8,18 @@ void NukeDiligent::Impl::EnsureGBuffer(int w, int h)
 	if (w <= 0 || h <= 0) return;
 	if (gbufColor && gbufW == w && gbufH == h) return;
 	gbufW = w; gbufH = h;
-	gbufColor.Release(); gbufDepth.Release();
-	gbufRTV = gbufSRV = gbufDSV = gbufDepthSRV = nullptr;
+	gbufColor.Release(); gbufDepth.Release(); gbufVel.Release();
+	gbufRTV = gbufSRV = gbufDSV = gbufDepthSRV = gbufVelRTV = gbufVelSRV = nullptr;
 
 	TextureDesc cd; cd.Name = "GBuffer"; cd.Type = RESOURCE_DIM_TEX_2D; cd.Width = (Uint32)w; cd.Height = (Uint32)h;
 	cd.Format = TEX_FORMAT_RGBA16_FLOAT; cd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
 	device->CreateTexture(cd, nullptr, &gbufColor);
 	if (gbufColor) { gbufRTV = gbufColor->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); gbufSRV = gbufColor->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
+
+	TextureDesc vd; vd.Name = "GBuffer Velocity"; vd.Type = RESOURCE_DIM_TEX_2D; vd.Width = (Uint32)w; vd.Height = (Uint32)h;
+	vd.Format = TEX_FORMAT_RG16_FLOAT; vd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;   // screen-space motion (TAA)
+	device->CreateTexture(vd, nullptr, &gbufVel);
+	if (gbufVel) { gbufVelRTV = gbufVel->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); gbufVelSRV = gbufVel->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
 
 	TextureDesc dd; dd.Name = "GBuffer Depth"; dd.Type = RESOURCE_DIM_TEX_2D; dd.Width = (Uint32)w; dd.Height = (Uint32)h;
 	dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE;
@@ -27,7 +32,7 @@ void NukeDiligent::Impl::EnsureGBuffer(int w, int h)
 bool NukeDiligent::Impl::BuildGBufferPipe()
 {
 	gbufPSO.Release(); gbufSRB.Release(); gbufMRVar = nullptr;
-	std::string vsSrc = shaderSource("world.vs"), psSrc = shaderSource("gbuffer.ps");
+	std::string vsSrc = shaderSource("gbuffer.vs"), psSrc = shaderSource("gbuffer.ps");   // velocity-aware VS (motion vectors)
 	if (vsSrc.empty() || psSrc.empty()) return false;
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	RefCntAutoPtr<IShader> vs, ps;
@@ -37,7 +42,8 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 
 	GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "GBuffer PSO";
 	auto& gp = ci.GraphicsPipeline;
-	gp.NumRenderTargets = 1; gp.RTVFormats[0] = TEX_FORMAT_RGBA16_FLOAT; gp.DSVFormat = TEX_FORMAT_D32_FLOAT;
+	gp.NumRenderTargets = 2; gp.RTVFormats[0] = TEX_FORMAT_RGBA16_FLOAT; gp.RTVFormats[1] = TEX_FORMAT_RG16_FLOAT;   // gbuffer + velocity
+	gp.DSVFormat = TEX_FORMAT_D32_FLOAT;
 	gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 	gp.RasterizerDesc.CullMode = CULL_MODE_BACK;
 	gp.DepthStencilDesc.DepthEnable = True; gp.DepthStencilDesc.DepthWriteEnable = True;
@@ -75,7 +81,7 @@ void NukeDiligent::Impl::RunSSR(PostPipe& pp, ITextureView* srcSRV, ITextureView
 	{
 		struct SSRData { float4x4 view, proj, invProj; float res[4]; };
 		MapHelper<SSRData> cb(context, ssrCB, MAP_WRITE, MAP_FLAG_DISCARD);
-		cb->view = curView; cb->proj = curProj; cb->invProj = curProj.Inverse();
+		cb->view = curView; cb->proj = curProjNoJitter; cb->invProj = curProjNoJitter.Inverse();   // unjittered — matches the unjittered gbuffer depth (TAA jitter must not leak into SSR)
 		cb->res[0] = (float)w; cb->res[1] = (float)h; cb->res[2] = w ? 1.0f / w : 0.0f; cb->res[3] = h ? 1.0f / h : 0.0f;
 	}
 	{
@@ -95,6 +101,55 @@ void NukeDiligent::Impl::RunSSR(PostPipe& pp, ITextureView* srcSRV, ITextureView
 	context->Draw(da);
 }
 
+// Temporal AA resolve: reproject the per-camera history by the current (unjittered) depth + prev view/proj, clamp
+// to the local colour neighbourhood, blend, and copy the result back into the history for next frame.
+void NukeDiligent::Impl::RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params)
+{
+	TAAState& st = taaStates[curTarget];
+	if (!st.hist || st.w != w || st.h != h)   // (re)create history to match the target size
+	{
+		st.hist.Release();
+		TextureDesc td; td.Name = "TAA history"; td.Type = RESOURCE_DIM_TEX_2D; td.Width = (Uint32)w; td.Height = (Uint32)h;
+		td.MipLevels = 1; td.Format = HDR_FMT; td.BindFlags = BIND_SHADER_RESOURCE | BIND_RENDER_TARGET; td.Usage = USAGE_DEFAULT;
+		device->CreateTexture(td, nullptr, &st.hist);
+		st.w = w; st.h = h; st.valid = false;
+	}
+	if (!st.hist) return;
+	{
+		struct TAAData { float4x4 invProj, invView, prevView, prevProj; float res[4]; float flags[4]; };
+		MapHelper<TAAData> cb(context, taaCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		cb->invProj  = curProjNoJitter.Inverse(); cb->invView = curView.Inverse();
+		cb->prevView = st.valid ? st.prevView : curView;
+		cb->prevProj = st.valid ? st.prevProj : curProjNoJitter;
+		cb->res[0] = (float)w; cb->res[1] = (float)h; cb->res[2] = w ? 1.0f / w : 0.0f; cb->res[3] = h ? 1.0f / h : 0.0f;
+		cb->flags[0] = st.valid ? 1.0f : 0.0f; cb->flags[1] = cb->flags[2] = cb->flags[3] = 0.0f;
+	}
+	{
+		MapHelper<float> cbp(context, postParamsCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		int n = (int)params.size(); if (n > 64) n = 64;
+		for (int k = 0; k < 64; ++k) cbp[k] = (k < n) ? params[k] : 0.0f;
+	}
+	ITextureView* dstRTV = dstTex->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+	context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+	context->SetViewports(1, &vp, w, h);
+	if (pp.srcVar)   pp.srcVar->Set(srcSRV);
+	if (pp.depthVar) pp.depthVar->Set(gbufDepthSRV);
+	if (pp.histVar)  pp.histVar->Set(st.hist->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	if (pp.velVar)   pp.velVar->Set(gbufVelSRV);
+	context->SetPipelineState(pp.pso);
+	context->CommitShaderResources(pp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
+	context->Draw(da);
+
+	// Copy the resolved result into the history for next frame; remember this frame's (unjittered) view/proj.
+	CopyTextureAttribs cp; cp.pSrcTexture = dstTex; cp.pDstTexture = st.hist;
+	cp.SrcTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	cp.DstTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	context->CopyTexture(cp);
+	st.prevView = curView; st.prevProj = curProjNoJitter; st.valid = true;
+}
+
 // --- SSR G-buffer prepass (single-sample): normal/roughness/metalness + depth, before the colour pass --------
 void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 {
@@ -104,30 +159,40 @@ void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 	if (!m_impl->CameraSize(cam, w, h)) return;
 	m_impl->EnsureGBuffer(w, h);
 	if (!m_impl->gbufRTV || !m_impl->gbufDSV) return;
+	m_impl->curTarget = cam.target;   // TAA per-camera state (taaStates[curTarget]) keyed correctly during the prepass
 	m_impl->SetCameraViewProj(cam, w, h);
 	IDeviceContext* ctx = m_impl->context;
-	ctx->SetRenderTargets(1, &m_impl->gbufRTV, m_impl->gbufDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ITextureView* rtvs[2] = { m_impl->gbufRTV, m_impl->gbufVelRTV };   // MRT: gbuffer + velocity
+	ctx->SetRenderTargets(m_impl->gbufVelRTV ? 2 : 1, rtvs, m_impl->gbufDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	const float clr[4] = { 0, 0, 0, 0 };
 	ctx->ClearRenderTarget(m_impl->gbufRTV, clr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	if (m_impl->gbufVelRTV) ctx->ClearRenderTarget(m_impl->gbufVelRTV, clr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	ctx->ClearDepthStencil(m_impl->gbufDSV, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
 	ctx->SetViewports(1, &vp, w, h);
 	m_impl->gbufActive = true;
 }
 
-void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3])
+void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
+                                       const float prevPos[3], const float prevQuat[4], const float prevScale[3])
 {
 	if (!m_impl->gbufActive || !m_impl->gbufPSO) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
 	Impl::MeshGPU& g = *gp;
 
-	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
-	               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
-	               * float4x4::Translation(pos[0], pos[1], pos[2]);
-	float4x4 wvp = world * m_impl->curView * m_impl->curProj;
-	struct CBData { float4x4 wvp; float4x4 world; };
-	{ MapHelper<CBData> cb(m_impl->context, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD); cb->wvp = wvp; cb->world = world; }
+	auto build = [](const float p[3], const float q[4], const float s[3]) {
+		return float4x4::Scale(s[0], s[1], s[2]) * Diligent::Quaternion<float>(q[0], q[1], q[2], q[3]).ToMatrix() * float4x4::Translation(p[0], p[1], p[2]);
+	};
+	float4x4 world = build(pos, quat, scale);
+	float4x4 wvp   = world * m_impl->curView * m_impl->curProj;   // prepass is UNjittered
+	// Previous-frame clip: prev object transform * previous camera (from this camera's TAA state). Falls back to
+	// the current transforms (zero velocity) when there's no prev transform / no history yet.
+	Impl::TAAState& tst = m_impl->taaStates[m_impl->curTarget];
+	float4x4 prevWorld = (prevPos && prevQuat && prevScale) ? build(prevPos, prevQuat, prevScale) : world;
+	float4x4 prevWVP   = tst.valid ? (prevWorld * tst.prevView * tst.prevProj) : wvp;
+	struct CBData { float4x4 wvp; float4x4 world; float4x4 prevWVP; };
+	{ MapHelper<CBData> cb(m_impl->context, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD); cb->wvp = wvp; cb->world = world; cb->prevWVP = prevWVP; }
 
 	float metallic = 0.0f, roughness = 0.6f; ITextureView* mrsrv = nullptr; ITextureView* nsrv = nullptr;
 	if (mat) { metallic = mat->metallic; roughness = mat->roughness;

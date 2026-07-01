@@ -124,6 +124,7 @@ struct NukeDiligent::Impl
 	// Custom post-effect chain (one fullscreen pipeline per effect; ping-ponged in HDR before the final tonemap).
 	struct PostPipe { RefCntAutoPtr<IPipelineState> pso; RefCntAutoPtr<IShaderResourceBinding> srb; IShaderResourceVariable* srcVar = nullptr; bool isBloom = false;
 	                  IShaderResourceVariable* gbufVar = nullptr; IShaderResourceVariable* depthVar = nullptr; bool isSSR = false;
+	                  IShaderResourceVariable* histVar = nullptr; IShaderResourceVariable* velVar = nullptr; bool isTAA = false;   // temporal AA (history + depth + velocity)
 	                  bool isRTRef = false;   // built-in ray-traced reflections (D3D12)
 	                  IShaderResourceVariable* tlasVar = nullptr; IShaderResourceVariable* instVar = nullptr;
 	                  IShaderResourceVariable* nrmVar = nullptr;  IShaderResourceVariable* rtProbeVar = nullptr;
@@ -172,8 +173,9 @@ struct NukeDiligent::Impl
 	// G-buffer prepass (single-sample) for screen-space reflections: normal(oct)+roughness+metalness + depth.
 	// Rendered per SSR camera before the colour pass; the "ssr" post effect samples it. Own 1x depth -> no MSAA
 	// depth resolve, and the colour/custom shaders stay untouched (a dedicated gbuffer.ps fills it).
-	RefCntAutoPtr<ITexture>             gbufColor, gbufDepth;
+	RefCntAutoPtr<ITexture>             gbufColor, gbufDepth, gbufVel;
 	ITextureView*                       gbufRTV = nullptr, *gbufDSV = nullptr, *gbufSRV = nullptr, *gbufDepthSRV = nullptr;
+	ITextureView*                       gbufVelRTV = nullptr, *gbufVelSRV = nullptr;   // screen-space motion (TAA)
 	int                                 gbufW = 0, gbufH = 0;
 	bool                                gbufActive = false;   // a valid prepass ran for the current camera
 	RefCntAutoPtr<IPipelineState>       gbufPSO;
@@ -182,6 +184,16 @@ struct NukeDiligent::Impl
 	IShaderResourceVariable*            gbufNrmVar = nullptr;  // PS g_Normal (dynamic) — normal-mapped gbuffer normal
 	RefCntAutoPtr<IBuffer>              ssrCB;                 // SSR matrices (view/proj/invProj/res)
 	RefCntAutoPtr<IBuffer>              rtRefCB;               // RT reflections (invViewProj, light, ambient, sky)
+	// Temporal AA: per-camera history + previous view/proj (keyed by curTarget), a shared CB, and the current
+	// frame's sub-pixel jitter (pixels; applied to the COLOUR projection only, in beginCamera).
+	RefCntAutoPtr<IBuffer>              taaCB;
+	struct TAAState { RefCntAutoPtr<ITexture> hist; float4x4 prevView, prevProj; bool valid = false; int w = 0, h = 0; };
+	std::map<uint64_t, TAAState>        taaStates;
+	bool                                curTAA = false;        // is the current camera running TAA?
+	float                               curJitterX = 0.0f, curJitterY = 0.0f;   // this frame's jitter (pixels, [-0.5,0.5])
+	int                                 taaFrame = 0;
+	float4x4                            curProjNoJitter;       // curProj before jitter (for TAA reprojection)
+	void RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params);
 
 	// --- Ray tracing (D3D12) ---------------------------------------------------------------------------------
 	std::unordered_map<Mesh*, RefCntAutoPtr<IBottomLevelAS>> blasCache;   // BLAS per mesh (built once, reused)
