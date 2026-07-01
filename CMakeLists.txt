@@ -50,7 +50,7 @@ target_include_directories(NukeRenderDiligent PRIVATE
 
 # glfw import lib (vcpkg). Debug build links the debug import lib.
 target_link_directories(NukeRenderDiligent PRIVATE
-    "${VCPKG_INSTALLED}/debug/lib"
+    "${VCPKG_INSTALLED}/$<$<CONFIG:Debug>:debug/>lib"
 )
 
 target_link_libraries(NukeRenderDiligent PRIVATE
@@ -69,14 +69,14 @@ target_link_libraries(NukeRenderDiligent PRIVATE
 )
 
 # Deploy the module DLL next to the editor, into modules/.
-set(MODULES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/x64/Debug/modules")
-set(EDITOR_DIR  "${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/x64/Debug")
+set(MODULES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/x64/$<CONFIG>/modules")
+set(EDITOR_DIR  "${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/x64/$<CONFIG>")
 add_custom_command(TARGET NukeRenderDiligent POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${MODULES_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:NukeRenderDiligent>" "${MODULES_DIR}/"
     # glfw3.dll is this module's runtime dependency — deploy it next to the exe.
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${VCPKG_INSTALLED}/debug/bin/glfw3.dll" "${EDITOR_DIR}/"
+            "${VCPKG_INSTALLED}/$<$<CONFIG:Debug>:debug/>bin/glfw3.dll" "${EDITOR_DIR}/"
     COMMENT "Deploying NukeRenderDiligent.dll + glfw3.dll"
 )
