@@ -87,8 +87,10 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 		Uint8* p = mb;
 		memset(p, 0, Impl::kMatCBBytes);
 		memcpy(p + 0, col, sizeof(float) * 4);
-		float prm[4] = { srv ? 1.0f : 0.0f, nsrv ? 1.0f : 0.0f, metallic, roughness };
-		memcpy(p + 16, prm, sizeof(float) * 4);   // g_Params (hasBase, hasNormal, metallic, roughness)
+		// g_Params.y: 0 = no normal; >0 = normal, OpenGL green (flip); <0 = normal, DirectX green (no flip).
+		float nrmY = nsrv ? ((mat && mat->norm && !mat->norm->invertGreen) ? -1.0f : 1.0f) : 0.0f;
+		float prm[4] = { srv ? 1.0f : 0.0f, nrmY, metallic, roughness };
+		memcpy(p + 16, prm, sizeof(float) * 4);   // g_Params (hasBase, hasNormal±greenConv, metallic, roughness)
 		float prm2[4] = { mrsrv ? 1.0f : 0.0f, aosrv ? 1.0f : 0.0f, emsrv ? 1.0f : 0.0f, specF };
 		memcpy(p + 32, prm2, sizeof(float) * 4);  // g_Params2 (hasMR, hasAO, hasEm, specularFactor)
 		float emv[4] = { emissive[0], emissive[1], emissive[2], emissiveI };

@@ -236,6 +236,7 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 	// (g_MatBytes) feeds auto-generated per-shader hit shaders (they load their own params from it).
 	Impl::RTInstanceData d{}; d.nrmOffset = nrmOff; d.uvOffset = uvOff; d.posOffset = posOff;
 	d.texIndex = texIdx; d.nrmTexIndex = nrmIdx; d.mrTexIndex = mrIdx; d.aoTexIndex = aoIdx; d.emTexIndex = emIdx; d.specTexIndex = specIdx;
+	d.nrmFlipG = (mat && mat->norm && mat->norm->invertGreen) ? 1u : 0u;   // green convention (OpenGL +Y)
 	float alb[4] = {1, 1, 1, 1}, em[3] = {0, 0, 0}; float metal = 0.0f, rough = 0.6f, emI = 0.0f, specF = 1.0f;
 	if (mat)
 	{

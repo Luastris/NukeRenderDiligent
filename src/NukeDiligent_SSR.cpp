@@ -135,7 +135,8 @@ void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float po
 	{
 		MapHelper<Uint8> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		Uint8* p = mb; memset(p, 0, Impl::kMatCBBytes);
-		float prm[4]  = { 0, nsrv ? 1.0f : 0.0f, metallic, roughness };   // g_Params (_, hasNormal.y, metallic.z, roughness.w)
+		float nrmY = nsrv ? ((mat && mat->norm && !mat->norm->invertGreen) ? -1.0f : 1.0f) : 0.0f;   // sign = green convention
+		float prm[4]  = { 0, nrmY, metallic, roughness };   // g_Params (_, hasNormal±greenConv, metallic.z, roughness.w)
 		memcpy(p + 16, prm, sizeof(float) * 4);
 		float prm2[4] = { mrsrv ? 1.0f : 0.0f, 0, 0, 1.0f };   // g_Params2 (hasMR.x)
 		memcpy(p + 32, prm2, sizeof(float) * 4);

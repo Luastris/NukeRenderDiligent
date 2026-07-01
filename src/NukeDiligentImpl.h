@@ -205,7 +205,7 @@ struct NukeDiligent::Impl
 	struct RTInstanceData {
 		uint32_t nrmOffset, uvOffset, posOffset, matByteOffset;
 		uint32_t texIndex, nrmTexIndex, mrTexIndex, aoTexIndex;
-		uint32_t emTexIndex, specTexIndex; float specularFactor; uint32_t _pad;
+		uint32_t emTexIndex, specTexIndex; float specularFactor; uint32_t nrmFlipG;   // 1 = flip green (OpenGL)
 		float albedoMetal[4]; float emissiveRough[4];
 	};
 	std::unordered_map<Mesh*, uint32_t> meshNrmByteOffset;     // mesh -> byte offset of its normals in rtNrmBuf

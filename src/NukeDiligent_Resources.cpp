@@ -48,14 +48,15 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 	if (it == texCache.end())
 	{
 		RefCntAutoPtr<ITexture> tex;
-		if (t->format == Texture::FMT_BC1 || t->format == Texture::FMT_BC3)
+		if (t->format == Texture::FMT_BC1 || t->format == Texture::FMT_BC3 || t->format == Texture::FMT_BC5)
 		{
 			// Pre-compressed BC with a stored mip chain — upload every level (no GenerateMips for BC).
-			const int  blockBytes = (t->format == Texture::FMT_BC1) ? 8 : 16;
+			const int  blockBytes = (t->format == Texture::FMT_BC1) ? 8 : 16;   // BC3/BC5 = 16
 			const int  mips = t->mipCount < 1 ? 1 : t->mipCount;
 			TextureDesc td; td.Type = RESOURCE_DIM_TEX_2D; td.Width = t->width; td.Height = t->height;
 			td.MipLevels = mips; td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
-			td.Format = (t->format == Texture::FMT_BC1) ? TEX_FORMAT_BC1_UNORM : TEX_FORMAT_BC3_UNORM;
+			td.Format = (t->format == Texture::FMT_BC1) ? TEX_FORMAT_BC1_UNORM
+			          : (t->format == Texture::FMT_BC5) ? TEX_FORMAT_BC5_UNORM : TEX_FORMAT_BC3_UNORM;
 			std::vector<TextureSubResData> subs(mips);
 			size_t off = 0; int mw = t->width, mh = t->height;
 			for (int m = 0; m < mips; ++m)
