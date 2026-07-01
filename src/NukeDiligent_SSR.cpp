@@ -45,19 +45,26 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	LayoutElement layout[] = { {0, 0, 3, VT_FLOAT32}, {1, 1, 3, VT_FLOAT32}, {2, 2, 2, VT_FLOAT32} };
 	gp.InputLayout.NumElements = 3; gp.InputLayout.LayoutElements = layout;
 
-	ShaderResourceVariableDesc vars[] = { {SHADER_TYPE_PIXEL, "g_MetalRough", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC} };
-	ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 1;
+	ShaderResourceVariableDesc vars[] = {
+		{SHADER_TYPE_PIXEL, "g_MetalRough", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_Normal",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+	};
+	ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 2;
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_WRAP; samp.AddressV = TEXTURE_ADDRESS_WRAP;
-	ImmutableSamplerDesc imm[] = { {SHADER_TYPE_PIXEL, "g_MetalRough", samp} };   // pairs with the texture (D3D12-strict)
-	ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+	ImmutableSamplerDesc imm[] = {   // per-texture samplers pair by name (D3D12-strict combined samplers)
+		{SHADER_TYPE_PIXEL, "g_MetalRough", samp},
+		{SHADER_TYPE_PIXEL, "g_Normal",     samp},
+	};
+	ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 2;
 	ci.pVS = vs; ci.pPS = ps;
 	device->CreateGraphicsPipelineState(ci, &gbufPSO);
 	if (!gbufPSO) { cout << "[NukeDiligent]\tgbuffer PSO build failed" << endl; return false; }
 	if (auto* c = gbufPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))    c->Set(worldCB);
 	if (auto* m = gbufPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB")) m->Set(worldMatCB);
 	gbufPSO->CreateShaderResourceBinding(&gbufSRB, true);
-	gbufMRVar = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
+	gbufMRVar  = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
+	gbufNrmVar = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
 	return true;
 }
 
@@ -122,18 +129,21 @@ void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float po
 	struct CBData { float4x4 wvp; float4x4 world; };
 	{ MapHelper<CBData> cb(m_impl->context, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD); cb->wvp = wvp; cb->world = world; }
 
-	float metallic = 0.0f, roughness = 0.6f; ITextureView* mrsrv = nullptr;
-	if (mat) { metallic = mat->metallic; roughness = mat->roughness; if (mat->mr) mrsrv = m_impl->GetTexSRV(mat->mr); }
+	float metallic = 0.0f, roughness = 0.6f; ITextureView* mrsrv = nullptr; ITextureView* nsrv = nullptr;
+	if (mat) { metallic = mat->metallic; roughness = mat->roughness;
+	           if (mat->mr) mrsrv = m_impl->GetTexSRV(mat->mr); if (mat->norm) nsrv = m_impl->GetTexSRV(mat->norm); }
 	{
 		MapHelper<Uint8> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		Uint8* p = mb; memset(p, 0, Impl::kMatCBBytes);
-		float prm[4]  = { 0, 0, metallic, roughness };         // g_Params  (metallic.z, roughness.w)
+		float prm[4]  = { 0, nsrv ? 1.0f : 0.0f, metallic, roughness };   // g_Params (_, hasNormal.y, metallic.z, roughness.w)
 		memcpy(p + 16, prm, sizeof(float) * 4);
 		float prm2[4] = { mrsrv ? 1.0f : 0.0f, 0, 0, 1.0f };   // g_Params2 (hasMR.x)
 		memcpy(p + 32, prm2, sizeof(float) * 4);
 	}
 	if (m_impl->gbufMRVar)
 		m_impl->gbufMRVar->Set(mrsrv ? mrsrv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	if (m_impl->gbufNrmVar)
+		m_impl->gbufNrmVar->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
 
 	IDeviceContext* ctx = m_impl->context;
 	IBuffer* vbs[] = { g.pos, g.nrm, g.uv }; Uint64 offs[] = { 0, 0, 0 };
