@@ -55,12 +55,13 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	float col[4] = { 1, 1, 1, 1 };
 	float metallic = 0.0f, roughness = 0.6f;
 	float emissive[3] = { 0, 0, 0 }, emissiveI = 0.0f;
+	float specF = 1.0f;
 	ITextureView* srv = nullptr; ITextureView* nsrv = nullptr;
-	ITextureView* mrsrv = nullptr; ITextureView* aosrv = nullptr; ITextureView* emsrv = nullptr;
+	ITextureView* mrsrv = nullptr; ITextureView* aosrv = nullptr; ITextureView* emsrv = nullptr; ITextureView* specsrv = nullptr;
 	if (mat)
 	{
 		col[0] = (float)mat->color.r; col[1] = (float)mat->color.g; col[2] = (float)mat->color.b; col[3] = (float)mat->color.a;
-		metallic = mat->metallic; roughness = mat->roughness;
+		metallic = mat->metallic; roughness = mat->roughness; specF = mat->specular;
 		emissive[0] = (float)mat->emissive.r; emissive[1] = (float)mat->emissive.g; emissive[2] = (float)mat->emissive.b;
 		emissiveI = mat->emissiveIntensity;
 		if (mat->diff) srv   = m_impl->GetTexSRV(mat->diff);
@@ -68,6 +69,7 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 		if (mat->mr)   mrsrv = m_impl->GetTexSRV(mat->mr);
 		if (mat->ao)   aosrv = m_impl->GetTexSRV(mat->ao);
 		if (mat->em)   emsrv = m_impl->GetTexSRV(mat->em);
+		if (mat->spec) specsrv = m_impl->GetTexSRV(mat->spec);
 	}
 	// Pick the pipeline for this material's shader (fallback to the built-in "world" pipeline).
 	uint64_t h = (mat && mat->shader && mat->shader->rendererHandle) ? mat->shader->rendererHandle
@@ -87,8 +89,8 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 		memcpy(p + 0, col, sizeof(float) * 4);
 		float prm[4] = { srv ? 1.0f : 0.0f, nsrv ? 1.0f : 0.0f, metallic, roughness };
 		memcpy(p + 16, prm, sizeof(float) * 4);   // g_Params (hasBase, hasNormal, metallic, roughness)
-		float prm2[4] = { mrsrv ? 1.0f : 0.0f, aosrv ? 1.0f : 0.0f, emsrv ? 1.0f : 0.0f, 1.0f };
-		memcpy(p + 32, prm2, sizeof(float) * 4);  // g_Params2 (hasMR, hasAO, hasEm, aoStrength)
+		float prm2[4] = { mrsrv ? 1.0f : 0.0f, aosrv ? 1.0f : 0.0f, emsrv ? 1.0f : 0.0f, specF };
+		memcpy(p + 32, prm2, sizeof(float) * 4);  // g_Params2 (hasMR, hasAO, hasEm, specularFactor)
 		float emv[4] = { emissive[0], emissive[1], emissive[2], emissiveI };
 		memcpy(p + 48, emv, sizeof(float) * 4);   // g_Emissive2 (rgb, intensity)
 		if (mat && mat->shader)
@@ -111,6 +113,7 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	if (wp.mrVar) wp.mrVar->Set(mrsrv ? mrsrv : whiteSRV);
 	if (wp.aoVar) wp.aoVar->Set(aosrv ? aosrv : whiteSRV);
 	if (wp.emVar) wp.emVar->Set(emsrv ? emsrv : whiteSRV);
+	if (wp.specVar) wp.specVar->Set(specsrv ? specsrv : whiteSRV);
 	if (wp.shadowVar) wp.shadowVar->Set(m_impl->shadowSRV ? m_impl->shadowSRV : whiteSRV);
 	if (wp.cubeVar && m_impl->shadowCubeSRV) wp.cubeVar->Set(m_impl->shadowCubeSRV);
 	if (wp.probeVar) wp.probeVar->Set((m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV);

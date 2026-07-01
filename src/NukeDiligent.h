@@ -52,7 +52,7 @@ public:
 	void endGBufferPass() override;
 	bool rtAvailable() override;
 	void beginRTScene() override;
-	void addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3]) override;
+	void addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections = true) override;
 	void buildRTScene() override;
 	uint64_t createPostPipeline(const char* name, const char* ps) override;
 	void     setPostChain(const NukePostStage* stages, int count) override;

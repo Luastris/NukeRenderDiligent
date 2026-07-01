@@ -60,16 +60,18 @@ std::string NukeDiligent::Impl::GenChitSource(const std::string& name, const std
 	  << "  float3 wdir = WorldRayDirection();\n"
 	  << "  SurfaceIn IN;\n"
 	  << "  IN.uv = FetchUV(inst.uvOffset, PrimitiveIndex(), attr.barycentrics);\n"
-	  << "  IN.worldNormal = FetchWorldNormal(inst.nrmOffset, PrimitiveIndex(), attr.barycentrics, ObjectToWorld3x4());\n"
+	  << "  float3 geomN = FetchWorldNormal(inst.nrmOffset, PrimitiveIndex(), attr.barycentrics, ObjectToWorld3x4());\n"
+	  << "  IN.worldNormal = ApplyNormalMap(inst, PrimitiveIndex(), IN.uv, geomN, ObjectToWorld3x4());\n"
 	  << "  if (dot(IN.worldNormal,wdir)>0.0) IN.worldNormal=-IN.worldNormal;\n"
 	  << "  IN.worldPos = WorldRayOrigin()+wdir*RayTCurrent(); IN.viewDir=-wdir;\n"
 	  << "  SurfaceOut O=(SurfaceOut)0; O.albedo=float3(1,1,1); O.roughness=1.0; O.alpha=1.0; O.unlit=false;\n"
 	  << "  Surface(IN,O);\n"
 	  << "  if (O.unlit){ p.color=O.emissive; return; }\n"
-	  << "  float3 col = ShadeSurface(IN.worldPos,IN.worldNormal,IN.viewDir,O.albedo,O.metallic,O.roughness,O.emissive);\n"
+	  << "  float aoM=SampleAO(inst,IN.uv); float3 specM=SampleSpec(inst,IN.uv);\n"
+	  << "  float3 col = ShadeSurface(IN.worldPos,IN.worldNormal,IN.viewDir,O.albedo,O.metallic,O.roughness,O.emissive,aoM,specM);\n"
 	  << "  float3 R=reflect(wdir,IN.worldNormal); float3 env=ReflEnv(R,O.roughness), traced=env;\n"
-	  << "  if (p.depth<(uint)g_RTParams.z){ RayDesc ray; ray.Origin=IN.worldPos+IN.worldNormal*0.08+R*0.05; ray.Direction=R; ray.TMin=0.02; ray.TMax=(g_RTParams.y>0.5)?g_RTParams.y:1000.0; RTPayload p2; p2.color=0.0; p2.depth=p.depth+1; TraceRay(g_TLAS,RAY_FLAG_NONE,0xFF,0,1,0,ray,p2); traced=p2.color; }\n"
-	  << "  col += SpecFr(IN.worldNormal,IN.viewDir,O.roughness,O.albedo,O.metallic)*lerp(traced,env,O.roughness);\n"
+	  << "  if (p.depth<(uint)g_RTParams.z){ RayDesc ray; ray.Origin=IN.worldPos+IN.worldNormal*0.08+R*0.05; ray.Direction=R; ray.TMin=0.02; ray.TMax=(g_RTParams.y>0.5)?g_RTParams.y:1000.0; RTPayload p2; p2.color=0.0; p2.depth=p.depth+1; TraceRay(g_TLAS,RAY_FLAG_NONE,RT_REFLECT_MASK,0,1,0,ray,p2); traced=p2.color; }\n"
+	  << "  col += SpecFr(IN.worldNormal,IN.viewDir,O.roughness,O.albedo,O.metallic,specM)*lerp(traced,env,O.roughness);\n"
 	  << "  p.color=col;\n}\n";
 	return s.str();
 }
@@ -174,14 +176,14 @@ void NukeDiligent::beginRTScene()
 	m_impl->rtSceneReady = false;
 }
 
-void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3])
+void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections)
 {
 	if (!m_impl->rtSupported) return;
 	IBottomLevelAS* blas = m_impl->GetMeshBLAS(mesh);
 	if (!blas || !mesh->normalArray || mesh->numVerts < 3) return;
 
-	// Register this mesh's normals + uvs in the concatenated buffers (once per unique mesh).
-	uint32_t nrmOff, uvOff;
+	// Register this mesh's normals + uvs + positions in the concatenated buffers (once per unique mesh).
+	uint32_t nrmOff, uvOff, posOff;
 	auto nit = m_impl->meshNrmByteOffset.find(mesh);
 	if (nit == m_impl->meshNrmByteOffset.end())
 	{
@@ -192,22 +194,32 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 		if (mesh->uvArray) m_impl->allUVCPU.insert(m_impl->allUVCPU.end(), mesh->uvArray, mesh->uvArray + (size_t)mesh->numVerts * 2);
 		else               m_impl->allUVCPU.insert(m_impl->allUVCPU.end(), (size_t)mesh->numVerts * 2, 0.0f);
 		m_impl->meshUVByteOffset[mesh] = uvOff;
+		posOff = (uint32_t)(m_impl->allPosCPU.size() * sizeof(float));
+		m_impl->allPosCPU.insert(m_impl->allPosCPU.end(), mesh->vertexArray, mesh->vertexArray + (size_t)mesh->numVerts * 3);
+		m_impl->meshPosByteOffset[mesh] = posOff;
 		m_impl->allNrmDirty = true;
 	}
-	else { nrmOff = nit->second; uvOff = m_impl->meshUVByteOffset[mesh]; }
+	else { nrmOff = nit->second; uvOff = m_impl->meshUVByteOffset[mesh]; posOff = m_impl->meshPosByteOffset[mesh]; }
 
-	// Material albedo texture -> bindless slot (flat color when none / table full).
-	uint32_t texIdx = 0xFFFFFFFFu;
-	if (mat && mat->diff)
-	{
-		auto tit = m_impl->matTexSlot.find(mat->diff);
-		if (tit != m_impl->matTexSlot.end()) texIdx = tit->second;
-		else if (m_impl->matTexSRVs.size() < Impl::kMaxMatTex)
-		{
-			ITextureView* srv = m_impl->GetTexSRV(mat->diff);
-			if (srv) { texIdx = (uint32_t)m_impl->matTexSRVs.size(); m_impl->matTexSRVs.push_back(srv); m_impl->matTexPtr.push_back(mat->diff); m_impl->matTexSlot[mat->diff] = texIdx; }
-		}
-	}
+	// Register a material texture in the bindless map array (shared across all map types). Returns 0xFFFFFFFF when
+	// absent or the table is full. De-duplicated per engine texture so each unique map occupies one slot.
+	auto slotFor = [&](Texture* t) -> uint32_t {
+		if (!t) return 0xFFFFFFFFu;
+		auto tit = m_impl->matTexSlot.find(t);
+		if (tit != m_impl->matTexSlot.end()) return tit->second;
+		if (m_impl->matTexSRVs.size() >= Impl::kMaxMatTex) return 0xFFFFFFFFu;
+		ITextureView* srv = m_impl->GetTexSRV(t);
+		if (!srv) return 0xFFFFFFFFu;
+		uint32_t idx = (uint32_t)m_impl->matTexSRVs.size();
+		m_impl->matTexSRVs.push_back(srv); m_impl->matTexPtr.push_back(t); m_impl->matTexSlot[t] = idx;
+		return idx;
+	};
+	uint32_t texIdx  = mat ? slotFor(mat->diff) : 0xFFFFFFFFu;
+	uint32_t nrmIdx  = mat ? slotFor(mat->norm) : 0xFFFFFFFFu;
+	uint32_t mrIdx   = mat ? slotFor(mat->mr)   : 0xFFFFFFFFu;
+	uint32_t aoIdx   = mat ? slotFor(mat->ao)   : 0xFFFFFFFFu;
+	uint32_t emIdx   = mat ? slotFor(mat->em)   : 0xFFFFFFFFu;
+	uint32_t specIdx = mat ? slotFor(mat->spec) : 0xFFFFFFFFu;
 
 	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
 	               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
@@ -215,21 +227,23 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 
 	TLASBuildInstanceData inst;
 	inst.pBLAS    = blas;
-	inst.Mask     = 0xFF;
+	inst.Mask     = inReflections ? 0xFF : (Uint8)0xFE;   // clear reflect-vis bit (0x01) -> invisible to reflection rays, still casts shadows
 	inst.Flags    = RAYTRACING_INSTANCE_NONE;
 	inst.CustomId = (Uint32)m_impl->rtInstances.size();   // -> g_Instances index (InstanceID() in the shader)
 	inst.ContributionToHitGroupIndex = TLAS_INSTANCE_OFFSET_AUTO;   // PER_TLAS binding: offset computed by Diligent
 
 	// Per-instance material. albedoMetal/emissiveRough feed the standard PBR hit shader; the full MatCB block
 	// (g_MatBytes) feeds auto-generated per-shader hit shaders (they load their own params from it).
-	Impl::RTInstanceData d{}; d.nrmOffset = nrmOff; d.uvOffset = uvOff; d.texIndex = texIdx;
-	float alb[4] = {1, 1, 1, 1}, em[3] = {0, 0, 0}; float metal = 0.0f, rough = 0.6f, emI = 0.0f;
+	Impl::RTInstanceData d{}; d.nrmOffset = nrmOff; d.uvOffset = uvOff; d.posOffset = posOff;
+	d.texIndex = texIdx; d.nrmTexIndex = nrmIdx; d.mrTexIndex = mrIdx; d.aoTexIndex = aoIdx; d.emTexIndex = emIdx; d.specTexIndex = specIdx;
+	float alb[4] = {1, 1, 1, 1}, em[3] = {0, 0, 0}; float metal = 0.0f, rough = 0.6f, emI = 0.0f, specF = 1.0f;
 	if (mat)
 	{
 		alb[0] = (float)mat->color.r; alb[1] = (float)mat->color.g; alb[2] = (float)mat->color.b; alb[3] = (float)mat->color.a;
-		metal = mat->metallic; rough = mat->roughness;
+		metal = mat->metallic; rough = mat->roughness; specF = mat->specular;
 		em[0] = (float)mat->emissive.r; em[1] = (float)mat->emissive.g; em[2] = (float)mat->emissive.b; emI = mat->emissiveIntensity;
 	}
+	d.specularFactor = specF;
 	d.albedoMetal[0] = alb[0]; d.albedoMetal[1] = alb[1]; d.albedoMetal[2] = alb[2]; d.albedoMetal[3] = metal;
 	d.emissiveRough[0] = em[0] * emI; d.emissiveRough[1] = em[1] * emI; d.emissiveRough[2] = em[2] * emI; d.emissiveRough[3] = rough;
 
@@ -239,7 +253,8 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 	float* mb = reinterpret_cast<float*>(m_impl->allMatCPU.data() + d.matByteOffset);
 	mb[0] = alb[0]; mb[1] = alb[1]; mb[2] = alb[2]; mb[3] = alb[3];                       // g_Color@0
 	mb[4] = (texIdx != 0xFFFFFFFFu) ? 1.0f : 0.0f; mb[5] = 0.0f; mb[6] = metal; mb[7] = rough;  // g_Params@16
-	mb[8] = 0.0f; mb[9] = 0.0f; mb[10] = (emI > 0.0f) ? 1.0f : 0.0f; mb[11] = 1.0f;       // g_Params2@32
+	mb[8] = (mrIdx != 0xFFFFFFFFu) ? 1.0f : 0.0f; mb[9] = (aoIdx != 0xFFFFFFFFu) ? 1.0f : 0.0f;
+	mb[10] = (emI > 0.0f) ? 1.0f : 0.0f; mb[11] = specF;                                  // g_Params2 (hasMR,hasAO,hasEm,specularFactor)
 	mb[12] = em[0] * emI; mb[13] = em[1] * emI; mb[14] = em[2] * emI; mb[15] = emI;       // g_Emissive2@48
 	if (mat && mat->shader)                                                              // custom props overlay
 		for (const nuke::ShaderProp& sp : mat->shader->props)
@@ -329,6 +344,16 @@ void NukeDiligent::buildRTScene()
 			BufferData udat{d->allUVCPU.data(), ud.Size};
 			d->device->CreateBuffer(ud, &udat, &d->rtUVBuf);
 			if (d->rtUVBuf) d->rtUVSRV = d->rtUVBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE);
+		}
+
+		d->rtPosBuf.Release(); d->rtPosSRV = nullptr;
+		if (!d->allPosCPU.empty())
+		{
+			BufferDesc pd; pd.Name = "RT Positions"; pd.Usage = USAGE_IMMUTABLE; pd.BindFlags = BIND_SHADER_RESOURCE;
+			pd.Mode = BUFFER_MODE_RAW; pd.Size = (Uint64)d->allPosCPU.size() * sizeof(float);
+			BufferData pdat{d->allPosCPU.data(), pd.Size};
+			d->device->CreateBuffer(pd, &pdat, &d->rtPosBuf);
+			if (d->rtPosBuf) d->rtPosSRV = d->rtPosBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE);
 		}
 		d->allNrmDirty = false;
 	}
@@ -517,6 +542,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	setv("g_Probe",    (probeActive && probeCubeSRV) ? probeCubeSRV : fallbackCubeSRV);
 	setv("g_AllNrm",   rtNrmSRV);
 	setv("g_AllUV",    rtUVSRV ? rtUVSRV : rtNrmSRV);
+	setv("g_AllPos",   rtPosSRV ? rtPosSRV : rtNrmSRV);
 	setv("g_Instances",rtInstSRV);
 	setv("g_MatBytes", rtMatSRV ? rtMatSRV : rtInstSRV);   // per-instance MatCB blocks (auto-gen chits); rtInstSRV = valid non-null fallback
 	{   // bindless albedo array (re-resolve each frame -> animated textures update)

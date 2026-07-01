@@ -307,18 +307,34 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		{SHADER_TYPE_PIXEL, "g_MetalRough", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Occlusion",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Emissive",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_Spec",       SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Shadow",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_ShadowCube", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Probe",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // reflection probe cubemap
 		{SHADER_TYPE_PIXEL, "g_TLAS",       SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // RT scene (only present when rtSupported)
 	};
 	ci.PSODesc.ResourceLayout.Variables    = vars;
-	ci.PSODesc.ResourceLayout.NumVariables = rtSupported ? 9 : 8;
+	// g_TLAS (last entry) only exists when rtSupported -> drop it from the list otherwise.
+	const Uint32 kNumVars = (Uint32)(sizeof(vars) / sizeof(vars[0]));
+	ci.PSODesc.ResourceLayout.NumVariables = rtSupported ? kNumVars : kNumVars - 1;
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_WRAP; samp.AddressV = TEXTURE_ADDRESS_WRAP; samp.AddressW = TEXTURE_ADDRESS_WRAP;
-	ImmutableSamplerDesc immSamp[] = {{SHADER_TYPE_PIXEL, "g_Tex", samp}};   // shared sampler for material maps; the
-	ci.PSODesc.ResourceLayout.ImmutableSamplers    = immSamp;                // shadow + probe samplers are attached
-	ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;                      // to their SRVs (custom shaders may omit them)
+	// One immutable sampler per material-map texture. Combined-sampler mode is strict on D3D12: a texture X is
+	// sampled via X_sampler, so each needs its own immutable sampler (keyed by the texture name). Register only the
+	// maps THIS shader actually declares (query the compiled PS) — a custom shader without them must not carry
+	// unassigned immutable samplers (Diligent warns). Shadow + probe samplers are attached to their SRVs elsewhere.
+	static const char* const kMapTex[] = { "g_Tex", "g_Normal", "g_MetalRough", "g_Occlusion", "g_Emissive", "g_Spec" };
+	ImmutableSamplerDesc immSamp[6]; Uint32 nImm = 0;
+	const Uint32 nRes = ps->GetResourceCount();
+	for (const char* nm : kMapTex)
+		for (Uint32 r = 0; r < nRes; ++r)
+		{
+			ShaderResourceDesc rd; ps->GetResourceDesc(r, rd);
+			if (rd.Type == SHADER_RESOURCE_TYPE_TEXTURE_SRV && std::string(rd.Name) == nm)
+			{ immSamp[nImm++] = ImmutableSamplerDesc{SHADER_TYPE_PIXEL, nm, samp}; break; }
+		}
+	ci.PSODesc.ResourceLayout.ImmutableSamplers    = immSamp;
+	ci.PSODesc.ResourceLayout.NumImmutableSamplers = nImm;
 	ci.pVS = vs; ci.pPS = ps;
 
 	auto setStatics = [&](IPipelineState* pso) {
@@ -363,6 +379,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.mrVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
 	wp.aoVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Occlusion");
 	wp.emVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Emissive");
+	wp.specVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Spec");
 	wp.shadowVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Shadow");
 	wp.cubeVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ShadowCube");
 	wp.probeVar  = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Probe");

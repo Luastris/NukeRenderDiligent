@@ -200,19 +200,27 @@ struct NukeDiligent::Impl
 	// RT reflection hit shading: per-instance geometry (normals) + material, so a ray hit can be shaded.
 	// Normals of every referenced mesh are concatenated into one raw buffer; each instance stores its byte offset.
 	// matByteOffset = this instance's MatCB block in g_MatBytes (auto-gen hit shaders load their params from it).
-	struct RTInstanceData { uint32_t nrmOffset, uvOffset, texIndex, matByteOffset; float albedoMetal[4]; float emissiveRough[4]; };
+	// Mirrors HLSL RTInstanceData (rt_common.hlsl) byte-for-byte. 16-byte aligned rows for StructuredBuffer.
+	struct RTInstanceData {
+		uint32_t nrmOffset, uvOffset, posOffset, matByteOffset;
+		uint32_t texIndex, nrmTexIndex, mrTexIndex, aoTexIndex;
+		uint32_t emTexIndex, specTexIndex; float specularFactor; uint32_t _pad;
+		float albedoMetal[4]; float emissiveRough[4];
+	};
 	std::unordered_map<Mesh*, uint32_t> meshNrmByteOffset;     // mesh -> byte offset of its normals in rtNrmBuf
 	std::unordered_map<Mesh*, uint32_t> meshUVByteOffset;      // mesh -> byte offset of its uvs in rtUVBuf
-	std::vector<float>                  allNrmCPU, allUVCPU;    // concatenated mesh normals / uvs (grow as meshes appear)
+	std::unordered_map<Mesh*, uint32_t> meshPosByteOffset;     // mesh -> byte offset of its positions in rtPosBuf
+	std::vector<float>                  allNrmCPU, allUVCPU, allPosCPU;   // concatenated normals / uvs / positions
 	bool                                allNrmDirty = false;
 	RefCntAutoPtr<IBuffer>              rtNrmBuf;     IBufferView* rtNrmSRV  = nullptr;   // ByteAddressBuffer (all normals)
 	RefCntAutoPtr<IBuffer>              rtUVBuf;      IBufferView* rtUVSRV   = nullptr;   // ByteAddressBuffer (all uvs)
+	RefCntAutoPtr<IBuffer>              rtPosBuf;     IBufferView* rtPosSRV  = nullptr;   // ByteAddressBuffer (all positions)
 	RefCntAutoPtr<IBuffer>              rtInstBuf;    IBufferView* rtInstSRV = nullptr;   // StructuredBuffer<RTInstanceData>
 	std::vector<RTInstanceData>         rtInstData;            // parallel to rtInstances, rebuilt per frame
 	uint32_t                            rtInstCapacity = 0;
-	static const uint32_t               kMaxMatTex = 64;       // bindless material albedo textures (fixed array)
+	static const uint32_t               kMaxMatTex = 256;      // bindless material maps (albedo/normal/MR/AO/emissive/spec)
 	std::unordered_map<Texture*, uint32_t> matTexSlot;         // engine texture -> slot in the bindless array
-	std::vector<ITextureView*>          matTexSRVs;            // unique material albedo SRVs (<= kMaxMatTex)
+	std::vector<ITextureView*>          matTexSRVs;            // unique material map SRVs (<= kMaxMatTex)
 	std::vector<Texture*>               matTexPtr;             // engine texture per slot (re-resolve SRV each frame -> animation)
 
 	// --- RT reflection PIPELINE (real DXR: ray-gen + miss + closest-hit + SBT, native recursion) -------------
@@ -274,6 +282,7 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              mrVar   = nullptr;  // PS "g_MetalRough" (dynamic)
 		IShaderResourceVariable*              aoVar   = nullptr;  // PS "g_Occlusion"  (dynamic)
 		IShaderResourceVariable*              emVar   = nullptr;  // PS "g_Emissive"   (dynamic)
+		IShaderResourceVariable*              specVar = nullptr;  // PS "g_Spec"       (specular map, dynamic)
 		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
 		IShaderResourceVariable*              probeVar  = nullptr;// PS "g_Probe" (reflection cubemap, dynamic)
