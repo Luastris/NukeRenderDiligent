@@ -239,6 +239,11 @@ void NukeDiligent::loop()
 		render();
 }
 
+void NukeDiligent::requestClose()
+{
+	if (m_window) glfwSetWindowShouldClose(m_window, GLFW_TRUE);
+}
+
 void NukeDiligent::deinit()
 {
 	for (auto& cb : m_impl->onClose) cb();
