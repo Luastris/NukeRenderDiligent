@@ -192,6 +192,11 @@ int NukeDiligent::render()
 		}
 		m_impl->pendingSamples = -1; m_impl->pendingHDR = -1;
 	}
+	// New frame: drop last frame's debug/gizmo lines (emission happens in onRender below).
+	{
+		std::lock_guard<std::mutex> lock(m_impl->debugMutex);
+		m_impl->debugVerts.clear();
+	}
 	// Deferred shadow-resolution change (rebuilds the shadow maps; never mid-frame).
 	if (m_impl->pendingShadowRes > 0)
 	{

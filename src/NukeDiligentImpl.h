@@ -50,6 +50,7 @@
 
 #include <cstring>
 #include <vector>
+#include <mutex>
 #include <unordered_map>
 #include <algorithm>
 #include <iostream>
@@ -342,6 +343,25 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<ISampler>               shadowCmpSampler;   // PCF comparison sampler (set on shadowSRV)
 	// Procedural sky / environment.
 	NukeSky                               sky;
+	// Debug/gizmo lines (iRender::drawDebugLine): per-frame vertex list (pos3+col4),
+	// guarded (game + fixed threads emit), drawn depth-tested at endCamera, cleared at
+	// the top of render().
+	// Drawn AFTER the post chain (LDR, no depth): TAA has no velocity for lines (they
+	// smear/vanish while the camera moves) and the RT-reflection composite overwrites
+	// them on reflective surfaces - post-last avoids both. Two PSOs: RT (RGBA8) targets
+	// and the swap-chain backbuffer format.
+	RefCntAutoPtr<IPipelineState> debugPSO;      // -> RT post targets (RGBA8)
+	RefCntAutoPtr<IPipelineState> debugPSOBB;    // -> the backbuffer (swap-chain format)
+	RefCntAutoPtr<IShaderResourceBinding> debugSRB;
+	RefCntAutoPtr<IShaderResourceBinding> debugSRBBB;
+	RefCntAutoPtr<IBuffer> debugCB;
+	RefCntAutoPtr<IBuffer> debugVB;
+	int debugVBSize = 0;                 // capacity, in vertices
+	std::vector<float> debugVerts;       // 7 floats per vertex
+	std::mutex debugMutex;
+	void CreateDebugResources();
+	void DrawDebugLines(bool toBackbuffer);
+
 	RefCntAutoPtr<IPipelineState>         skyPSO;
 	RefCntAutoPtr<IShaderResourceBinding> skySRB;
 	RefCntAutoPtr<IBuffer>                skyCB;

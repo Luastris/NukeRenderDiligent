@@ -143,6 +143,8 @@ void NukeDiligent::Impl::RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* ds
 	context->Draw(da);
 
 	// Copy the resolved result into the history for next frame; remember this frame's (unjittered) view/proj.
+	// dstTex is still bound as the render target — unbind explicitly or Diligent nags every frame.
+	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 	CopyTextureAttribs cp; cp.pSrcTexture = dstTex; cp.pDstTexture = st.hist;
 	cp.SrcTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
 	cp.DstTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;

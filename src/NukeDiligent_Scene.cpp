@@ -302,6 +302,104 @@ void NukeDiligent::setCameraTAA(bool enabled)
 	m_impl->curJitterY = Halton(idx, 3) - 0.5f;
 }
 
+// ---- debug/gizmo lines (iRender::drawDebugLine) ----------------------------------------
+
+void NukeDiligent::drawDebugLine(const float a[3], const float b[3], const float color[4])
+{
+	std::lock_guard<std::mutex> lock(m_impl->debugMutex);
+	auto& v = m_impl->debugVerts;
+	v.insert(v.end(), { a[0], a[1], a[2], color[0], color[1], color[2], color[3],
+	                    b[0], b[1], b[2], color[0], color[1], color[2], color[3] });
+}
+
+void NukeDiligent::Impl::CreateDebugResources()
+{
+	debugPSO.Release(); debugPSOBB.Release(); debugSRB.Release(); debugSRBBB.Release(); debugCB.Release();
+	std::string vs = shaderSource("debug.vs"), ps = shaderSource("debug.ps");
+	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]	debug-line shaders missing" << endl; return; }
+	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	RefCntAutoPtr<IShader> v, p;
+	sci.Desc = {"Debug VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); device->CreateShader(sci, &v);
+	sci.Desc = {"Debug PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &p);
+	if (!v || !p) return;
+
+	BufferDesc cbd; cbd.Name = "DebugCB"; cbd.Size = sizeof(float4x4);
+	cbd.Usage = USAGE_DYNAMIC; cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
+	device->CreateBuffer(cbd, nullptr, &debugCB);
+
+	// Post-last overlay: LDR targets, single-sample, NO depth (the scene depth is
+	// multisampled and long resolved by this point; gizmos read on top of the image).
+	auto build = [&](TEXTURE_FORMAT fmt, const char* name,
+	                 RefCntAutoPtr<IPipelineState>& pso, RefCntAutoPtr<IShaderResourceBinding>& srb)
+	{
+		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = name;
+		auto& gp = ci.GraphicsPipeline;
+		gp.NumRenderTargets = 1; gp.RTVFormats[0] = fmt;
+		gp.DSVFormat = TEX_FORMAT_UNKNOWN;
+		gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_LINE_LIST;
+		gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
+		gp.DepthStencilDesc.DepthEnable = False;
+		gp.DepthStencilDesc.DepthWriteEnable = False;
+		gp.SmplDesc.Count = 1;
+		LayoutElement layout[] = {
+			{0, 0, 3, VT_FLOAT32, False},   // pos
+			{1, 0, 4, VT_FLOAT32, False},   // color
+		};
+		gp.InputLayout.LayoutElements = layout; gp.InputLayout.NumElements = 2;
+		ci.pVS = v; ci.pPS = p;
+		device->CreateGraphicsPipelineState(ci, &pso);
+		if (pso)
+		{
+			if (auto* sv = pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "DebugCB")) sv->Set(debugCB);
+			pso->CreateShaderResourceBinding(&srb, true);
+		}
+	};
+	build(TEX_FORMAT_RGBA8_UNORM, "Debug Lines PSO", debugPSO, debugSRB);
+	TEXTURE_FORMAT bbFmt = swapChain ? swapChain->GetDesc().ColorBufferFormat : TEX_FORMAT_RGBA8_UNORM;
+	build(bbFmt, "Debug Lines PSO BB", debugPSOBB, debugSRBBB);
+	cout << "[NukeDiligent]	debug-line pipeline" << (debugPSO ? " ready" : " FAILED") << endl;
+}
+
+void NukeDiligent::Impl::DrawDebugLines(bool toBackbuffer)
+{
+	IPipelineState* pso = toBackbuffer ? debugPSOBB : debugPSO;
+	IShaderResourceBinding* srb = toBackbuffer ? debugSRBBB : debugSRB;
+	if (!pso) return;
+	std::vector<float> verts;
+	{
+		std::lock_guard<std::mutex> lock(debugMutex);
+		verts = debugVerts;   // snapshot: emission may continue from the fixed thread
+	}
+	if (verts.empty()) return;
+	const int vertCount = (int)(verts.size() / 7);
+
+	if (!debugVB || debugVBSize < vertCount)
+	{
+		debugVB.Release();
+		while (debugVBSize < vertCount) debugVBSize = debugVBSize ? debugVBSize * 2 : 1024;
+		BufferDesc bd; bd.Name = "Debug VB"; bd.BindFlags = BIND_VERTEX_BUFFER;
+		bd.Usage = USAGE_DYNAMIC; bd.CPUAccessFlags = CPU_ACCESS_WRITE;
+		bd.Size = (Uint64)debugVBSize * 7 * sizeof(float);
+		device->CreateBuffer(bd, nullptr, &debugVB);
+		if (!debugVB) return;
+	}
+	{
+		MapHelper<float> mv(context, debugVB, MAP_WRITE, MAP_FLAG_DISCARD);
+		std::memcpy(mv, verts.data(), verts.size() * sizeof(float));
+	}
+	{
+		MapHelper<float4x4> cb(context, debugCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		*cb = curView * curProj;
+	}
+	IBuffer* vbs[] = { debugVB };
+	const Uint64 offs[] = { 0 };
+	context->SetVertexBuffers(0, 1, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	context->SetPipelineState(pso);
+	context->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{(Uint32)vertCount, DRAW_FLAG_VERIFY_STATES};
+	context->Draw(da);
+}
+
 void NukeDiligent::endCamera()
 {
 	// 1) Resolve the multisampled HDR color into the single-sample HDR texture (post-pass input).
@@ -378,7 +476,14 @@ void NukeDiligent::endCamera()
 	}
 	// 3) Final tonemap/encode into the output (RT's post texture, or the backbuffer for target 0).
 	if (chainSrc && m_impl->curPostDst)
+	{
 		m_impl->RunPostPass(chainSrc, m_impl->curPostDst, m_impl->curRTW, m_impl->curRTH, m_impl->curTarget == 0);
+
+		// Debug/gizmo lines LAST, over the final LDR image (target still bound by RunPostPass):
+		// TAA has no velocity for lines and the RT-reflection composite overwrites them -
+		// post-last dodges both. No depth here -> gizmos read on top (X-ray); fine for an editor.
+		m_impl->DrawDebugLines(m_impl->curTarget == 0);
+	}
 
 	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
 	m_impl->curPostSrc = nullptr; m_impl->curPostDst = nullptr;

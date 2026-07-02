@@ -56,6 +56,7 @@ public:
 	void addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections = true) override;
 	void setCameraTAA(bool enabled) override;
 	void requestClose() override;
+	void drawDebugLine(const float a[3], const float b[3], const float color[4]) override;
 	void buildRTScene() override;
 	uint64_t createPostPipeline(const char* name, const char* ps) override;
 	void     setPostChain(const NukePostStage* stages, int count) override;

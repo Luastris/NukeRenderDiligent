@@ -154,6 +154,7 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	BuildOutlinePipelines();   // selection outline (stencil mark + scaled draw)
 	CreateShadowResources();   // directional shadow map + depth PSO
 	CreateSkyResources();      // procedural sky pipeline
+	CreateDebugResources();    // debug/gizmo line pipeline
 	CreatePostResources();     // final tonemap / post-process pass
 }
 
@@ -405,6 +406,7 @@ void NukeDiligent::Impl::RebuildForMSAA()
 	for (auto& kv : worldPipes)
 		BuildWorldPipe(kv.second, kv.second.vsSrc, kv.second.psSrc, kv.second.dbg.c_str());
 	CreateSkyResources();
+	CreateDebugResources();
 	BuildOutlinePipelines();
 	backbufferMS = RT{};   // recreated on next target-0 camera
 	for (auto& kv : rts)

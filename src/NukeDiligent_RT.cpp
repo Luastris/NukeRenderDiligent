@@ -502,6 +502,10 @@ void NukeDiligent::Impl::EnsureRTOutput(int w, int h)
 void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params)
 {
 	if (!dstTex || !srcSRV) return;
+	// The chain runner leaves the previous stage's target bound; TraceRays/CopyTexture into a
+	// BOUND render target makes Diligent auto-unbind with an Info nag every frame ("Texture
+	// 'Post Scratch' is currently bound as render target...") — unbind explicitly, silently.
+	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 	if (rtPipelineDirty) BuildRTPipeline();   // a custom shader appeared/changed -> rebuild with its hit group
 	// No scene to trace (no opaque meshes) -> pass the chain colour through unchanged.
 	if (!rtPSO || !rtSBT || !rtSceneReady || !tlas)
@@ -559,6 +563,10 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 
 	// The TLAS is rebuilt every frame -> refresh the SBT's per-instance hit-group mapping each frame. Each
 	// instance routes to its shader's closest-hit (unlit -> its own RT shader; everything else -> standard PBR).
+	// RESET first: the SBT accumulates bindings by instance NAME — when the instance set shrinks (a
+	// MeshRenderer was disabled), a stale entry for a no-longer-existing instance stays behind and
+	// TraceRays asserts "instance to shader mapping is incorrect" (crash on toggling renderers).
+	rtSBT->ResetHitGroups();
 	for (size_t i = 0; i < rtInstData.size() && i < rtInstanceNames.size(); ++i)
 	{
 		const char* group = "HitGroup";   // default = standard PBR
