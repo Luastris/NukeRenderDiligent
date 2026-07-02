@@ -112,23 +112,48 @@ void NukeDiligent::renderDrawLists(const NukeUIDrawData& data)
 	}
 }
 
-// ---- Render module export (boost::dll) ----
-// Exported as the unmangled symbol "renderModule"; the engine's render-module
-// loader looks this up to distinguish render modules from extension plugins.
-class NukeDiligentModule : public NUKERenderModule
+// ---- Plugin export (boost::dll, unified plugin model) ----
+// An ordinary NUKEModule exported as "plugin", like every other plugin. What makes it a
+// renderer is metadata: provides()="render" + phase()=PHASE_BOOT. The loader enables it
+// during bootstrap and registers queryService() (the iRender*) in the service registry;
+// the host then grabs it via GetService<iRender>() and drives init/window itself.
+class NukeDiligentModule : public NUKEModule
 {
 public:
 	NukeDiligentModule()
 	{
 		std::strcpy(title, "Diligent Renderer");
 		std::strcpy(description, "NukeEngine renderer backed by Diligent Engine (D3D11/D3D12).");
-		std::strcpy(author, "NukeEngine");
+		std::strcpy(author, "Luastris");
+		std::strcpy(site, "https://luastris.com");
 		std::strcpy(version, "0.1.0");
-		std::strcpy(id, "diligent");
+		tags = { "render", "diligent", "d3d11", "d3d12" };
 	}
-	iRender* CreateRenderer() override { return new NukeDiligent(); }
-	void DestroyRenderer(iRender* r) override { delete r; }
+	const char* provides() override { return "render"; }
+	int         phase()    override { return PHASE_BOOT; }
+	void*       queryService() override
+	{
+		if (!renderer) renderer = new NukeDiligent();
+		return static_cast<iRender*>(renderer);
+	}
+	void OnLoad() override {}          // no component types to register
+	void Run(AppInstance*) override {} // host-driven (main loop calls render()); no worker thread
+	bool HasSettings() override { return false; }
+	void Settings() override {}
+	void Shutdown() override
+	{
+		// Full renderer teardown lives HERE (not in the host): the loader revoked the
+		// "render" service already, and UnloadModules shuts boot providers down LAST,
+		// after every runtime plugin that might still touch the renderer is gone.
+		if (renderer) renderer->deinit();
+		delete renderer;
+		renderer = nullptr;
+		stopped  = true;
+	}
+
+private:
+	NukeDiligent* renderer = nullptr;
 };
 
-extern "C" BOOST_SYMBOL_EXPORT NukeDiligentModule renderModule;
-NukeDiligentModule renderModule;
+extern "C" BOOST_SYMBOL_EXPORT NukeDiligentModule plugin;
+NukeDiligentModule plugin;

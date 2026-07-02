@@ -46,7 +46,7 @@
 
 // Engine headers last (they do `using namespace std;` internally).
 #include "NukeDiligent.h"
-#include <interface/RenderModule.h>
+#include <interface/NUKEEInteface.h>   // NUKEModule — the renderer is an ordinary plugin now
 
 #include <cstring>
 #include <vector>
