@@ -20,22 +20,87 @@ static void cb_mousebtn(GLFWwindow* w, int button, int action, int /*mods*/)
 	double x = 0, y = 0; glfwGetCursorPos(w, &x, &y);
 	self->_UImouse(button, action == GLFW_PRESS ? 1 : 0, (int)x, (int)y);
 }
-static void cb_scroll(GLFWwindow* w, double /*xo*/, double yo)
+static void cb_scroll(GLFWwindow* w, double xo, double yo)
 {
 	auto* self = static_cast<NukeDiligent*>(glfwGetWindowUserPointer(w));
-	if (!self || !self->_UImouseWheel) return;
+	if (!self) return;
+	{
+		std::lock_guard<std::mutex> l(self->m_uiInput.m);
+		self->m_uiInput.scrollX += xo;
+		self->m_uiInput.scrollY += yo;
+	}
+	if (!self->_UImouseWheel) return;
 	double x = 0, y = 0; glfwGetCursorPos(w, &x, &y);
 	self->_UImouseWheel(0, (int)yo, (int)x, (int)y);
 }
 static void cb_key(GLFWwindow* w, int key, int /*scancode*/, int action, int mods)
 {
 	auto* self = static_cast<NukeDiligent*>(glfwGetWindowUserPointer(w));
-	if (self && self->_UIkey) self->_UIkey(key, action, mods);
+	if (!self) return;
+	{
+		std::lock_guard<std::mutex> l(self->m_uiInput.m);
+		self->m_uiInput.keys.push_back({ key, action, mods });
+		if (self->m_uiInput.keys.size() > 512) self->m_uiInput.keys.pop_front();
+	}
+	if (self->_UIkey) self->_UIkey(key, action, mods);
 }
 static void cb_char(GLFWwindow* w, unsigned int cp)
 {
 	auto* self = static_cast<NukeDiligent*>(glfwGetWindowUserPointer(w));
-	if (self && self->_UIchar) self->_UIchar(cp);
+	if (!self) return;
+	{
+		std::lock_guard<std::mutex> l(self->m_uiInput.m);
+		self->m_uiInput.chars.push_back(cp);
+		if (self->m_uiInput.chars.size() > 512) self->m_uiInput.chars.pop_front();
+	}
+	if (self->_UIchar) self->_UIchar(cp);
+}
+
+// --- runtime-GUI input seam (2.5) --------------------------------------------------------
+int NukeDiligent::fetchUIChars(unsigned int* out, int max)
+{
+	if (!out || max <= 0) return 0;
+	std::lock_guard<std::mutex> l(m_uiInput.m);
+	int n = 0;
+	while (n < max && !m_uiInput.chars.empty())
+	{
+		out[n++] = m_uiInput.chars.front();
+		m_uiInput.chars.pop_front();
+	}
+	return n;
+}
+
+int NukeDiligent::fetchUIKeys(int* keys, int* actions, int* mods, int max)
+{
+	if (!keys || !actions || !mods || max <= 0) return 0;
+	std::lock_guard<std::mutex> l(m_uiInput.m);
+	int n = 0;
+	while (n < max && !m_uiInput.keys.empty())
+	{
+		const UIInput::Key& k = m_uiInput.keys.front();
+		keys[n] = k.key; actions[n] = k.action; mods[n] = k.mods;
+		++n;
+		m_uiInput.keys.pop_front();
+	}
+	return n;
+}
+
+void NukeDiligent::getScrollDelta(double& x, double& y)
+{
+	std::lock_guard<std::mutex> l(m_uiInput.m);
+	x = m_uiInput.scrollX; y = m_uiInput.scrollY;
+	m_uiInput.scrollX = m_uiInput.scrollY = 0.0;
+}
+
+const char* NukeDiligent::getClipboardText()
+{
+	const char* t = m_window ? glfwGetClipboardString(m_window) : nullptr;
+	return t ? t : "";
+}
+
+void NukeDiligent::setClipboardText(const char* text)
+{
+	if (m_window && text) glfwSetClipboardString(m_window, text);
 }
 
 NukeDiligent::NukeDiligent() : m_impl(new Impl()) {}

@@ -6,6 +6,8 @@
 
 #include <render/irender.h>
 #include <boost/function.hpp>
+#include <deque>
+#include <mutex>
 
 using namespace nuke;   // iRender / Mesh / Material / NukeCameraDesc live in namespace nuke
 
@@ -95,6 +97,23 @@ public:
 	void setCursorMode(int mode) override;
 	void rawMouse(double xpos, double ypos) override;
 	void mouseEnterLeave(int entered) override;
+
+	// Runtime-GUI input seam (2.5): drained queues filled by the GLFW callbacks.
+	int  fetchUIChars(unsigned int* out, int max) override;
+	int  fetchUIKeys(int* keys, int* actions, int* mods, int max) override;
+	void getScrollDelta(double& x, double& y) override;
+	const char* getClipboardText() override;
+	void setClipboardText(const char* text) override;
+
+	// Filled from the GLFW callbacks; size-capped so an idle consumer can't leak.
+	struct UIInput
+	{
+		std::mutex m;
+		std::deque<unsigned int> chars;
+		struct Key { int key, action, mods; };
+		std::deque<Key> keys;
+		double scrollX = 0.0, scrollY = 0.0;
+	} m_uiInput;
 
 private:
 	struct Impl;          // PImpl: keeps Diligent types out of this header
