@@ -61,7 +61,10 @@ void NukeDiligent::Impl::CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT d
 	GP.InputLayout.NumElements    = 3;
 	GP.InputLayout.LayoutElements = layout;
 
-	ShaderResourceVariableDesc vars[] = {{SHADER_TYPE_PIXEL, "Texture", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}};
+	// MUTABLE (not DYNAMIC): the UI binds textures through a per-texture SRB CACHE, so
+	// commits consume NO dynamic GPU descriptors (a dynamic var allocated fresh ones on
+	// EVERY CommitShaderResources - dozens per frame, per window; the heap bled out).
+	ShaderResourceVariableDesc vars[] = {{SHADER_TYPE_PIXEL, "Texture", SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE}};
 	PSOCreateInfo.PSODesc.ResourceLayout.Variables    = vars;
 	PSOCreateInfo.PSODesc.ResourceLayout.NumVariables = 1;
 	SamplerDesc sam;
@@ -81,8 +84,7 @@ void NukeDiligent::Impl::CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT d
 	device->CreateBuffer(cbd, nullptr, &uiCB);
 	uiPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "Constants")->Set(uiCB);
 
-	uiPSO->CreateShaderResourceBinding(&uiSRB, true);
-	uiTexVar = uiSRB->GetVariableByName(SHADER_TYPE_PIXEL, "Texture");
+	// No single SRB: DrawUILists gets one from the per-texture cache (UISRBFor).
 }
 
 void NukeDiligent::Impl::CreateWorldPipeline()

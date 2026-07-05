@@ -38,6 +38,8 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	if (m_impl->worldPipes.empty()) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
+	++m_impl->statDraws;                              // frame stats (status bar)
+	m_impl->statTris += mesh ? mesh->numVerts / 3 : 0;
 	Impl::MeshGPU& g = *gp;
 
 	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])

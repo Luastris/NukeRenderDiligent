@@ -50,6 +50,7 @@
 
 #include <cstring>
 #include <vector>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <algorithm>
@@ -77,8 +78,17 @@ struct NukeDiligent::Impl
 
 	// --- generic 2D (UI) draw-list renderer ---
 	RefCntAutoPtr<IPipelineState>         uiPSO;
-	RefCntAutoPtr<IShaderResourceBinding> uiSRB;
-	IShaderResourceVariable*              uiTexVar = nullptr;
+	// Per-texture SRB cache (MUTABLE var, set once): zero dynamic descriptors per
+	// commit. LRU-purged by frame stamp; destroyTexture2D drops its entry eagerly.
+	struct UISRBEntry { RefCntAutoPtr<IShaderResourceBinding> srb; uint64_t lastUse = 0; };
+	std::unordered_map<ITextureView*, UISRBEntry> uiSRBCache;
+	uint64_t uiFrame = 0;
+	IShaderResourceBinding* UISRBFor(ITextureView* view);
+
+	// Frame statistics (editor status bar): scene draws counted this frame, latched at
+	// the start of the next one (getFrameStats reads the completed frame's numbers).
+	int statDraws = 0, statTris = 0;
+	int statDrawsOut = 0, statTrisOut = 0;
 	RefCntAutoPtr<IBuffer>                uiVB, uiIB, uiCB;
 	int uiVBSize = 0;
 	int uiIBSize = 0;
@@ -412,6 +422,12 @@ struct NukeDiligent::Impl
 	Uint32                                uiTW = 0, uiTH = 0; // its size (0 = use swapchain)
 	void BuildOutlinePipelines();
 	void EnsureOutlineMask(int w, int h);
+
+	// UI multi-viewport: one swap chain per detached OS window (keyed by native handle,
+	// HWND on Windows). Created lazily in uiViewportRender, dropped in uiViewportDestroy.
+	std::map<void*, RefCntAutoPtr<ISwapChain>> uiVpSC;
+	// Shared UI draw body (renderDrawLists + secondary viewports draw with it).
+	void DrawUILists(ITextureView* rtv, Uint32 surfW, Uint32 surfH, const NukeUIDrawData& data);
 
 	// Shader sources pushed by the engine (the renderer does NO file IO). name -> HLSL.
 	std::unordered_map<std::string, std::string> shaderSrc;

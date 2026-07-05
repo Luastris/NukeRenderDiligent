@@ -78,6 +78,10 @@ public:
 	uint64_t createTexture2D(const void* rgbaPixels, int width, int height) override;
 	void     destroyTexture2D(uint64_t handle) override;
 	void     renderDrawLists(const NukeUIDrawData& data) override;
+	void*    nativeWindow() override;   // GLFWwindow* (UI platform backend mounts on it)
+	void     uiViewportRender(void* nativeHandle, int w, int h, const NukeUIDrawData& data) override;
+	void     uiViewportDestroy(void* nativeHandle) override;
+	void     getFrameStats(int& drawCalls, int& triangles) override;
 	uint64_t createRenderTarget(int w, int h) override;
 	void     resizeRenderTarget(uint64_t id, int w, int h) override;
 	uint64_t getRenderTargetTexture(uint64_t id) override;

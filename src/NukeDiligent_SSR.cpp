@@ -181,6 +181,8 @@ void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float po
 	if (!m_impl->gbufActive || !m_impl->gbufPSO) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
+	++m_impl->statDraws;                              // frame stats (status bar)
+	m_impl->statTris += mesh ? mesh->numVerts / 3 : 0;
 	Impl::MeshGPU& g = *gp;
 
 	auto build = [](const float p[3], const float q[4], const float s[3]) {

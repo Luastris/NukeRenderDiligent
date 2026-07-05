@@ -116,6 +116,23 @@ int NukeDiligent::init(const WindowDesc& desc)
 	{
 		auto* pFactory = GetEngineFactoryD3D12(); engFactory = pFactory;
 		EngineD3D12CreateInfo EngineCI;
+#ifdef _DEBUG
+		// D3D12 debug layer: validation errors (the CAUSE of a device removal) land in
+		// THIS log instead of a bare "device removed" fence assert after the fact.
+		EngineCI.SetValidationLevel(VALIDATION_LEVEL_1);
+#endif
+		// Editor-class descriptor budgets. The UI commits its SRB on every texture switch
+		// (dynamic vars) and the editor renders EXTRA worlds (asset previews) plus one UI
+		// pass per detached OS window — the library defaults overflow on heavy frames
+		// (window restore = RT resizes + full redraw): "Failed to allocate N dynamic
+		// GPU-visible CBV/SRV/UAV descriptors".
+		// NOTE: the SAMPLER heap is capped at 2048 descriptors TOTAL by D3D12 itself —
+		// it can only be REPARTITIONED (static vs dynamic), never grown. We use few
+		// unique static samplers, so give the dynamic side the bigger share.
+		EngineCI.GPUDescriptorHeapDynamicSize[0] = 131072;   // CBV/SRV/UAV (default 8k)
+		EngineCI.GPUDescriptorHeapSize[0]        = 32768;    // static/mutable CBV/SRV/UAV
+		EngineCI.GPUDescriptorHeapSize[1]        = 512;      // static/mutable samplers
+		EngineCI.GPUDescriptorHeapDynamicSize[1] = 1536;     // dynamic samplers (512+1536 = the 2048 cap)
 		pFactory->CreateDeviceAndContextsD3D12(EngineCI, &m_impl->device, &m_impl->context);
 		if (!m_impl->device) { cout << "[NukeDiligent]\tD3D12 device creation failed" << endl; return 1; }
 		pFactory->CreateSwapChainD3D12(m_impl->device, m_impl->context, SCDesc,
@@ -163,6 +180,12 @@ int NukeDiligent::init(const WindowDesc& desc)
 int NukeDiligent::render()
 {
 	glfwPollEvents();
+
+	// Frame stats: latch the completed frame's counters for getFrameStats, start fresh.
+	m_impl->statDrawsOut = m_impl->statDraws;
+	m_impl->statTrisOut  = m_impl->statTris;
+	m_impl->statDraws = 0;
+	m_impl->statTris  = 0;
 
 	// Follow the window: resize the swap chain (and report size to the UI via
 	// width/height) when the framebuffer changes. Skip rendering when minimized.

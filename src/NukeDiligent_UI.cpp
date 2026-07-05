@@ -1,40 +1,60 @@
 #include "NukeDiligentImpl.h"
 
 
-void NukeDiligent::renderDrawLists(const NukeUIDrawData& data)
+// Per-texture SRB (MUTABLE variable, set ONCE at creation): committing it costs no
+// dynamic GPU descriptors, unlike a DYNAMIC variable which allocated fresh ones on
+// every CommitShaderResources — dozens per frame per window, bleeding the heap dry.
+IShaderResourceBinding* NukeDiligent::Impl::UISRBFor(ITextureView* view)
 {
-	if (!m_impl->uiPSO || data.listCount == 0) return;
+	UISRBEntry& e = uiSRBCache[view];
+	if (!e.srb)
+	{
+		uiPSO->CreateShaderResourceBinding(&e.srb, true);
+		if (!e.srb) { uiSRBCache.erase(view); return nullptr; }
+		if (IShaderResourceVariable* v = e.srb->GetVariableByName(SHADER_TYPE_PIXEL, "Texture"))
+			v->Set(view);
+	}
+	e.lastUse = uiFrame;
+	return e.srb;
+}
+
+// Shared UI draw body: upload the lists, then draw them into the given target.
+// Used by renderDrawLists (main window / bound RT) and uiViewportRender (a detached
+// OS window's own swap chain).
+void NukeDiligent::Impl::DrawUILists(ITextureView* uirtv, Uint32 surfW, Uint32 surfH, const NukeUIDrawData& data)
+{
+	if (!uiPSO || !uirtv || data.listCount == 0) return;
 	if (data.dispSize[0] <= 0.f || data.dispSize[1] <= 0.f) return;
 
 	int totalVtx = 0, totalIdx = 0;
 	for (int i = 0; i < data.listCount; ++i) { totalVtx += data.lists[i].vtxCount; totalIdx += data.lists[i].idxCount; }
 	if (totalVtx == 0 || totalIdx == 0) return;
 
-	IRenderDevice*  dev = m_impl->device;
-	IDeviceContext* ctx = m_impl->context;
+	IRenderDevice*  dev = device;
+	IDeviceContext* ctx = context;
 
-	if (!m_impl->uiVB || m_impl->uiVBSize < totalVtx)
+	if (!uiVB || uiVBSize < totalVtx)
 	{
-		m_impl->uiVB.Release();
-		while (m_impl->uiVBSize < totalVtx) m_impl->uiVBSize = m_impl->uiVBSize ? m_impl->uiVBSize * 2 : 4096;
+		uiVB.Release();
+		while (uiVBSize < totalVtx) uiVBSize = uiVBSize ? uiVBSize * 2 : 4096;
 		BufferDesc bd;
 		bd.Name = "UI VB"; bd.BindFlags = BIND_VERTEX_BUFFER; bd.Usage = USAGE_DYNAMIC; bd.CPUAccessFlags = CPU_ACCESS_WRITE;
-		bd.Size = (Uint64)m_impl->uiVBSize * sizeof(NukeUIVert);
-		dev->CreateBuffer(bd, nullptr, &m_impl->uiVB);
+		bd.Size = (Uint64)uiVBSize * sizeof(NukeUIVert);
+		dev->CreateBuffer(bd, nullptr, &uiVB);
 	}
-	if (!m_impl->uiIB || m_impl->uiIBSize < totalIdx)
+	if (!uiIB || uiIBSize < totalIdx)
 	{
-		m_impl->uiIB.Release();
-		while (m_impl->uiIBSize < totalIdx) m_impl->uiIBSize = m_impl->uiIBSize ? m_impl->uiIBSize * 2 : 8192;
+		uiIB.Release();
+		while (uiIBSize < totalIdx) uiIBSize = uiIBSize ? uiIBSize * 2 : 8192;
 		BufferDesc bd;
 		bd.Name = "UI IB"; bd.BindFlags = BIND_INDEX_BUFFER; bd.Usage = USAGE_DYNAMIC; bd.CPUAccessFlags = CPU_ACCESS_WRITE;
-		bd.Size = (Uint64)m_impl->uiIBSize * sizeof(uint16_t);
-		dev->CreateBuffer(bd, nullptr, &m_impl->uiIB);
+		bd.Size = (Uint64)uiIBSize * sizeof(uint16_t);
+		dev->CreateBuffer(bd, nullptr, &uiIB);
 	}
 
 	{
-		MapHelper<NukeUIVert> vtx(ctx, m_impl->uiVB, MAP_WRITE, MAP_FLAG_DISCARD);
-		MapHelper<uint16_t>   idx(ctx, m_impl->uiIB, MAP_WRITE, MAP_FLAG_DISCARD);
+		MapHelper<NukeUIVert> vtx(ctx, uiVB, MAP_WRITE, MAP_FLAG_DISCARD);
+		MapHelper<uint16_t>   idx(ctx, uiIB, MAP_WRITE, MAP_FLAG_DISCARD);
 		if (!vtx || !idx) return;
 		NukeUIVert* pv = vtx;
 		uint16_t*   pi = idx;
@@ -56,26 +76,22 @@ void NukeDiligent::renderDrawLists(const NukeUIDrawData& data)
 			0.f, 2.f / (T - B), 0.f, 0.f,
 			0.f, 0.f, 0.5f, 0.f,
 			(R + L) / (L - R), (T + B) / (B - T), 0.5f, 1.f};
-		MapHelper<float4x4> cb(ctx, m_impl->uiCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		MapHelper<float4x4> cb(ctx, uiCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		if (cb) *cb = proj;
 	}
 
-	// Target: an explicit RT (bindRenderTarget -> runtime UI into the viewport/camera RT) or the
-	// backbuffer (editor UI). Bound here, no clear, so the UI composites over whatever's already there.
-	ITextureView* uirtv = m_impl->uiRTV ? m_impl->uiRTV : m_impl->swapChain->GetCurrentBackBufferRTV();
-	const Uint32 surfW = (m_impl->uiRTV && m_impl->uiTW) ? m_impl->uiTW : m_impl->swapChain->GetDesc().Width;
-	const Uint32 surfH = (m_impl->uiRTV && m_impl->uiTH) ? m_impl->uiTH : m_impl->swapChain->GetDesc().Height;
 	ctx->SetRenderTargets(1, &uirtv, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
-	IBuffer* vbs[] = {m_impl->uiVB};
+	IBuffer* vbs[] = {uiVB};
 	ctx->SetVertexBuffers(0, 1, vbs, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
-	ctx->SetIndexBuffer(m_impl->uiIB, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	ctx->SetPipelineState(m_impl->uiPSO);
+	ctx->SetIndexBuffer(uiIB, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ctx->SetPipelineState(uiPSO);
 	const float bf[4] = {0, 0, 0, 0};
 	ctx->SetBlendFactors(bf);
 	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)surfW; vp.Height = (float)surfH; vp.MinDepth = 0; vp.MaxDepth = 1;
 	ctx->SetViewports(1, &vp, surfW, surfH);
 
+	++uiFrame;
 	Uint32 globalIdx = 0, globalVtx = 0;
 	ITextureView* lastView = nullptr;
 	for (int i = 0; i < data.listCount; ++i)
@@ -97,19 +113,104 @@ void NukeDiligent::renderDrawLists(const NukeUIDrawData& data)
 			if (view != lastView)
 			{
 				lastView = view;
-				m_impl->uiTexVar->Set(view);
-				ctx->CommitShaderResources(m_impl->uiSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+				IShaderResourceBinding* srb = UISRBFor(view);
+				if (!srb) continue;
+				ctx->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 			}
 
 			DrawIndexedAttribs da{cmd.elemCount, VT_UINT16, DRAW_FLAG_VERIFY_STATES};
 			da.FirstIndexLocation = cmd.idxOffset + globalIdx;
-			if (m_impl->baseVertexSupported)
+			if (baseVertexSupported)
 				da.BaseVertex = cmd.vtxOffset + globalVtx;
 			ctx->DrawIndexed(da);
 		}
 		globalIdx += l.idxCount;
 		globalVtx += l.vtxCount;
 	}
+
+	// LRU purge: drop SRBs of textures not drawn for a while (resized RTs leave stale
+	// views behind — the SRB's strong ref must not keep them alive forever).
+	if ((uiFrame & 511) == 0)
+		for (auto it = uiSRBCache.begin(); it != uiSRBCache.end(); )
+		{
+			if (uiFrame - it->second.lastUse > 512) it = uiSRBCache.erase(it);
+			else ++it;
+		}
+}
+
+void NukeDiligent::renderDrawLists(const NukeUIDrawData& data)
+{
+	// Target: an explicit RT (bindRenderTarget -> runtime UI into the viewport/camera RT) or the
+	// backbuffer (editor UI). No clear — the UI composites over whatever's already there.
+	ITextureView* uirtv = m_impl->uiRTV ? m_impl->uiRTV : m_impl->swapChain->GetCurrentBackBufferRTV();
+	const Uint32 surfW = (m_impl->uiRTV && m_impl->uiTW) ? m_impl->uiTW : m_impl->swapChain->GetDesc().Width;
+	const Uint32 surfH = (m_impl->uiRTV && m_impl->uiTH) ? m_impl->uiTH : m_impl->swapChain->GetDesc().Height;
+	m_impl->DrawUILists(uirtv, surfW, surfH, data);
+}
+
+// --- UI multi-viewport: one swap chain per detached OS window ----------------------
+
+void* NukeDiligent::nativeWindow()
+{
+	return m_window;
+}
+
+void NukeDiligent::uiViewportRender(void* nativeHandle, int w, int h, const NukeUIDrawData& data)
+{
+	// Degenerate sizes come through while a window is minimizing/restoring — presenting
+	// or resizing then can remove the D3D12 device. Sit those frames out.
+	if (!nativeHandle || w < 8 || h < 8 || !m_impl->device) return;
+
+	RefCntAutoPtr<ISwapChain>& sc = m_impl->uiVpSC[nativeHandle];
+	if (!sc)
+	{
+		// Same color format as the main swap chain (the UI PSO was built for it);
+		// no depth — the UI never depth-tests.
+		SwapChainDesc scd;
+		scd.ColorBufferFormat = m_impl->swapChain->GetDesc().ColorBufferFormat;
+		scd.DepthBufferFormat = TEX_FORMAT_UNKNOWN;
+		scd.Width = (Uint32)w; scd.Height = (Uint32)h;
+		Win32NativeWindow win{ nativeHandle };
+		if (m_impl->useD3D12)
+			GetEngineFactoryD3D12()->CreateSwapChainD3D12(m_impl->device, m_impl->context, scd, FullScreenModeDesc{}, win, &sc);
+		else
+			GetEngineFactoryD3D11()->CreateSwapChainD3D11(m_impl->device, m_impl->context, scd, FullScreenModeDesc{}, win, &sc);
+		if (!sc) { m_impl->uiVpSC.erase(nativeHandle); return; }
+	}
+	IDeviceContext* ctx = m_impl->context;
+	const SwapChainDesc& scd = sc->GetDesc();
+	if ((int)scd.Width != w || (int)scd.Height != h)
+	{
+		// Resize needs the back buffers UNBOUND and NOT referenced by in-flight GPU
+		// work, or D3D12 removes the device. A window-resize event is rare — a full
+		// GPU idle here is cheap insurance.
+		ctx->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
+		ctx->Flush();
+		m_impl->device->IdleGPU();
+		sc->Resize((Uint32)w, (Uint32)h);
+	}
+
+	ITextureView* rtv = sc->GetCurrentBackBufferRTV();
+	if (!rtv) return;
+	ctx->SetRenderTargets(1, &rtv, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	const float clear[4] = { 0.06f, 0.06f, 0.07f, 1.0f };
+	ctx->ClearRenderTarget(rtv, clear, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	m_impl->DrawUILists(rtv, sc->GetDesc().Width, sc->GetDesc().Height, data);
+	// Unbind the secondary back buffer BEFORE presenting it — the state cache must not
+	// hold a presented buffer when the next frame's main passes start binding targets.
+	ctx->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
+	sc->Present(0);   // no vsync: the main window's present already paces the frame
+}
+
+void NukeDiligent::uiViewportDestroy(void* nativeHandle)
+{
+	m_impl->uiVpSC.erase(nativeHandle);
+}
+
+void NukeDiligent::getFrameStats(int& drawCalls, int& triangles)
+{
+	drawCalls = m_impl->statDrawsOut;
+	triangles = m_impl->statTrisOut;
 }
 
 // ---- Plugin export (boost::dll, unified plugin model) ----

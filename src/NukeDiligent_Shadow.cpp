@@ -210,6 +210,8 @@ void NukeDiligent::renderShadowObject(Mesh* mesh, const float pos[3], const floa
 {
 	if (!m_impl->shadowPSO) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh); if (!gp) return;
+	++m_impl->statDraws;                              // frame stats (status bar)
+	m_impl->statTris += mesh ? mesh->numVerts / 3 : 0;
 	Impl::MeshGPU& g = *gp;
 	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
 	               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()

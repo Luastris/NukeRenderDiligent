@@ -201,6 +201,7 @@ uint64_t NukeDiligent::createTexture2D(const void* rgba, int width, int height)
 
 void NukeDiligent::destroyTexture2D(uint64_t handle)
 {
+	m_impl->uiSRBCache.erase(reinterpret_cast<ITextureView*>(handle));   // drop its cached SRB too
 	m_impl->textures.erase(handle);
 }
 
