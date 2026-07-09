@@ -149,6 +149,11 @@ struct NukeDiligent::Impl
 	std::vector<ChainStage>               postChain;      // current camera's effect chain (copied in setPostChain)
 	uint64_t CreatePostPipe(const std::string& name, const std::string& ps);
 	void     EnsureScratch(int w, int h);
+	// Format-safe texture transfer: equal formats -> CopyTexture; different -> fullscreen
+	// blit (CopyTextureRegion between e.g. RGBA8 scene color and RGBA16F chain scratch is
+	// an INVALID D3D12 call — it poisons the command list and Close() fails E_INVALIDARG).
+	void     BlitTexture(ITextureView* srcSRV, ITexture* dstTex);
+	std::map<TEXTURE_FORMAT, std::pair<RefCntAutoPtr<IPipelineState>, RefCntAutoPtr<IShaderResourceBinding>>> blitPipes;
 
 	// Built-in bloom (multi-pass): bright-pass -> separable blur (half-res ping-pong) -> composite. Invoked
 	// for a chain stage whose post shader is named "bloom".
@@ -398,9 +403,10 @@ struct NukeDiligent::Impl
 	uint64_t MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg);
 	bool     BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg);
 	void     RebuildForMSAA();   // rebuild all sample-count-dependent pipelines + targets after `samples` changes
-	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; };
+	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; int version = 0; };
 	std::unordered_map<Mesh*, MeshGPU>          meshCache;
-	MeshGPU* GetMeshGPU(Mesh* mesh);   // get-or-build the GPU vertex buffers (pos/nrm/uv) for a mesh
+	MeshGPU* GetMeshGPU(Mesh* mesh);   // get-or-build the GPU vertex buffers (pos/nrm/uv) for a mesh;
+	                                   // re-uploads in place when Mesh::version changed (skinned/procedural)
 	std::unordered_map<Texture*, RefCntAutoPtr<ITexture>> texCache;   // engine Texture -> GPU texture
 	std::unordered_map<Texture*, std::vector<RefCntAutoPtr<ITexture>>> animTex;   // GIF: one Texture2D per frame
 	float4x4 curView, curProj;   // set in beginCamera, used in renderObject

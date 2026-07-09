@@ -508,11 +508,14 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 	if (rtPipelineDirty) BuildRTPipeline();   // a custom shader appeared/changed -> rebuild with its hit group
 	// No scene to trace (no opaque meshes) -> pass the chain colour through unchanged.
+	// BlitTexture, NOT CopyTexture: on the FIRST chain stage the source is the SCENE
+	// color (RGBA8 with HDR off) while the destination is the RGBA16F chain scratch —
+	// a cross-format CopyTextureRegion is invalid and poisons the command list (this
+	// exact call was the "Failed to close the command list" crash on opening an EMPTY
+	// world: no meshes -> no RT scene -> this branch).
 	if (!rtPSO || !rtSBT || !rtSceneReady || !tlas)
 	{
-		if (ITexture* srcTex = srcSRV->GetTexture())
-			context->CopyTexture(CopyTextureAttribs{srcTex, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
-			                                        dstTex, RESOURCE_STATE_TRANSITION_MODE_TRANSITION});
+		BlitTexture(srcSRV, dstTex);
 		return;
 	}
 	EnsureRTOutput(w, h);
@@ -579,6 +582,6 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	TraceRaysAttribs ta; ta.pSBT = rtSBT; ta.DimensionX = (Uint32)w; ta.DimensionY = (Uint32)h; ta.DimensionZ = 1;
 	context->TraceRays(ta);
 
-	context->CopyTexture(CopyTextureAttribs{rtOutTex, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
-	                                        dstTex,   RESOURCE_STATE_TRANSITION_MODE_TRANSITION});
+	// Format-safe: rtOut is fixed RGBA16F, the destination may be the RGBA8 scene target.
+	BlitTexture(rtOutTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE), dstTex);
 }

@@ -63,7 +63,7 @@ target_link_libraries(NukeRenderDiligent PRIVATE
     Diligent-Win32Platform
     Diligent-Primitives
     glfw3dll
-    d3d11 dxgi d3dcompiler
+    d3d11 d3d12 dxgi d3dcompiler   # d3d12: D3D12GetDebugInterface (DRED enable)
     shell32 user32   # ExtractIconEx + SendMessage(WM_SETICON) for the window icon
     dwmapi           # DwmSetWindowAttribute — dark title bar
 )

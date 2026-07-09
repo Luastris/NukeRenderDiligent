@@ -1,5 +1,86 @@
 #include "NukeDiligentImpl.h"
+#include "RenderDeviceD3D12.h"   // drain the D3D12 debug layer into OUR console (see below)
+#include <d3d12.h>
 
+// The D3D12 debug layer reports the ACTUAL invalid operation (what the "Failed to close
+// the command list" / device-removed asserts are symptoms of) — but only into the
+// debugger's output window, which nobody sees on a console run. Drain the info queue
+// into stdout every frame so the console names the real error, not the aftermath.
+// On device removal: print the reason + the DRED breadcrumb trail (the EXACT command
+// list/op the GPU faulted on — command lists execute async, so the CPU-side assert
+// location is meaningless) + the page-fault allocation, once.
+static void DumpDeviceRemoval(ID3D12Device* d3dDev)
+{
+	const HRESULT reason = d3dDev->GetDeviceRemovedReason();
+	if (SUCCEEDED(reason)) return;
+	static bool dumped = false;
+	if (dumped) return;
+	dumped = true;
+	std::cout << "[D3D12] ===== DEVICE REMOVED, reason=0x" << std::hex << (unsigned long)reason << std::dec
+	          << " (887A0005=REMOVED/page fault, 887A0006=HUNG, 887A0007=RESET, 887A0020=DRIVER_INTERNAL) =====" << std::endl;
+	ID3D12DeviceRemovedExtendedData* dred = nullptr;
+	if (SUCCEEDED(d3dDev->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData), (void**)&dred)) && dred)
+	{
+		D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
+		if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc)))
+			for (const D3D12_AUTO_BREADCRUMB_NODE* n = bc.pHeadAutoBreadcrumbNode; n; n = n->pNext)
+			{
+				const UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+				if (done == 0 || done == n->BreadcrumbCount) continue;   // untouched or fully completed list
+				std::cout << "[D3D12] FAULTING command list '"
+				          << (n->pCommandListDebugNameA ? n->pCommandListDebugNameA : "?")
+				          << "' stopped at op " << done << "/" << n->BreadcrumbCount
+				          << ", breadcrumb op id=" << (n->pCommandHistory ? (int)n->pCommandHistory[done] : -1)
+				          << " (2=Draw 3=DrawIndexed 4=ExecuteIndirect 8=CopyResource 13=Dispatch 27=DispatchRays 30=BuildRaytracingAS)" << std::endl;
+			}
+		D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
+		if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) && pf.PageFaultVA)
+		{
+			std::cout << "[D3D12] PAGE FAULT at GPU VA 0x" << std::hex << (unsigned long long)pf.PageFaultVA << std::dec << std::endl;
+			for (const D3D12_DRED_ALLOCATION_NODE* a = pf.pHeadExistingAllocationNode; a; a = a->pNext)
+				if (a->ObjectNameA) std::cout << "[D3D12]   live allocation near VA: " << a->ObjectNameA << std::endl;
+			for (const D3D12_DRED_ALLOCATION_NODE* a = pf.pHeadRecentFreedAllocationNode; a; a = a->pNext)
+				if (a->ObjectNameA) std::cout << "[D3D12]   RECENTLY FREED at VA (use-after-free suspect): " << a->ObjectNameA << std::endl;
+		}
+		dred->Release();
+	}
+	std::cout << "[D3D12] ===== end of device-removal report =====" << std::endl;
+}
+
+static void DrainD3D12DebugMessages(Diligent::IRenderDevice* dev, bool useD3D12)
+{
+	if (!useD3D12 || !dev) return;
+	static ID3D12InfoQueue* iq = nullptr;   // process-lifetime cache
+	static ID3D12Device* d3dDev = nullptr;
+	static bool tried = false;
+	if (!tried)
+	{
+		tried = true;
+		Diligent::RefCntAutoPtr<Diligent::IRenderDeviceD3D12> d12(dev, Diligent::IID_RenderDeviceD3D12);
+		if (d12 && d12->GetD3D12Device())
+		{
+			d3dDev = d12->GetD3D12Device();
+			d3dDev->QueryInterface(__uuidof(ID3D12InfoQueue), (void**)&iq);
+		}
+	}
+	if (d3dDev) DumpDeviceRemoval(d3dDev);   // async GPU faults surface HERE, with breadcrumbs
+	if (!iq) return;
+	const Diligent::Uint64 n = iq->GetNumStoredMessages();
+	static Diligent::Uint64 seen = 0;
+	if (n < seen) seen = 0;                 // queue was cleared/rolled — start over
+	for (Diligent::Uint64 i = seen; i < n; ++i)
+	{
+		SIZE_T len = 0;
+		iq->GetMessage(i, nullptr, &len);
+		if (!len) continue;
+		std::vector<char> buf(len);
+		D3D12_MESSAGE* m = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+		if (SUCCEEDED(iq->GetMessage(i, m, &len))
+		    && m->Severity <= D3D12_MESSAGE_SEVERITY_WARNING && m->pDescription)
+			std::cout << "[D3D12] " << m->pDescription << std::endl;
+	}
+	seen = n;
+}
 
 static void glfw_error(int code, const char* desc)
 {
@@ -185,6 +266,21 @@ int NukeDiligent::init(const WindowDesc& desc)
 		// D3D12 debug layer: validation errors (the CAUSE of a device removal) land in
 		// THIS log instead of a bare "device removed" fence assert after the fact.
 		EngineCI.SetValidationLevel(VALIDATION_LEVEL_1);
+		// DRED: when the GPU faults ASYNCHRONOUSLY (page fault mid-execution — the CPU
+		// only notices frames later, at a random fence/Close), auto-breadcrumbs record
+		// the exact command list + operation the GPU died on, and the page-fault output
+		// names the allocation. Dumped by DrainD3D12DebugMessages on removal.
+		{
+			ID3D12DeviceRemovedExtendedDataSettings* dredSettings = nullptr;
+			if (SUCCEEDED(D3D12GetDebugInterface(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
+			                                     (void**)&dredSettings)) && dredSettings)
+			{
+				dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+				dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+				dredSettings->Release();
+				cout << "[NukeDiligent]\tDRED enabled (breadcrumbs + page-fault reporting)" << endl;
+			}
+		}
 #endif
 		// Editor-class descriptor budgets. The UI commits its SRB on every texture switch
 		// (dynamic vars) and the editor renders EXTRA worlds (asset previews) plus one UI
@@ -245,6 +341,9 @@ int NukeDiligent::init(const WindowDesc& desc)
 int NukeDiligent::render()
 {
 	glfwPollEvents();
+#ifdef _DEBUG
+	DrainD3D12DebugMessages(m_impl->device, m_impl->useD3D12);   // real validation errors -> console
+#endif
 
 	// Frame stats: latch the completed frame's counters for getFrameStats, start fresh.
 	m_impl->statDrawsOut = m_impl->statDraws;

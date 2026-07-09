@@ -260,6 +260,74 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	return h;
 }
 
+// Equal formats -> plain CopyTexture. Different formats -> fullscreen blit: D3D12 only
+// allows copies inside a format family, and the chain legitimately crosses families
+// (RGBA8 scene color with HDR off vs the RGBA16F chain scratch). One tiny PSO per
+// destination format, built lazily.
+void NukeDiligent::Impl::BlitTexture(ITextureView* srcSRV, ITexture* dstTex)
+{
+	if (!srcSRV || !dstTex) return;
+	ITexture* srcTex = srcSRV->GetTexture();
+	if (srcTex && srcTex->GetDesc().Format == dstTex->GetDesc().Format)
+	{
+		context->CopyTexture(CopyTextureAttribs{srcTex, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
+		                                        dstTex, RESOURCE_STATE_TRANSITION_MODE_TRANSITION});
+		return;
+	}
+	const TEXTURE_FORMAT fmt = dstTex->GetDesc().Format;
+	auto it = blitPipes.find(fmt);
+	if (it == blitPipes.end())
+	{
+		static const char* kBlitPS =
+			"Texture2D g_Source; SamplerState g_Source_sampler;\n"
+			"struct PSIn { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\n"
+			"float4 main(in PSIn i) : SV_TARGET { return g_Source.Sample(g_Source_sampler, i.uv); }\n";
+		std::string vs = shaderSource("post.vs");
+		if (vs.empty()) return;
+		ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+		RefCntAutoPtr<IShader> v, p;
+		sci.Desc = {"Blit VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str();  device->CreateShader(sci, &v);
+		sci.Desc = {"Blit PS", SHADER_TYPE_PIXEL,  true}; sci.Source = kBlitPS;     device->CreateShader(sci, &p);
+		if (!v || !p) return;
+		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Blit PSO";
+		auto& gp = ci.GraphicsPipeline;
+		gp.NumRenderTargets = 1; gp.RTVFormats[0] = fmt;
+		gp.DSVFormat = TEX_FORMAT_UNKNOWN;
+		gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+		gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
+		gp.DepthStencilDesc.DepthEnable = False;
+		gp.InputLayout.NumElements = 0;
+		SamplerDesc samp; samp.MinFilter = FILTER_TYPE_POINT; samp.MagFilter = FILTER_TYPE_POINT; samp.MipFilter = FILTER_TYPE_POINT;
+		samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP;
+		ShaderResourceVariableDesc var{SHADER_TYPE_PIXEL, "g_Source", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC};
+		ImmutableSamplerDesc       imm{SHADER_TYPE_PIXEL, "g_Source", samp};
+		ci.PSODesc.ResourceLayout.Variables = &var; ci.PSODesc.ResourceLayout.NumVariables = 1;
+		ci.PSODesc.ResourceLayout.ImmutableSamplers = &imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+		ci.pVS = v; ci.pPS = p;
+		RefCntAutoPtr<IPipelineState> pso;
+		device->CreateGraphicsPipelineState(ci, &pso);
+		if (!pso) return;
+		RefCntAutoPtr<IShaderResourceBinding> srb;
+		pso->CreateShaderResourceBinding(&srb, true);
+		it = blitPipes.emplace(fmt, std::make_pair(pso, srb)).first;
+	}
+	IPipelineState* pso = it->second.first;
+	IShaderResourceBinding* srb = it->second.second;
+	if (!pso || !srb) return;
+	const TextureDesc& dd = dstTex->GetDesc();
+	ITextureView* rtv = dstTex->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+	if (!rtv) return;
+	context->SetRenderTargets(1, &rtv, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)dd.Width; vp.Height = (float)dd.Height; vp.MinDepth = 0; vp.MaxDepth = 1;
+	context->SetViewports(1, &vp, dd.Width, dd.Height);
+	if (auto* v = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Source")) v->Set(srcSRV);
+	context->SetPipelineState(pso);
+	context->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
+	context->Draw(da);
+	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
+}
+
 void NukeDiligent::Impl::EnsureScratch(int w, int h)
 {
 	if (w <= 0 || h <= 0) return;

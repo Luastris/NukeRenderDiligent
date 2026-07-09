@@ -106,11 +106,15 @@ void NukeDiligent::Impl::RunSSR(PostPipe& pp, ITextureView* srcSRV, ITextureView
 void NukeDiligent::Impl::RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params)
 {
 	TAAState& st = taaStates[curTarget];
-	if (!st.hist || st.w != w || st.h != h)   // (re)create history to match the target size
+	// The history must MATCH the resolve target's format (it is COPIED from dstTex each
+	// frame; a cross-format CopyTextureRegion is invalid in D3D12) — the target can be
+	// RGBA8 (scene, HDR off) or RGBA16F (chain scratch), so follow it, don't hardcode.
+	const TEXTURE_FORMAT histFmt = dstTex->GetDesc().Format;
+	if (!st.hist || st.w != w || st.h != h || st.hist->GetDesc().Format != histFmt)
 	{
 		st.hist.Release();
 		TextureDesc td; td.Name = "TAA history"; td.Type = RESOURCE_DIM_TEX_2D; td.Width = (Uint32)w; td.Height = (Uint32)h;
-		td.MipLevels = 1; td.Format = HDR_FMT; td.BindFlags = BIND_SHADER_RESOURCE | BIND_RENDER_TARGET; td.Usage = USAGE_DEFAULT;
+		td.MipLevels = 1; td.Format = histFmt; td.BindFlags = BIND_SHADER_RESOURCE | BIND_RENDER_TARGET; td.Usage = USAGE_DEFAULT;
 		device->CreateTexture(td, nullptr, &st.hist);
 		st.w = w; st.h = h; st.valid = false;
 	}

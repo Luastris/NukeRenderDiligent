@@ -148,10 +148,12 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 			return nullptr;
 		}
 		// Build (and cache) GPU vertex buffers for this mesh: positions + normals + uv.
-		MeshGPU g; g.numVerts = mesh->numVerts;
+		// DEFAULT usage (not immutable): dynamic meshes (skinned instances, procedural)
+		// re-upload in place below when Mesh::version changes.
+		MeshGPU g; g.numVerts = mesh->numVerts; g.version = mesh->version;
 		const Uint64 sz3 = (Uint64)mesh->numVerts * 3 * sizeof(float);
 		const Uint64 sz2 = (Uint64)mesh->numVerts * 2 * sizeof(float);
-		BufferDesc bd; bd.BindFlags = BIND_VERTEX_BUFFER; bd.Usage = USAGE_IMMUTABLE;
+		BufferDesc bd; bd.BindFlags = BIND_VERTEX_BUFFER; bd.Usage = USAGE_DEFAULT;
 		// Positions double as BLAS geometry under D3D12 ray tracing -> they need BIND_RAY_TRACING too.
 		BufferDesc pbd = bd; if (rtSupported) pbd.BindFlags = BIND_VERTEX_BUFFER | BIND_RAY_TRACING;
 		pbd.Size = sz3; pbd.Name = "mesh pos"; BufferData pdat{mesh->vertexArray, sz3}; device->CreateBuffer(pbd, &pdat, &g.pos);
@@ -164,6 +166,18 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 	}
 	MeshGPU& g = it->second;
 	if (!g.pos || !g.nrm || !g.uv) return nullptr;
+	if (g.version != mesh->version)
+	{
+		if (g.numVerts != mesh->numVerts)   // topology changed: rebuild from scratch
+		{
+			meshCache.erase(it);
+			return GetMeshGPU(mesh);
+		}
+		const Uint64 sz3 = (Uint64)mesh->numVerts * 3 * sizeof(float);
+		if (mesh->vertexArray) context->UpdateBuffer(g.pos, 0, sz3, mesh->vertexArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		if (mesh->normalArray) context->UpdateBuffer(g.nrm, 0, sz3, mesh->normalArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		g.version = mesh->version;
+	}
 	return &g;
 }
 void NukeDiligent::bindRenderTarget(uint64_t id)
@@ -174,6 +188,12 @@ void NukeDiligent::bindRenderTarget(uint64_t id)
 	m_impl->uiRTV = it->second.rtv; m_impl->uiTW = (Uint32)it->second.w; m_impl->uiTH = (Uint32)it->second.h;
 }
 void NukeDiligent::invalidateTexture(Texture* t) { if (t) m_impl->texCache.erase(t); }   // re-uploaded on next GetTexSRV
+
+void NukeDiligent::invalidateMesh(Mesh* m)
+{
+	if (!m) return;
+	m_impl->meshCache.erase(m);   // buffers are ref-counted; Diligent releases them GPU-safely
+}
 
 // ---- Neutral UI seam: generic 2D draw (no ImGui types) ----
 

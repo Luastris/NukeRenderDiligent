@@ -170,6 +170,14 @@ void NukeDiligent::uiViewportRender(void* nativeHandle, int w, int h, const Nuke
 		scd.ColorBufferFormat = m_impl->swapChain->GetDesc().ColorBufferFormat;
 		scd.DepthBufferFormat = TEX_FORMAT_UNKNOWN;
 		scd.Width = (Uint32)w; scd.Height = (Uint32)h;
+		// THE ROOT of two weeks of "device removed" asserts: SwapChainDesc defaults to
+		// IsPrimary = true, and a PRIMARY swap chain's Present() runs FinishFrame() +
+		// ReleaseStaleResources() — with a secondary window open that happened TWICE per
+		// frame, corrupting the frame-resource lifetime bookkeeping (the GPU kept reading
+		// memory the second FinishFrame released) -> random device removals. It also gave
+		// every secondary window its own frame-latency waitable (500 ms stalls when the
+		// window is occluded -> the stutters). Secondary windows are NOT primary.
+		scd.IsPrimary = False;
 		Win32NativeWindow win{ nativeHandle };
 		if (m_impl->useD3D12)
 			GetEngineFactoryD3D12()->CreateSwapChainD3D12(m_impl->device, m_impl->context, scd, FullScreenModeDesc{}, win, &sc);
@@ -204,7 +212,20 @@ void NukeDiligent::uiViewportRender(void* nativeHandle, int w, int h, const Nuke
 
 void NukeDiligent::uiViewportDestroy(void* nativeHandle)
 {
-	m_impl->uiVpSC.erase(nativeHandle);
+	auto it = m_impl->uiVpSC.find(nativeHandle);
+	if (it == m_impl->uiVpSC.end()) return;
+	// The GPU may still be reading this swap chain's back buffers (frames in flight);
+	// releasing them mid-use REMOVES THE DEVICE — it surfaces later as the
+	// GetCompletedFenceValue == UINT64_MAX assert storm. Settle the queue first: window
+	// destruction is rare, a full idle is cheap insurance. NOTE imgui also RECREATES
+	// platform windows on viewport merge/DPI changes, not just on user close.
+	if (m_impl->context && m_impl->device)
+	{
+		m_impl->context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
+		m_impl->context->Flush();
+		m_impl->device->IdleGPU();
+	}
+	m_impl->uiVpSC.erase(it);
 }
 
 void NukeDiligent::getFrameStats(int& drawCalls, int& triangles)
