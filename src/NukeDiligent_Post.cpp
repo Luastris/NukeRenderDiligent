@@ -87,7 +87,7 @@ void NukeDiligent::Impl::CreatePostResources()
 	if (!postParamsCB) { BufferDesc d; d.Name = "PostParams"; d.Size = 256; d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &postParamsCB); }
 	if (!postFrameCB)  { BufferDesc d; d.Name = "PostFrame";  d.Size = sizeof(float) * 8; d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &postFrameCB); }
 	// SSR matrices (view/proj/invProj + resolution), filled per camera in RunSSR.
-	if (!ssrCB) { BufferDesc d; d.Name = "SSRCB"; d.Size = sizeof(float) * (16 * 3 + 4); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &ssrCB); }
+	if (!ssrCB) { BufferDesc d; d.Name = "SSRCB"; d.Size = sizeof(float) * (16 * 4 + 4); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &ssrCB); }   // view/proj/invProj/invView + res
 	if (!rtRefCB) { BufferDesc d; d.Name = "RTRefCB"; d.Size = sizeof(float) * (16 + 4 * 8); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &rtRefCB); }
 	if (!taaCB) { BufferDesc d; d.Name = "TAACB"; d.Size = sizeof(float) * (16 * 4 + 4 * 2); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &taaCB); }
 	BuildGBufferPipe();   // gbuffer.ps + world.vs (shares worldCB/worldMatCB) — for the SSR prepass
@@ -213,7 +213,11 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
 	gp.DepthStencilDesc.DepthEnable = False;
 	gp.InputLayout.NumElements = 0;
-	const bool ssr = (name == "ssr");   // built-in: also samples the G-buffer + depth + camera matrices (SSRCB)
+	// "musicvis" (audio-reactive ghost overlays) shares SSR's resource layout: G-buffer
+	// normals + prepass depth + camera matrices (SSRCB), PLUS the generic per-object id
+	// target. Same isSSR path end to end — the difference is in the pixel shader.
+	const bool mvis = (name == "musicvis");
+	const bool ssr = (name == "ssr" || mvis);   // built-in: also samples the G-buffer + depth + camera matrices (SSRCB)
 	const bool taa = (name == "taa");   // built-in: samples depth + a history texture + camera matrices (TAACB)
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP;
@@ -230,6 +234,11 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 		vars.push_back({SHADER_TYPE_PIXEL, "g_Depth",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 		imms.push_back({SHADER_TYPE_PIXEL, "g_GBuffer", psamp});
 		imms.push_back({SHADER_TYPE_PIXEL, "g_Depth",   psamp});
+	}
+	if (mvis)   // generic per-object id (gbuffer RT2; POINT — ids must not blend)
+	{
+		vars.push_back({SHADER_TYPE_PIXEL, "g_ObjId", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+		imms.push_back({SHADER_TYPE_PIXEL, "g_ObjId", psamp});
 	}
 	if (taa)
 	{
@@ -253,6 +262,7 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	pp.pso->CreateShaderResourceBinding(&pp.srb, true);
 	pp.srcVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Source");
 	if (ssr) { pp.gbufVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GBuffer"); pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.isSSR = true; }
+	if (mvis) pp.objIdVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ObjId");
 	if (taa) { pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.histVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_History"); pp.velVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Velocity"); pp.isTAA = true; }
 	pp.isBloom = (name == "bloom");   // built-in multi-pass effect; the renderer runs the passes itself
 	uint64_t h = nextShaderHandle++;

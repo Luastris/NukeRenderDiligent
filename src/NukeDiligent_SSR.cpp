@@ -8,8 +8,9 @@ void NukeDiligent::Impl::EnsureGBuffer(int w, int h)
 	if (w <= 0 || h <= 0) return;
 	if (gbufColor && gbufW == w && gbufH == h) return;
 	gbufW = w; gbufH = h;
-	gbufColor.Release(); gbufDepth.Release(); gbufVel.Release();
+	gbufColor.Release(); gbufDepth.Release(); gbufVel.Release(); gbufObjId.Release();
 	gbufRTV = gbufSRV = gbufDSV = gbufDepthSRV = gbufVelRTV = gbufVelSRV = nullptr;
+	gbufObjIdRTV = gbufObjIdSRV = nullptr;
 
 	TextureDesc cd; cd.Name = "GBuffer"; cd.Type = RESOURCE_DIM_TEX_2D; cd.Width = (Uint32)w; cd.Height = (Uint32)h;
 	cd.Format = TEX_FORMAT_RGBA16_FLOAT; cd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
@@ -20,6 +21,14 @@ void NukeDiligent::Impl::EnsureGBuffer(int w, int h)
 	vd.Format = TEX_FORMAT_RG16_FLOAT; vd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;   // screen-space motion (TAA)
 	device->CreateTexture(vd, nullptr, &gbufVel);
 	if (gbufVel) { gbufVelRTV = gbufVel->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); gbufVelSRV = gbufVel->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
+
+	// Generic per-OBJECT id: one flat value per draw (pivot hash, written by gbuffer.vs).
+	// The G-buffer carries NO effect semantics — consumers (musicvis note tint; outlines /
+	// per-object masks later) derive their own meaning from the id.
+	TextureDesc nd; nd.Name = "GBuffer ObjectId"; nd.Type = RESOURCE_DIM_TEX_2D; nd.Width = (Uint32)w; nd.Height = (Uint32)h;
+	nd.Format = TEX_FORMAT_R8_UNORM; nd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+	device->CreateTexture(nd, nullptr, &gbufObjId);
+	if (gbufObjId) { gbufObjIdRTV = gbufObjId->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); gbufObjIdSRV = gbufObjId->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
 
 	TextureDesc dd; dd.Name = "GBuffer Depth"; dd.Type = RESOURCE_DIM_TEX_2D; dd.Width = (Uint32)w; dd.Height = (Uint32)h;
 	dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE;
@@ -42,7 +51,8 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 
 	GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "GBuffer PSO";
 	auto& gp = ci.GraphicsPipeline;
-	gp.NumRenderTargets = 2; gp.RTVFormats[0] = TEX_FORMAT_RGBA16_FLOAT; gp.RTVFormats[1] = TEX_FORMAT_RG16_FLOAT;   // gbuffer + velocity
+	gp.NumRenderTargets = 3; gp.RTVFormats[0] = TEX_FORMAT_RGBA16_FLOAT; gp.RTVFormats[1] = TEX_FORMAT_RG16_FLOAT;   // gbuffer + velocity
+	gp.RTVFormats[2] = TEX_FORMAT_R8_UNORM;   // generic per-object id
 	gp.DSVFormat = TEX_FORMAT_D32_FLOAT;
 	gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 	gp.RasterizerDesc.CullMode = CULL_MODE_BACK;
@@ -79,9 +89,10 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 void NukeDiligent::Impl::RunSSR(PostPipe& pp, ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, const std::vector<float>& params)
 {
 	{
-		struct SSRData { float4x4 view, proj, invProj; float res[4]; };
+		struct SSRData { float4x4 view, proj, invProj, invView; float res[4]; };
 		MapHelper<SSRData> cb(context, ssrCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		cb->view = curView; cb->proj = curProjNoJitter; cb->invProj = curProjNoJitter.Inverse();   // unjittered — matches the unjittered gbuffer depth (TAA jitter must not leak into SSR)
+		cb->invView = curView.Inverse();   // view -> WORLD (musicvis reconstructs world positions for its note hash)
 		cb->res[0] = (float)w; cb->res[1] = (float)h; cb->res[2] = w ? 1.0f / w : 0.0f; cb->res[3] = h ? 1.0f / h : 0.0f;
 	}
 	{
@@ -95,6 +106,7 @@ void NukeDiligent::Impl::RunSSR(PostPipe& pp, ITextureView* srcSRV, ITextureView
 	if (pp.srcVar)   pp.srcVar->Set(srcSRV);
 	if (pp.gbufVar)  pp.gbufVar->Set(gbufSRV);
 	if (pp.depthVar) pp.depthVar->Set(gbufDepthSRV);
+	if (pp.objIdVar && gbufObjIdSRV) pp.objIdVar->Set(gbufObjIdSRV);   // musicvis: generic per-object id
 	context->SetPipelineState(pp.pso);
 	context->CommitShaderResources(pp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
@@ -168,11 +180,15 @@ void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 	m_impl->curTarget = cam.target;   // TAA per-camera state (taaStates[curTarget]) keyed correctly during the prepass
 	m_impl->SetCameraViewProj(cam, w, h);
 	IDeviceContext* ctx = m_impl->context;
-	ITextureView* rtvs[2] = { m_impl->gbufRTV, m_impl->gbufVelRTV };   // MRT: gbuffer + velocity
-	ctx->SetRenderTargets(m_impl->gbufVelRTV ? 2 : 1, rtvs, m_impl->gbufDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ITextureView* rtvs[3] = { m_impl->gbufRTV, m_impl->gbufVelRTV, m_impl->gbufObjIdRTV };   // MRT: gbuffer + velocity + object id
+	Uint32 nrt = 1;
+	if (m_impl->gbufVelRTV)  nrt = 2;
+	if (m_impl->gbufVelRTV && m_impl->gbufObjIdRTV) nrt = 3;   // slots must be contiguous (PSO declares 3)
+	ctx->SetRenderTargets(nrt, rtvs, m_impl->gbufDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	const float clr[4] = { 0, 0, 0, 0 };
 	ctx->ClearRenderTarget(m_impl->gbufRTV, clr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	if (m_impl->gbufVelRTV) ctx->ClearRenderTarget(m_impl->gbufVelRTV, clr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	if (m_impl->gbufVelRTV)   ctx->ClearRenderTarget(m_impl->gbufVelRTV, clr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	if (m_impl->gbufObjIdRTV) ctx->ClearRenderTarget(m_impl->gbufObjIdRTV, clr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	ctx->ClearDepthStencil(m_impl->gbufDSV, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
 	ctx->SetViewports(1, &vp, w, h);

@@ -135,6 +135,7 @@ struct NukeDiligent::Impl
 	// Custom post-effect chain (one fullscreen pipeline per effect; ping-ponged in HDR before the final tonemap).
 	struct PostPipe { RefCntAutoPtr<IPipelineState> pso; RefCntAutoPtr<IShaderResourceBinding> srb; IShaderResourceVariable* srcVar = nullptr; bool isBloom = false;
 	                  IShaderResourceVariable* gbufVar = nullptr; IShaderResourceVariable* depthVar = nullptr; bool isSSR = false;
+	                  IShaderResourceVariable* objIdVar = nullptr;   // musicvis: generic per-OBJECT id (gbuffer RT2)
 	                  IShaderResourceVariable* histVar = nullptr; IShaderResourceVariable* velVar = nullptr; bool isTAA = false;   // temporal AA (history + depth + velocity)
 	                  bool isRTRef = false;   // built-in ray-traced reflections (D3D12)
 	                  IShaderResourceVariable* tlasVar = nullptr; IShaderResourceVariable* instVar = nullptr;
@@ -189,9 +190,10 @@ struct NukeDiligent::Impl
 	// G-buffer prepass (single-sample) for screen-space reflections: normal(oct)+roughness+metalness + depth.
 	// Rendered per SSR camera before the colour pass; the "ssr" post effect samples it. Own 1x depth -> no MSAA
 	// depth resolve, and the colour/custom shaders stay untouched (a dedicated gbuffer.ps fills it).
-	RefCntAutoPtr<ITexture>             gbufColor, gbufDepth, gbufVel;
+	RefCntAutoPtr<ITexture>             gbufColor, gbufDepth, gbufVel, gbufObjId;
 	ITextureView*                       gbufRTV = nullptr, *gbufDSV = nullptr, *gbufSRV = nullptr, *gbufDepthSRV = nullptr;
 	ITextureView*                       gbufVelRTV = nullptr, *gbufVelSRV = nullptr;   // screen-space motion (TAA)
+	ITextureView*                       gbufObjIdRTV = nullptr, *gbufObjIdSRV = nullptr; // generic per-OBJECT id (pivot hash)
 	int                                 gbufW = 0, gbufH = 0;
 	bool                                gbufActive = false;   // a valid prepass ran for the current camera
 	RefCntAutoPtr<IPipelineState>       gbufPSO;
