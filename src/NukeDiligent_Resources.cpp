@@ -212,7 +212,14 @@ uint64_t NukeDiligent::createTexture2D(const void* rgba, int width, int height)
 	TextureData       init{&mip0, 1};
 	RefCntAutoPtr<ITexture> tex;
 	m_impl->device->CreateTexture(Desc, &init, &tex);
-	if (!tex) return 0;
+	if (!tex)
+	{
+		// Transient GPU-memory pressure (boot-time uploads, parallel tooling): callers
+		// treat 0 as "retry later", so say WHY a frame degraded instead of dying silently.
+		std::cout << "[NukeDiligent]\tcreateTexture2D FAILED (" << width << "x" << height
+		          << ") — GPU resource pressure; UI retries next frame." << std::endl;
+		return 0;
+	}
 	ITextureView* view = tex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 	uint64_t handle = reinterpret_cast<uint64_t>(view);
 	m_impl->textures[handle] = tex; // keep alive

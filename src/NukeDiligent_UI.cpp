@@ -110,6 +110,7 @@ void NukeDiligent::Impl::DrawUILists(ITextureView* uirtv, Uint32 surfW, Uint32 s
 			ctx->SetScissorRects(1, &sc, surfW, surfH);
 
 			ITextureView* view = reinterpret_cast<ITextureView*>(cmd.texId);
+			if (!view) continue;   // no texture (failed/pending upload): drop the cmd, not the app
 			if (view != lastView)
 			{
 				lastView = view;
