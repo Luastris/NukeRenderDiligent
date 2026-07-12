@@ -9,6 +9,26 @@ cmake_policy(SET CMP0091 NEW)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 # --- Diligent Engine (built as a subproject; only what we need) ---
+# Pre-seed Diligent's backend try_compile results: the atlbase.h probe only passes from a
+# VS dev prompt (a stray older toolset without ATL wins the probe otherwise), while the
+# ACTUAL build resolves ATL fine through the vcxproj default include path — this project
+# is Windows-only with the C++ workload, D3D11/12 + ATL are a given.
+set(HAS_D3D11 TRUE CACHE INTERNAL "")
+set(HAS_D3D12 TRUE CACHE INTERNAL "")
+set(HAS_ATL   TRUE CACHE INTERNAL "")
+# ...and hand every Diligent target the ATL include dir explicitly: outside a VS dev
+# prompt the generated vcxprojs carry no ATLMFC path, and Diligent's Win32 platform code
+# includes atlbase.h (the newest installed toolset wins).
+file(GLOB _nuke_atl_dirs "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/*/VC/Tools/MSVC/*/atlmfc/include")
+if(_nuke_atl_dirs)
+    list(SORT _nuke_atl_dirs)
+    list(REVERSE _nuke_atl_dirs)
+    list(GET _nuke_atl_dirs 0 _nuke_atl)
+    include_directories("${_nuke_atl}")   # directory-scoped: inherited by the subproject
+    string(REPLACE "/include" "/lib/x64" _nuke_atl_lib "${_nuke_atl}")
+    link_directories("${_nuke_atl_lib}")  # atls.lib for the D3D backends
+    message(STATUS "ATL include: ${_nuke_atl}")
+endif()
 set(DILIGENT_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(DILIGENT_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
 set(DILIGENT_NO_VULKAN     ON  CACHE BOOL "" FORCE)
