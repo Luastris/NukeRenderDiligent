@@ -172,6 +172,9 @@ void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV,
 	{
 		MapHelper<float> cb(context, postCB, MAP_WRITE, MAP_FLAG_DISCARD);   // final pass = tonemap/encode ONLY
 		for (int k = 0; k < 8; ++k) cb[k] = 0.0f;
+		// g_Post.x = transparent output: the final backbuffer pass emits PREMULTIPLIED scene
+		// alpha (rgb*a, a) so a DirectComposition window shows the desktop where alpha < 1.
+		cb[0] = (toBackbuffer && transparent) ? 1.0f : 0.0f;
 		cb[1] = mode;
 		cb[2] = hdrPaperWhite; cb[3] = hdrPeak;   // HDR10 mapping (post.ps mode 2)
 		cb[4] = toneExposure;   // g_Grade.x = exposure

@@ -21,6 +21,16 @@ project — the engine core contains zero graphics code.
 - Debug-line pass, per-object id pass (for shaders/picking), UI seam for the editor and
   the runtime GUI, native multi-viewport windows.
 
+## Window modes & transparency
+
+Driven by the engine's `WindowDesc` / `Game.Set*` API (persisted in `config/main.json`):
+windowed, borderless-fullscreen and exclusive-fullscreen (video-mode switch) via GLFW;
+per-pixel **transparency** via a DirectComposition swap chain. The composition path patches
+the vendored `SwapChainD3DBase.hpp` (`CreateSwapChainForComposition` + premultiplied alpha,
+guarded by `g_NukeCompositionSwapChain` so the opaque path is byte-for-byte unchanged) and
+binds the swap chain into a DComp visual on the HWND. Transparency is a creation-time swap
+chain property — it applies on the next launch, not live.
+
 ## Gotchas
 
 - New renderer-internal shader pairs must be added to `RendererInternalShader()` in the

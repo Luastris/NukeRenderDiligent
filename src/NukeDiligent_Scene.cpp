@@ -266,6 +266,10 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 
 	IDeviceContext* ctx = m_impl->context;
 	ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	// Clear to the camera's Background colour. Its ALPHA drives transparency on a composited
+	// window: opaque geometry writes alpha 1 over it, a procedural sky fills it opaque, and the
+	// final pass carries the alpha premultiplied so the desktop shows where the background alpha
+	// (and no geometry) is below 1. On an opaque window the alpha is ignored by the final pass.
 	ctx->ClearRenderTarget(rtv, cam.clear, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	if (dsv)
 		ctx->ClearDepthStencil(dsv, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);

@@ -30,6 +30,7 @@ public:
 	bool isWindowFocused() override;
 	bool isWindowMaximized() override;
 	void setWindowMaximized(bool maximized) override;
+	void applyWindow(const WindowDesc& desc) override;   // runtime size/mode/decoration/opacity
 	void getCursorPos(double& x, double& y) override;
 	bool isMouseButtonDown(int button) override;
 	void bindRenderTarget(uint64_t rtId) override;
@@ -120,4 +121,8 @@ private:
 	struct Impl;          // PImpl: keeps Diligent types out of this header
 	Impl*       m_impl   = nullptr;
 	GLFWwindow* m_window = nullptr;
+	// Windowed placement remembered when going fullscreen, so returning to windowed restores
+	// a sane position/size (glfwSetWindowMonitor to NULL needs an explicit rect). -1 = unset.
+	int m_winX = -1, m_winY = -1, m_winW = 0, m_winH = 0;
+	int m_windowMode = 0;   // current applied WindowMode (0/1/2)
 };

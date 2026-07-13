@@ -69,6 +69,15 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IDeviceContext> context;
 	RefCntAutoPtr<ISwapChain>     swapChain;
 	bool                          useD3D12 = false;   // active backend (set in init from WindowDesc.backend)
+	// DirectComposition objects for a TRANSPARENT window (per-pixel alpha to the desktop):
+	// the composition swap chain presents into this visual tree. Stored as IUnknown* so the
+	// widely-included Impl header stays free of <dcomp.h> (typed use lives in NukeDiligent.cpp).
+	IUnknown*                     dcompDevice = nullptr;   // IDCompositionDevice
+	IUnknown*                     dcompTarget = nullptr;   // IDCompositionTarget
+	IUnknown*                     dcompVisual = nullptr;   // IDCompositionVisual
+	bool                          transparent = false;     // transparent window: the empty background
+	                                                       // clears to alpha 0 and the final pass outputs
+	                                                       // PREMULTIPLIED alpha so the desktop shows through.
 	bool                          rtSupported = false; // device reports ray-tracing capability (D3D12 + RT-capable GPU)
 	RefCntAutoPtr<IShaderSourceInputStreamFactory> shaderFactory;   // resolves #include + loads RT shaders from the shaders dir
 

@@ -1,6 +1,15 @@
 #include "NukeDiligentImpl.h"
 #include "RenderDeviceD3D12.h"   // drain the D3D12 debug layer into OUR console (see below)
+#include "SwapChainD3D12.h"      // ISwapChainD3D12::GetDXGISwapChain (bind into DComp)
+#include "SwapChainD3D11.h"
+#include <config.h>              // nuke::WindowMode (window display mode)
 #include <d3d12.h>
+#include <dcomp.h>               // DirectComposition (per-pixel window transparency)
+
+// NUKE PATCH global (DEFINED in the vendored SwapChainD3DBase.cpp so the Diligent DLLs resolve
+// it too): true => the PRIMARY swap chain is created for DirectComposition (premultiplied
+// alpha) instead of the HWND. Set only around the transparent window's swap-chain creation.
+extern "C" bool g_NukeCompositionSwapChain;
 
 // The D3D12 debug layer reports the ACTUAL invalid operation (what the "Failed to close
 // the command list" / device-removed asserts are symptoms of) — but only into the
@@ -210,9 +219,10 @@ int NukeDiligent::init(const WindowDesc& desc)
 	glfwWindowHint(GLFW_MAXIMIZED, desc.maximized ? GLFW_TRUE : GLFW_FALSE);
 	if (desc.transparent)
 		glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, GLFW_TRUE); // NOTE: true see-through also needs swapchain alpha (DComp) — not yet wired
-	GLFWmonitor* monitor = desc.fullscreen ? glfwGetPrimaryMonitor() : nullptr;
+	// Always create WINDOWED; a fullscreen mode is applied right after init via applyWindow
+	// (one code path for launch + runtime). Avoids the exclusive-at-create special case.
 	const char*  title   = (desc.title && desc.title[0]) ? desc.title : "NukeEngine";
-	m_window = glfwCreateWindow(w, h, title, monitor, nullptr);
+	m_window = glfwCreateWindow(w, h, title, nullptr, nullptr);
 	if (!m_window) { cout << "[NukeDiligent]\tglfwCreateWindow failed" << endl; glfwTerminate(); return 1; }
 
 	glfwSetWindowUserPointer(m_window, this);
@@ -250,6 +260,10 @@ int NukeDiligent::init(const WindowDesc& desc)
 	glfwShowWindow(m_window);
 
 	m_impl->useD3D12 = (desc.backend == 1);
+	// Per-pixel transparency: the PRIMARY swap chain is built for DirectComposition (see the
+	// vendored SwapChainD3DBase.hpp patch). Set the flag around creation only; reset after so
+	// secondary (UI viewport) swap chains stay ordinary opaque HWND chains.
+	g_NukeCompositionSwapChain = desc.transparent;
 	Win32NativeWindow Window{ hWnd };
 	SwapChainDesc SCDesc;
 	// Match the World PSO + offscreen render targets (RGBA8_UNORM). Diligent defaults the
@@ -309,6 +323,53 @@ int NukeDiligent::init(const WindowDesc& desc)
 		                               FullScreenModeDesc{}, Window, &m_impl->swapChain);
 	}
 	if (!m_impl->swapChain) { cout << "[NukeDiligent]\tswap chain creation failed" << endl; return 1; }
+	g_NukeCompositionSwapChain = false;   // primary done — secondary swap chains stay opaque
+	m_impl->transparent = desc.transparent;   // drives the alpha-0 clear + premultiplied final pass
+
+	// Transparent window: bind the composition swap chain into a DirectComposition visual on
+	// the HWND so its per-pixel alpha shows the desktop (the swap chain alone doesn't compose).
+	if (desc.transparent)
+	{
+		IDXGISwapChain* dxgiSC = nullptr;
+		if (m_impl->useD3D12)
+		{
+			RefCntAutoPtr<ISwapChainD3D12> sc(m_impl->swapChain, IID_SwapChainD3D12);
+			if (sc) dxgiSC = sc->GetDXGISwapChain();
+		}
+		else
+		{
+			RefCntAutoPtr<ISwapChainD3D11> sc(m_impl->swapChain, IID_SwapChainD3D11);
+			if (sc) dxgiSC = sc->GetDXGISwapChain();
+		}
+		IDCompositionDevice* dcDev = nullptr;
+		if (dxgiSC && SUCCEEDED(DCompositionCreateDevice(nullptr, __uuidof(IDCompositionDevice), (void**)&dcDev)))
+		{
+			IDCompositionTarget* dcTarget = nullptr;
+			IDCompositionVisual* dcVisual = nullptr;
+			HRESULT hrT = dcDev->CreateTargetForHwnd(hWnd, TRUE, &dcTarget);
+			HRESULT hrV = dcDev->CreateVisual(&dcVisual);
+			if (SUCCEEDED(hrT) && SUCCEEDED(hrV) && dcTarget && dcVisual)
+			{
+				dcVisual->SetContent(dxgiSC);       // AddRefs the swap chain
+				dcTarget->SetRoot(dcVisual);
+				dcDev->Commit();
+				m_impl->dcompDevice = dcDev;
+				m_impl->dcompTarget = dcTarget;
+				m_impl->dcompVisual = dcVisual;
+				cout << "[NukeDiligent]\tDirectComposition transparency active (premultiplied alpha)" << endl;
+			}
+			else
+			{
+				if (dcVisual) dcVisual->Release();
+				if (dcTarget) dcTarget->Release();
+				dcDev->Release();
+				cout << "[NukeDiligent]\tDComp visual setup failed (hrT=0x" << std::hex << hrT
+				     << " hrV=0x" << hrV << std::dec << ") — window opaque" << endl;
+			}
+		}
+		else
+			cout << "[NukeDiligent]\tDComp device creation failed — window opaque" << endl;
+	}
 	// Shader #include resolver (+ RT shader loader): resolves "rt_common.hlsl" etc. from the shaders directory.
 	if (engFactory) engFactory->CreateDefaultShaderSourceStreamFactory("shaders", &m_impl->shaderFactory);
 	// Ray tracing needs the D3D12 backend AND a capable GPU/driver (RTX / DXR1.1).
@@ -329,6 +390,12 @@ int NukeDiligent::init(const WindowDesc& desc)
 
 	cout << "[NukeDiligent]\tdevice=" << m_impl->device.RawPtr()
 	     << " swapChain=" << m_impl->swapChain.RawPtr() << endl;
+
+	// Launch straight into the requested display mode (window created windowed above; the
+	// swap chain follows the framebuffer on the first frame). Same one path as the runtime API.
+	m_windowMode = (int)WindowMode::Windowed;
+	if (desc.mode != (int)WindowMode::Windowed)
+		applyWindow(desc);
 
 	if (_UIinit)
 	{
@@ -439,6 +506,11 @@ void NukeDiligent::requestClose()
 void NukeDiligent::deinit()
 {
 	for (auto& cb : m_impl->onClose) cb();
+	// DirectComposition (transparent window): release visual -> target -> device before the
+	// swap chain they reference.
+	if (m_impl->dcompVisual) { m_impl->dcompVisual->Release(); m_impl->dcompVisual = nullptr; }
+	if (m_impl->dcompTarget) { m_impl->dcompTarget->Release(); m_impl->dcompTarget = nullptr; }
+	if (m_impl->dcompDevice) { m_impl->dcompDevice->Release(); m_impl->dcompDevice = nullptr; }
 	m_impl->swapChain.Release();
 	m_impl->context.Release();
 	m_impl->device.Release();
@@ -466,6 +538,51 @@ void NukeDiligent::setWindowTitle(const char* title) { if (m_window && title) gl
 bool NukeDiligent::isWindowFocused() { return m_window && glfwGetWindowAttrib(m_window, GLFW_FOCUSED) != 0; }
 bool NukeDiligent::isWindowMaximized() { return m_window && glfwGetWindowAttrib(m_window, GLFW_MAXIMIZED) != 0; }
 void NukeDiligent::setWindowMaximized(bool m) { if (!m_window) return; if (m) glfwMaximizeWindow(m_window); else glfwRestoreWindow(m_window); }
+
+// Runtime window change (Game.Set* -> iRender::applyWindow). The swap chain follows the new
+// framebuffer size in the render loop (glfwGetFramebufferSize), so we only drive the WINDOW.
+void NukeDiligent::applyWindow(const WindowDesc& d)
+{
+	if (!m_window) return;
+	GLFWmonitor* mon = glfwGetPrimaryMonitor();
+	const GLFWvidmode* vm = mon ? glfwGetVideoMode(mon) : nullptr;
+
+	// Leaving windowed: remember the current windowed rect so a later return restores it.
+	if (m_windowMode == (int)WindowMode::Windowed && d.mode != (int)WindowMode::Windowed)
+		glfwGetWindowPos(m_window, &m_winX, &m_winY), glfwGetWindowSize(m_window, &m_winW, &m_winH);
+
+	if (d.mode == (int)WindowMode::Windowed)
+	{
+		// Decoration can only change while NOT monitor-fullscreen.
+		glfwSetWindowMonitor(m_window, nullptr,
+		                     m_winX >= 0 ? m_winX : 64, m_winY >= 0 ? m_winY : 64,
+		                     d.w > 0 ? d.w : 1280, d.h > 0 ? d.h : 720, GLFW_DONT_CARE);
+		glfwSetWindowAttrib(m_window, GLFW_DECORATED, d.decorated ? GLFW_TRUE : GLFW_FALSE);
+		glfwSetWindowAttrib(m_window, GLFW_RESIZABLE, d.resizable ? GLFW_TRUE : GLFW_FALSE);
+	}
+	else if (d.mode == (int)WindowMode::BorderlessFullscreen)
+	{
+		// Undecorated window covering the monitor at the DESKTOP resolution (no mode switch).
+		int mx = 0, my = 0; if (mon) glfwGetMonitorPos(mon, &mx, &my);
+		glfwSetWindowAttrib(m_window, GLFW_DECORATED, GLFW_FALSE);
+		glfwSetWindowMonitor(m_window, nullptr, mx, my,
+		                     vm ? vm->width : (d.w > 0 ? d.w : 1280),
+		                     vm ? vm->height : (d.h > 0 ? d.h : 720), GLFW_DONT_CARE);
+	}
+	else   // WindowMode::ExclusiveFullscreen — real GLFW fullscreen, monitor switches to our resolution
+	{
+		int rw = d.w > 0 ? d.w : (vm ? vm->width : 1280);
+		int rh = d.h > 0 ? d.h : (vm ? vm->height : 720);
+		glfwSetWindowMonitor(m_window, mon, 0, 0, rw, rh, vm ? vm->refreshRate : GLFW_DONT_CARE);
+	}
+
+	glfwSetWindowOpacity(m_window, d.opacity <= 0.0f ? 1.0f : d.opacity);
+	m_windowMode = d.mode;
+	if (d.transparent)
+		cout << "[NukeDiligent]\tper-pixel transparency is a creation-time property — applies on next launch" << endl;
+	cout << "[NukeDiligent]\tapplyWindow mode=" << d.mode << " " << d.w << "x" << d.h
+	     << " decorated=" << d.decorated << " opacity=" << d.opacity << endl;
+}
 void NukeDiligent::getCursorPos(double& x, double& y) { x = y = 0; if (m_window) glfwGetCursorPos(m_window, &x, &y); }
 bool NukeDiligent::isMouseButtonDown(int b) { return m_window && glfwGetMouseButton(m_window, b) == GLFW_PRESS; }
 
