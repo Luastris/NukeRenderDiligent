@@ -436,6 +436,12 @@ int NukeDiligent::render()
 	{
 		width  = fbw;
 		height = fbh;
+		// D3D12 removes the device if the swap-chain back buffers are still bound or referenced by
+		// in-flight GPU work when Resize() runs — and a resize DRAG fires this every frame. Unbind +
+		// flush + idle first (same as the secondary-viewport path in NukeDiligent_UI.cpp).
+		m_impl->context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
+		m_impl->context->Flush();
+		m_impl->device->IdleGPU();
 		m_impl->swapChain->Resize((Uint32)fbw, (Uint32)fbh);
 	}
 
