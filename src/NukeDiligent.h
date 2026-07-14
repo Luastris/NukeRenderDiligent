@@ -31,6 +31,8 @@ public:
 	bool isWindowMaximized() override;
 	void setWindowMaximized(bool maximized) override;
 	void applyWindow(const WindowDesc& desc) override;   // runtime size/mode/decoration/opacity
+	void setVSync(bool on) override;                     // main-present vsync (live)
+	bool getVSync() override;
 	void getCursorPos(double& x, double& y) override;
 	bool isMouseButtonDown(int button) override;
 	void bindRenderTarget(uint64_t rtId) override;

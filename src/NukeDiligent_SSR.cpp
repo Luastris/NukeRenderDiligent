@@ -6,34 +6,72 @@
 void NukeDiligent::Impl::EnsureGBuffer(int w, int h)
 {
 	if (w <= 0 || h <= 0) return;
-	if (gbufColor && gbufW == w && gbufH == h) return;
+	if (gbufColor && gbufW == w && gbufH == h) return;   // already the active set
+
+	const uint64_t key = ((uint64_t)(uint32_t)w << 32) | (uint32_t)h;
+	auto it = gbufCache.find(key);
+	if (it == gbufCache.end())
+	{
+		// Miss: build a fresh set for this size. Nothing is released — other sizes stay
+		// cached, so no in-use buffer is freed mid-frame (that was the device-removed race).
+		GBufferSet s;
+		TextureDesc cd; cd.Name = "GBuffer"; cd.Type = RESOURCE_DIM_TEX_2D; cd.Width = (Uint32)w; cd.Height = (Uint32)h;
+		cd.Format = TEX_FORMAT_RGBA16_FLOAT; cd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+		device->CreateTexture(cd, nullptr, &s.color);
+		if (s.color) { s.rtv = s.color->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); s.srv = s.color->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
+
+		TextureDesc vd; vd.Name = "GBuffer Velocity"; vd.Type = RESOURCE_DIM_TEX_2D; vd.Width = (Uint32)w; vd.Height = (Uint32)h;
+		vd.Format = TEX_FORMAT_RG16_FLOAT; vd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;   // screen-space motion (TAA)
+		device->CreateTexture(vd, nullptr, &s.vel);
+		if (s.vel) { s.velRTV = s.vel->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); s.velSRV = s.vel->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
+
+		// Generic per-OBJECT id: one flat value per draw (pivot hash, written by gbuffer.vs).
+		// The G-buffer carries NO effect semantics — consumers (musicvis note tint; outlines /
+		// per-object masks later) derive their own meaning from the id.
+		TextureDesc nd; nd.Name = "GBuffer ObjectId"; nd.Type = RESOURCE_DIM_TEX_2D; nd.Width = (Uint32)w; nd.Height = (Uint32)h;
+		nd.Format = TEX_FORMAT_R8_UNORM; nd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+		device->CreateTexture(nd, nullptr, &s.objId);
+		if (s.objId) { s.objIdRTV = s.objId->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); s.objIdSRV = s.objId->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
+
+		TextureDesc dd; dd.Name = "GBuffer Depth"; dd.Type = RESOURCE_DIM_TEX_2D; dd.Width = (Uint32)w; dd.Height = (Uint32)h;
+		dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE;
+		device->CreateTexture(dd, nullptr, &s.depth);
+		if (s.depth) { s.dsv = s.depth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL); s.depthSRV = s.depth->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
+
+		it = gbufCache.emplace(key, std::move(s)).first;
+	}
+
+	GBufferSet& set = it->second;
+	set.lastUsed = ++gbufFrameCtr;
+	gbufCurKey = key;
+
+	// Repoint the live members at the active set — consumers (SSR/RT/Post) read these fields.
+	gbufColor = set.color;  gbufDepth = set.depth;  gbufVel = set.vel;  gbufObjId = set.objId;
+	gbufRTV = set.rtv; gbufSRV = set.srv; gbufDSV = set.dsv; gbufDepthSRV = set.depthSRV;
+	gbufVelRTV = set.velRTV; gbufVelSRV = set.velSRV;
+	gbufObjIdRTV = set.objIdRTV; gbufObjIdSRV = set.objIdSRV;
 	gbufW = w; gbufH = h;
-	gbufColor.Release(); gbufDepth.Release(); gbufVel.Release(); gbufObjId.Release();
-	gbufRTV = gbufSRV = gbufDSV = gbufDepthSRV = gbufVelRTV = gbufVelSRV = nullptr;
-	gbufObjIdRTV = gbufObjIdSRV = nullptr;
 
-	TextureDesc cd; cd.Name = "GBuffer"; cd.Type = RESOURCE_DIM_TEX_2D; cd.Width = (Uint32)w; cd.Height = (Uint32)h;
-	cd.Format = TEX_FORMAT_RGBA16_FLOAT; cd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
-	device->CreateTexture(cd, nullptr, &gbufColor);
-	if (gbufColor) { gbufRTV = gbufColor->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); gbufSRV = gbufColor->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
+	EvictGBufferCache();
+}
 
-	TextureDesc vd; vd.Name = "GBuffer Velocity"; vd.Type = RESOURCE_DIM_TEX_2D; vd.Width = (Uint32)w; vd.Height = (Uint32)h;
-	vd.Format = TEX_FORMAT_RG16_FLOAT; vd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;   // screen-space motion (TAA)
-	device->CreateTexture(vd, nullptr, &gbufVel);
-	if (gbufVel) { gbufVelRTV = gbufVel->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); gbufVelSRV = gbufVel->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
-
-	// Generic per-OBJECT id: one flat value per draw (pivot hash, written by gbuffer.vs).
-	// The G-buffer carries NO effect semantics — consumers (musicvis note tint; outlines /
-	// per-object masks later) derive their own meaning from the id.
-	TextureDesc nd; nd.Name = "GBuffer ObjectId"; nd.Type = RESOURCE_DIM_TEX_2D; nd.Width = (Uint32)w; nd.Height = (Uint32)h;
-	nd.Format = TEX_FORMAT_R8_UNORM; nd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
-	device->CreateTexture(nd, nullptr, &gbufObjId);
-	if (gbufObjId) { gbufObjIdRTV = gbufObjId->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); gbufObjIdSRV = gbufObjId->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
-
-	TextureDesc dd; dd.Name = "GBuffer Depth"; dd.Type = RESOURCE_DIM_TEX_2D; dd.Width = (Uint32)w; dd.Height = (Uint32)h;
-	dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE;
-	device->CreateTexture(dd, nullptr, &gbufDepth);
-	if (gbufDepth) { gbufDSV = gbufDepth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL); gbufDepthSRV = gbufDepth->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
+// Bound the cache (main size + preview size + a little slack for drag-resize transients).
+// Eviction only drops the RefCntAutoPtrs; Diligent frees the underlying D3D12 memory after
+// the frame fence, so evicting a size used a frame ago is safe. The active set is never evicted.
+void NukeDiligent::Impl::EvictGBufferCache()
+{
+	const size_t CAP = 4;
+	while (gbufCache.size() > CAP)
+	{
+		uint64_t lruKey = 0, lru = ~0ull; bool found = false;
+		for (auto& kv : gbufCache)
+		{
+			if (kv.first == gbufCurKey) continue;   // never evict the set in use this frame
+			if (kv.second.lastUsed < lru) { lru = kv.second.lastUsed; lruKey = kv.first; found = true; }
+		}
+		if (!found) break;
+		gbufCache.erase(lruKey);
+	}
 }
 
 // G-buffer prepass pipeline: world.vs (shares worldCB) + gbuffer.ps (shares worldMatCB). Single-sample, depth

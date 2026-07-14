@@ -5,6 +5,7 @@
 #include <config.h>              // nuke::WindowMode (window display mode)
 #include <d3d12.h>
 #include <dcomp.h>               // DirectComposition (per-pixel window transparency)
+#include <cstdlib>               // std::getenv (NUKE_GPU_VALIDATION opt-in)
 
 // NUKE PATCH global (DEFINED in the vendored SwapChainD3DBase.cpp so the Diligent DLLs resolve
 // it too): true => the PRIMARY swap chain is created for DirectComposition (premultiplied
@@ -277,14 +278,19 @@ int NukeDiligent::init(const WindowDesc& desc)
 		auto* pFactory = GetEngineFactoryD3D12(); engFactory = pFactory;
 		EngineD3D12CreateInfo EngineCI;
 #ifdef _DEBUG
-		// D3D12 debug layer: validation errors (the CAUSE of a device removal) land in
-		// THIS log instead of a bare "device removed" fence assert after the fact.
-		EngineCI.SetValidationLevel(VALIDATION_LEVEL_1);
-		// DRED: when the GPU faults ASYNCHRONOUSLY (page fault mid-execution — the CPU
-		// only notices frames later, at a random fence/Close), auto-breadcrumbs record
-		// the exact command list + operation the GPU died on, and the page-fault output
-		// names the allocation. Dumped by DrainD3D12DebugMessages on removal.
+		// GPU validation + DRED are OPT-IN even in Debug: the D3D12 validation layer and DRED
+		// auto-breadcrumbs (a marker before/after every command) cost real per-command time and
+		// can HALVE the frame rate. 99% of Debug runs don't need them — enable ONLY when chasing a
+		// device-removed / GPU fault: set env NUKE_GPU_VALIDATION=1 and rerun (no rebuild). Then the
+		// actual invalid op lands in the console (DrainD3D12DebugMessages) instead of a bare fence assert.
+		const char* gpuValEnv = std::getenv("NUKE_GPU_VALIDATION");
+		if (gpuValEnv && gpuValEnv[0] && gpuValEnv[0] != '0')
 		{
+			// Validation errors (the CAUSE of a device removal) land in THIS log.
+			EngineCI.SetValidationLevel(VALIDATION_LEVEL_1);
+			// DRED: when the GPU faults ASYNCHRONOUSLY (page fault mid-execution — the CPU only
+			// notices frames later, at a random fence/Close), auto-breadcrumbs record the exact
+			// command list + operation the GPU died on, and the page-fault output names the allocation.
 			ID3D12DeviceRemovedExtendedDataSettings* dredSettings = nullptr;
 			if (SUCCEEDED(D3D12GetDebugInterface(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
 			                                     (void**)&dredSettings)) && dredSettings)
@@ -292,8 +298,8 @@ int NukeDiligent::init(const WindowDesc& desc)
 				dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
 				dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
 				dredSettings->Release();
-				cout << "[NukeDiligent]\tDRED enabled (breadcrumbs + page-fault reporting)" << endl;
 			}
+			cout << "[NukeDiligent]\tD3D12 GPU validation + DRED ENABLED (NUKE_GPU_VALIDATION) — expect lower FPS" << endl;
 		}
 #endif
 		// Editor-class descriptor budgets. The UI commits its SRB on every texture switch
@@ -483,9 +489,12 @@ int NukeDiligent::render()
 	m_impl->context->SetRenderTargets(1, &pRTV, pDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	for (auto& cb : m_impl->onGUI) cb();
 
-	m_impl->swapChain->Present();
+	m_impl->swapChain->Present(m_impl->vsync ? 1 : 0);   // SyncInterval 1 = vsync, 0 = uncapped
 	return 1;
 }
+
+void NukeDiligent::setVSync(bool on) { m_impl->vsync = on; }   // takes effect on the next Present
+bool NukeDiligent::getVSync()        { return m_impl->vsync; }
 
 void NukeDiligent::loop()
 {

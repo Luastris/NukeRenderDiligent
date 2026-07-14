@@ -69,6 +69,7 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IDeviceContext> context;
 	RefCntAutoPtr<ISwapChain>     swapChain;
 	bool                          useD3D12 = false;   // active backend (set in init from WindowDesc.backend)
+	bool                          vsync    = true;    // main-present sync interval: true = 1 (vsync), false = 0 (uncapped)
 	// DirectComposition objects for a TRANSPARENT window (per-pixel alpha to the desktop):
 	// the composition swap chain presents into this visual tree. Stored as IUnknown* so the
 	// widely-included Impl header stays free of <dcomp.h> (typed use lives in NukeDiligent.cpp).
@@ -204,6 +205,24 @@ struct NukeDiligent::Impl
 	ITextureView*                       gbufVelRTV = nullptr, *gbufVelSRV = nullptr;   // screen-space motion (TAA)
 	ITextureView*                       gbufObjIdRTV = nullptr, *gbufObjIdSRV = nullptr; // generic per-OBJECT id (pivot hash)
 	int                                 gbufW = 0, gbufH = 0;
+	// G-buffers are cached PER SIZE. The editor renders the main scene and a small
+	// selected-camera preview (different sizes) in the SAME frame; a single shared buffer
+	// used to be Release()+recreated twice every frame — a per-frame lifetime race that
+	// intermittently removed the device (GPU still reading the buffer we just freed). Now
+	// each size keeps its own persistent set and the live gbuf* members above merely point
+	// at the active one. Bounded LRU so drag-resize (many transient sizes) can't grow
+	// unbounded; eviction just drops the refs and lets Diligent's deferred release free the
+	// memory after the frame fence (safe — the active set is never evicted).
+	struct GBufferSet {
+		RefCntAutoPtr<ITexture> color, depth, vel, objId;
+		ITextureView *rtv = nullptr, *dsv = nullptr, *srv = nullptr, *depthSRV = nullptr,
+		             *velRTV = nullptr, *velSRV = nullptr, *objIdRTV = nullptr, *objIdSRV = nullptr;
+		uint64_t lastUsed = 0;
+	};
+	std::unordered_map<uint64_t, GBufferSet> gbufCache;
+	uint64_t                            gbufFrameCtr = 0;   // LRU clock
+	uint64_t                            gbufCurKey = 0;     // active set's key (never evicted)
+	void EvictGBufferCache();
 	bool                                gbufActive = false;   // a valid prepass ran for the current camera
 	RefCntAutoPtr<IPipelineState>       gbufPSO;
 	RefCntAutoPtr<IShaderResourceBinding> gbufSRB;
