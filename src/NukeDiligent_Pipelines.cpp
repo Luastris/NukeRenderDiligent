@@ -157,6 +157,7 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	CreateShadowResources();   // directional shadow map + depth PSO
 	CreateSkyResources();      // procedural sky pipeline
 	CreateDebugResources();    // debug/gizmo line pipeline
+	CreateSpriteResources();   // 2D sprite quad pipeline (SceneFmt + MSAA -> rebuild with them)
 	CreatePostResources();     // final tonemap / post-process pass
 }
 
@@ -409,6 +410,7 @@ void NukeDiligent::Impl::RebuildForMSAA()
 		BuildWorldPipe(kv.second, kv.second.vsSrc, kv.second.psSrc, kv.second.dbg.c_str());
 	CreateSkyResources();
 	CreateDebugResources();
+	CreateSpriteResources();   // sprite PSO sample count / SceneFmt depends on samples+HDR
 	BuildOutlinePipelines();
 	backbufferMS = RT{};   // recreated on next target-0 camera
 	for (auto& kv : rts)

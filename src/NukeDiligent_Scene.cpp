@@ -422,6 +422,7 @@ void NukeDiligent::Impl::DrawDebugLines(bool toBackbuffer)
 
 void NukeDiligent::endCamera()
 {
+	m_impl->FlushSprites();   // draw any pending sprite batch WHILE the (MS) camera targets are still bound
 	// 1) Resolve the multisampled HDR color into the single-sample HDR texture (post-pass input).
 	if (m_impl->curMSAA && m_impl->curResolveSrc && m_impl->curResolveDst)
 	{

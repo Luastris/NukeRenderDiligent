@@ -407,6 +407,22 @@ struct NukeDiligent::Impl
 	void CreateDebugResources();
 	void DrawDebugLines(bool toBackbuffer);
 
+	// Sprites (iRender::drawSprite): unlit textured quads, alpha-blended, drawn IN the camera pass
+	// (SceneFmt + MSAA + depth-test, no depth write). PSO depends on samples/HDR -> rebuilt with them.
+	RefCntAutoPtr<IPipelineState>         spritePSO;
+	RefCntAutoPtr<IShaderResourceBinding> spriteSRB;
+	IShaderResourceVariable*              spriteTexVar = nullptr;   // PS g_Sprite (dynamic)
+	RefCntAutoPtr<IBuffer>                spriteCB;                 // view*proj
+	RefCntAutoPtr<IBuffer>                spriteVB;                 // dynamic (grows), 9 floats/vertex
+	int                                   spriteVBSize = 0;         // VB capacity in vertices
+	// Batching: drawSprite ACCUMULATES quads and flushes ONE draw per texture run (sprites arrive
+	// pre-sorted back-to-front, so consecutive same-texture sprites merge). Flushed on texture
+	// change and at endCamera (before the MSAA resolve).
+	Texture*                              spriteBatchTex = nullptr;
+	std::vector<float>                    spriteBatchVerts;
+	void CreateSpriteResources();
+	void FlushSprites();
+
 	RefCntAutoPtr<IPipelineState>         skyPSO;
 	RefCntAutoPtr<IShaderResourceBinding> skySRB;
 	RefCntAutoPtr<IBuffer>                skyCB;
