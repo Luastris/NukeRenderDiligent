@@ -68,6 +68,11 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IRenderDevice>  device;
 	RefCntAutoPtr<IDeviceContext> context;
 	RefCntAutoPtr<ISwapChain>     swapChain;
+	// True (and logs the removal reason once) if the D3D12 device has been removed. Guard every Present/
+	// Flush with it so a device loss degrades to a skipped frame + a console reason, NOT a Diligent
+	// debug-assert crash dialog (the assert fires INSIDE Present, too late to catch otherwise).
+	bool  DeviceRemoved();
+	void* d3d12DevCache = nullptr;   // cached ID3D12Device* (void* keeps <d3d12.h> out of this header)
 	bool                          useD3D12 = false;   // active backend (set in init from WindowDesc.backend)
 	bool                          vsync    = true;    // main-present sync interval: true = 1 (vsync), false = 0 (uncapped)
 	// DirectComposition objects for a TRANSPARENT window (per-pixel alpha to the desktop):

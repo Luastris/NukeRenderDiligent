@@ -92,6 +92,20 @@ static void DrainD3D12DebugMessages(Diligent::IRenderDevice* dev, bool useD3D12)
 	seen = n;
 }
 
+bool NukeDiligent::Impl::DeviceRemoved()
+{
+	if (!useD3D12 || !device) return false;
+	if (!d3d12DevCache)
+	{
+		Diligent::RefCntAutoPtr<Diligent::IRenderDeviceD3D12> d12(device, Diligent::IID_RenderDeviceD3D12);
+		if (d12) d3d12DevCache = d12->GetD3D12Device();
+	}
+	ID3D12Device* dev = (ID3D12Device*)d3d12DevCache;
+	if (!dev || SUCCEEDED(dev->GetDeviceRemovedReason())) return false;
+	DumpDeviceRemoval(dev);   // prints reason once (+ DRED breadcrumbs when NUKE_GPU_VALIDATION is on)
+	return true;
+}
+
 static void glfw_error(int code, const char* desc)
 {
 	fprintf(stderr, "[NukeDiligent] GLFW error %d: %s\n", code, desc);
@@ -497,6 +511,7 @@ int NukeDiligent::render()
 	m_impl->context->SetRenderTargets(1, &pRTV, pDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	for (auto& cb : m_impl->onGUI) cb();
 
+	if (m_impl->DeviceRemoved()) return 1;   // device lost this frame: skip present, keep the app alive
 	m_impl->swapChain->Present(m_impl->vsync ? 1 : 0);   // SyncInterval 1 = vsync, 0 = uncapped
 	return 1;
 }

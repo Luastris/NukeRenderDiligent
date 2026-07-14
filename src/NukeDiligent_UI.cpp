@@ -208,6 +208,7 @@ void NukeDiligent::uiViewportRender(void* nativeHandle, int w, int h, const Nuke
 	// Unbind the secondary back buffer BEFORE presenting it — the state cache must not
 	// hold a presented buffer when the next frame's main passes start binding targets.
 	ctx->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
+	if (m_impl->DeviceRemoved()) return;   // don't Present on a dead device (Diligent would debug-assert)
 	sc->Present(0);   // no vsync: the main window's present already paces the frame
 }
 
