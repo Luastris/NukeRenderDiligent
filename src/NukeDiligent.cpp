@@ -284,7 +284,9 @@ int NukeDiligent::init(const WindowDesc& desc)
 		// device-removed / GPU fault: set env NUKE_GPU_VALIDATION=1 and rerun (no rebuild). Then the
 		// actual invalid op lands in the console (DrainD3D12DebugMessages) instead of a bare fence assert.
 		const char* gpuValEnv = std::getenv("NUKE_GPU_VALIDATION");
-		if (gpuValEnv && gpuValEnv[0] && gpuValEnv[0] != '0')
+		const bool  wantVal = desc.gpuValidation                                   // config/main.json (works for double-click)
+		                   || (gpuValEnv && gpuValEnv[0] && gpuValEnv[0] != '0');   // or the env var (terminal launches)
+		if (wantVal)
 		{
 			// Validation errors (the CAUSE of a device removal) land in THIS log.
 			EngineCI.SetValidationLevel(VALIDATION_LEVEL_1);

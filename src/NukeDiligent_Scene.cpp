@@ -11,7 +11,21 @@ void NukeDiligent::Impl::SetCameraViewProj(const NukeCameraDesc& cam, int w, int
 	float3 U = float3(cam.camUp[0], cam.camUp[1], cam.camUp[2]);
 	float3 R = normalize(cross(U, F)); U = cross(F, R);
 	curView = float4x4(R.x, U.x, F.x, 0.f, R.y, U.y, F.y, 0.f, R.z, U.z, F.z, 0.f, -dot(P, R), -dot(P, U), -dot(P, F), 1.f);
-	curProj = float4x4::Projection(cam.fov, aspect, cam.nearZ, cam.farZ, false);
+	// Projection: perspective, orthographic, or an element-wise blend of the two matrices (the
+	// standard perspective<->ortho tween — the engine animates cam.ortho for a smooth transition).
+	float4x4 persp = float4x4::Projection(cam.fov, aspect, cam.nearZ, cam.farZ, false);
+	if (cam.ortho <= 0.0001f)
+		curProj = persp;
+	else
+	{
+		float halfH = (cam.orthoSize > 1e-4f) ? cam.orthoSize : 1.0f;
+		float4x4 orth = float4x4::Ortho(2.0f * halfH * aspect, 2.0f * halfH, cam.nearZ, cam.farZ, false);
+		if (cam.ortho >= 0.9999f) curProj = orth;
+		else
+			for (int r = 0; r < 4; ++r)
+				for (int c = 0; c < 4; ++c)
+					curProj.m[r][c] = persp.m[r][c] * (1.0f - cam.ortho) + orth.m[r][c] * cam.ortho;
+	}
 	curCamPos[0] = P.x; curCamPos[1] = P.y; curCamPos[2] = P.z;
 }
 
