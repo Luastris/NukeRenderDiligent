@@ -52,6 +52,7 @@ add_library(NukeRenderDiligent SHARED
     src/NukeDiligent_UI.cpp
     src/NukeDiligent_RT.cpp
     src/NukeDiligent_Sprite.cpp
+    src/NukeDiligent_Decal.cpp
 )
 
 target_compile_definitions(NukeRenderDiligent PRIVATE

@@ -441,6 +441,15 @@ struct NukeDiligent::Impl
 	void FlushScreenPre();                    // at endCamera, before the MSAA resolve (into the scene target)
 	void FlushScreenPost(bool toBackbuffer);  // after post, on the final output
 
+	// Screen-space decals (iRender::drawDecal): a box volume, surface reconstructed from the gbuf depth,
+	// texture projected along the box +Z. Albedo = alpha blend, LightProjector = additive. Unit-cube VB.
+	RefCntAutoPtr<IPipelineState>         decalPSO, decalPSOAdd;
+	RefCntAutoPtr<IShaderResourceBinding> decalSRB, decalSRBAdd;
+	IShaderResourceVariable*              decalTexVar = nullptr, *decalDepthVar = nullptr;
+	IShaderResourceVariable*              decalTexVarAdd = nullptr, *decalDepthVarAdd = nullptr;
+	RefCntAutoPtr<IBuffer>                decalCB, decalVB;
+	void CreateDecalResources();
+
 	RefCntAutoPtr<IPipelineState>         skyPSO;
 	RefCntAutoPtr<IShaderResourceBinding> skySRB;
 	RefCntAutoPtr<IBuffer>                skyCB;
