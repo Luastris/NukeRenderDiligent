@@ -45,7 +45,8 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 	}
 
 	auto it = texCache.find(t);
-	if (it == texCache.end())
+	if (it != texCache.end())
+		return it->second ? it->second->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
 	{
 		RefCntAutoPtr<ITexture> tex;
 		if (t->format == Texture::FMT_BC1 || t->format == Texture::FMT_BC3 || t->format == Texture::FMT_BC5)
@@ -79,6 +80,17 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 			TextureSubResData sub; sub.pData = t->pixels.data(); sub.Stride = (Uint64)t->width * 4;
 			TextureData data; data.pSubResources = &sub; data.NumSubresources = 1;
 			device->CreateTexture(td, &data, &tex);
+		}
+		// NEVER cache a failed upload. A transient CreateTexture failure (e.g. GPU-memory pressure while a
+		// huge inspector preview is resident) would otherwise blank this texture PERMANENTLY on every
+		// consumer until the editor restarts. Return null now and retry next frame — the cache only ever
+		// holds a live SRV, so a valid texture always self-heals.
+		if (!tex)
+		{
+			std::cout << "[NukeDiligent]\tGetTexSRV upload FAILED (" << t->width << "x" << t->height
+			          << " fmt " << t->format << " mips " << t->mipCount << ", " << t->pixels.size()
+			          << " bytes) — GPU resource pressure; retrying next frame." << std::endl;
+			return nullptr;
 		}
 		it = texCache.emplace(t, tex).first;
 	}
