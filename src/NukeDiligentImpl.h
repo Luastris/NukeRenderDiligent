@@ -423,6 +423,24 @@ struct NukeDiligent::Impl
 	void CreateSpriteResources();
 	void FlushSprites();
 
+	// Screen-space (Canvas HUD) sprites — verts already in NDC, identity transform. Two queues:
+	// PRE = drawn with the scene before post (reuses spritePSO; NDC z=0 => always on top); POST =
+	// drawn on the final image after post (own output-format PSO, single-sample, no depth). Both defer
+	// their draw to a flush point, so they store per-texture RUNS (texture + vertex count) into one
+	// vertex list that the flush replays.
+	struct SprRun { Texture* tex; int count; };
+	std::vector<float>   spriteScrPreVerts;   std::vector<SprRun> spriteScrPreRuns;
+	std::vector<float>   spriteScrPostVerts;  std::vector<SprRun> spriteScrPostRuns;
+	RefCntAutoPtr<IPipelineState>         spriteScreenPSO, spriteScreenPSOBB;      // after-post: RT / backbuffer format
+	RefCntAutoPtr<IShaderResourceBinding> spriteScreenSRB, spriteScreenSRBBB;
+	IShaderResourceVariable*              spriteScreenTexVar = nullptr, *spriteScreenTexVarBB = nullptr;
+	void AppendScreenSprite(std::vector<float>& verts, std::vector<SprRun>& runs, Texture* tex,
+	                        const float rect[4], const float refSize[2], const float uv[4], const float tint[4]);
+	void FlushScreen(std::vector<float>& verts, std::vector<SprRun>& runs, IPipelineState* pso,
+	                 IShaderResourceBinding* srb, IShaderResourceVariable* texVar);
+	void FlushScreenPre();                    // at endCamera, before the MSAA resolve (into the scene target)
+	void FlushScreenPost(bool toBackbuffer);  // after post, on the final output
+
 	RefCntAutoPtr<IPipelineState>         skyPSO;
 	RefCntAutoPtr<IShaderResourceBinding> skySRB;
 	RefCntAutoPtr<IBuffer>                skyCB;

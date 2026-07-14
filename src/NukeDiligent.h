@@ -35,6 +35,8 @@ public:
 	bool getVSync() override;
 	void drawSprite(Texture* tex, const float center[3], const float right[3], const float up[3],
 	                const float uv[4], const float tint[4]) override;
+	void drawSpriteScreen(Texture* tex, const float rect[4], const float refSize[2],
+	                      const float uv[4], const float tint[4], int afterPost) override;
 	void getCursorPos(double& x, double& y) override;
 	bool isMouseButtonDown(int button) override;
 	void bindRenderTarget(uint64_t rtId) override;

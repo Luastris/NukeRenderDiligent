@@ -422,7 +422,8 @@ void NukeDiligent::Impl::DrawDebugLines(bool toBackbuffer)
 
 void NukeDiligent::endCamera()
 {
-	m_impl->FlushSprites();   // draw any pending sprite batch WHILE the (MS) camera targets are still bound
+	m_impl->FlushSprites();     // draw any pending sprite batch WHILE the (MS) camera targets are still bound
+	m_impl->FlushScreenPre();   // WithWorld screen-space canvas sprites: into the scene, before post
 	// 1) Resolve the multisampled HDR color into the single-sample HDR texture (post-pass input).
 	if (m_impl->curMSAA && m_impl->curResolveSrc && m_impl->curResolveDst)
 	{
@@ -504,6 +505,7 @@ void NukeDiligent::endCamera()
 		// TAA has no velocity for lines and the RT-reflection composite overwrites them -
 		// post-last dodges both. No depth here -> gizmos read on top (X-ray); fine for an editor.
 		m_impl->DrawDebugLines(m_impl->curTarget == 0);
+		m_impl->FlushScreenPost(m_impl->curTarget == 0);   // AfterPost screen-space canvas sprites (crisp HUD)
 	}
 
 	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
