@@ -68,6 +68,21 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IRenderDevice>  device;
 	RefCntAutoPtr<IDeviceContext> context;
 	RefCntAutoPtr<ISwapChain>     swapChain;
+
+	// ---- CENTRALIZED GPU-resource lifetime manager --------------------------------------------------
+	// THE rule: a GPU object whose raw pointer may still sit in CPU-side data (UI draw lists recorded
+	// this frame, texId handles, cached SRVs/RTVs, SRBs, BLAS geometry refs) is NEVER Release()d
+	// inline — it goes through Trash(). Trash parks a strong ref for kTrashFrames frames, so any stale
+	// pointer still dereferences a LIVE object (and its address cannot be reused by a fresh allocation
+	// while parked); Diligent then defers the underlying D3D12 memory to the frame fence. Inline
+	// releases of objects like these were the random "device removed" (ACCESS_DENIED / page fault)
+	// crashes with detached windows open. Purged once per render(); drained fully in deinit().
+	static const uint64_t kTrashFrames = 4;   // > max frames in flight + recorded-but-not-yet-drawn UI window
+	uint64_t frameId = 0;                     // advanced once at the top of render()
+	std::vector<std::pair<RefCntAutoPtr<IObject>, uint64_t>> gpuTrash;
+	std::mutex trashMutex;                    // create/destroy may arrive off the render thread
+	void Trash(IObject* o);                   // null-safe: park an object until the GPU can't see it
+	void PurgeTrash(bool everything = false); // frame tick (or full drain after IdleGPU)
 	// True (and logs the removal reason once) if the D3D12 device has been removed. Guard every Present/
 	// Flush with it so a device loss degrades to a skipped frame + a console reason, NOT a Diligent
 	// debug-assert crash dialog (the assert fires INSIDE Present, too late to catch otherwise).
@@ -126,6 +141,17 @@ struct NukeDiligent::Impl
 	};
 	std::unordered_map<uint64_t, RT> rts;
 	uint64_t rtCounter = 0;
+	void TrashRT(RT& rt);                    // park ALL of an RT's textures (before replacing it)
+
+	// Per-size transient-target cache (scratch / bloom / RT-reflection output). Several DIFFERENT-sized
+	// cameras render in one frame (viewport + camera preview + asset-editor previews) — a single shared
+	// target that was Release()+recreated on every size change was a mid-frame lifetime race (the exact
+	// intermittent device-removal class the G-buffer already got fixed for) AND an allocation storm.
+	// Same pattern as GBufferSet: keyed by (w<<32|h), bounded LRU, evictions go through Trash().
+	struct SizedTexSet { RefCntAutoPtr<ITexture> a, b; uint64_t lastUsed = 0; };
+	std::unordered_map<uint64_t, SizedTexSet> scratchCache, bloomCache, rtOutCache;
+	uint64_t sizedClock = 0;                 // shared LRU clock for the sized caches
+	void EvictSized(std::unordered_map<uint64_t, SizedTexSet>& cache, uint64_t curKey);
 
 	// --- MSAA --------------------------------------------------------------------------------------
 	Uint8 samples = 4;                 // hardware multisample count for all geometry passes (1 = off)
@@ -372,6 +398,11 @@ struct NukeDiligent::Impl
 	void WriteFrameCB(const Diligent::float3& P);   // fill worldFrameCB (lights/shadows/sky/probe) — shared by camera + cube-face passes
 	float                                 curCamPos[3] = {0, 0, 0};  // set in beginCamera (PBR view dir)
 	uint64_t                              curTarget = 0;             // RT id bound by beginCamera (feedback guard)
+	// True between beginCamera binding its targets and the END of endCamera. Sprites (world +
+	// canvas-pre) REQUIRE the camera's colour+depth targets — a sprite emitted/flushed outside a
+	// camera pass would draw into whatever is bound (e.g. a depth-less UI target: "Sprite PSO
+	// D32_FLOAT vs DSV nullptr" spam) — such calls are dropped instead.
+	bool                                  cameraPassActive = false;
 	std::vector<NukeLight>                lights;      // scene lights (setLights); empty -> default sun
 
 	// --- Shadow maps (directional + spot share a 2D array; one slice per shadow-casting light) -----

@@ -70,7 +70,11 @@ void NukeDiligent::Impl::EvictGBufferCache()
 			if (kv.second.lastUsed < lru) { lru = kv.second.lastUsed; lruKey = kv.first; found = true; }
 		}
 		if (!found) break;
-		gbufCache.erase(lruKey);
+		// Route the eviction through the trash: under a drag-resize an evicted size can have been
+		// used only a frame or two ago, and its SRVs may still sit in recorded draw data.
+		auto it = gbufCache.find(lruKey);
+		Trash(it->second.color); Trash(it->second.depth); Trash(it->second.vel); Trash(it->second.objId);
+		gbufCache.erase(it);
 	}
 }
 
@@ -162,6 +166,7 @@ void NukeDiligent::Impl::RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* ds
 	const TEXTURE_FORMAT histFmt = dstTex->GetDesc().Format;
 	if (!st.hist || st.w != w || st.h != h || st.hist->GetDesc().Format != histFmt)
 	{
+		Trash(st.hist);   // the old history may still be bound in this frame's earlier TAA pass
 		st.hist.Release();
 		TextureDesc td; td.Name = "TAA history"; td.Type = RESOURCE_DIM_TEX_2D; td.Width = (Uint32)w; td.Height = (Uint32)h;
 		td.MipLevels = 1; td.Format = histFmt; td.BindFlags = BIND_SHADER_RESOURCE | BIND_RENDER_TARGET; td.Usage = USAGE_DEFAULT;

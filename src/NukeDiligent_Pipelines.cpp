@@ -252,6 +252,7 @@ void NukeDiligent::Impl::EnsureOutlineMask(int w, int h)
 {
 	if (w <= 0 || h <= 0) return;
 	if (outlineMaskTex && outlineMaskW == w && outlineMaskH == h) return;
+	Trash(outlineMaskTex);   // this frame's earlier passes may still reference it
 	outlineMaskRTV = nullptr; outlineMaskSRV = nullptr; outlineMaskTex.Release();
 	TextureDesc td; td.Name = "Outline Mask"; td.Type = RESOURCE_DIM_TEX_2D;
 	td.Width = (Uint32)w; td.Height = (Uint32)h;
@@ -414,9 +415,19 @@ void NukeDiligent::Impl::RebuildForMSAA()
 	CreateSpriteResources();   // sprite PSO sample count / SceneFmt depends on samples+HDR
 	CreateDecalResources();    // decal PSO sample count / SceneFmt depends on samples+HDR
 	BuildOutlinePipelines();
+	TrashRT(backbufferMS);
 	backbufferMS = RT{};   // recreated on next target-0 camera
 	for (auto& kv : rts)
-		if (kv.second.w > 0 && kv.second.h > 0) kv.second = MakeRT(kv.second.w, kv.second.h);
+		if (kv.second.w > 0 && kv.second.h > 0)
+		{
+			RT old = kv.second;              // last frame's UI draw data may still be in flight
+			kv.second = MakeRT(kv.second.w, kv.second.h);
+			TrashRT(old);
+		}
+	// Every cached UI SRB keys a view that may have just been replaced — drop wholesale (parked, not
+	// freed); the cache repopulates on the next draw.
+	for (auto& kv : uiSRBCache) Trash(kv.second.srb);
+	uiSRBCache.clear();
 }
 
 uint64_t NukeDiligent::createShaderPipeline(const char* name, const char* vs, const char* ps)

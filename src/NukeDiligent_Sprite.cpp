@@ -107,6 +107,7 @@ void NukeDiligent::drawSprite(Texture* tex, const float center[3], const float r
                               const float uv[4], const float tint[4])
 {
 	if (!m_impl->spritePSO || !tex) return;
+	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw (see Impl flag)
 	if (m_impl->spriteBatchTex && tex != m_impl->spriteBatchTex) m_impl->FlushSprites();   // texture changed -> new batch
 	m_impl->spriteBatchTex = tex;
 
@@ -130,12 +131,16 @@ void NukeDiligent::drawSprite(Texture* tex, const float center[3], const float r
 void NukeDiligent::Impl::FlushSprites()
 {
 	if (!spritePSO || spriteBatchVerts.empty() || !spriteBatchTex) { spriteBatchVerts.clear(); spriteBatchTex = nullptr; return; }
+	// Outside a camera pass the bound target has no (matching) depth buffer — the sprite PSO needs
+	// D32. Drop the batch instead of spamming D3D12 with format-mismatch draws.
+	if (!cameraPassActive) { spriteBatchVerts.clear(); spriteBatchTex = nullptr; return; }
 	ITextureView* srv = GetTexSRV(spriteBatchTex);
 	if (!srv) { spriteBatchVerts.clear(); spriteBatchTex = nullptr; return; }
 
 	const int vertCount = (int)(spriteBatchVerts.size() / 9);
 	if (!spriteVB || spriteVBSize < vertCount)
 	{
+		Trash(spriteVB);   // grows mid-frame; earlier draws this frame reference the old buffer
 		spriteVB.Release();
 		while (spriteVBSize < vertCount) spriteVBSize = spriteVBSize ? spriteVBSize * 2 : 384;   // 384 = 64 quads
 		BufferDesc bd; bd.Name = "Sprite VB"; bd.BindFlags = BIND_VERTEX_BUFFER;
@@ -199,6 +204,7 @@ void NukeDiligent::Impl::FlushScreen(std::vector<float>& verts, std::vector<SprR
 	const int vertCount = (int)(verts.size() / 9);
 	if (!spriteVB || spriteVBSize < vertCount)
 	{
+		Trash(spriteVB);   // grows mid-frame; earlier draws this frame reference the old buffer
 		spriteVB.Release();
 		while (spriteVBSize < vertCount) spriteVBSize = spriteVBSize ? spriteVBSize * 2 : 384;
 		BufferDesc bd; bd.Name = "Sprite VB"; bd.BindFlags = BIND_VERTEX_BUFFER;
@@ -228,7 +234,12 @@ void NukeDiligent::Impl::FlushScreen(std::vector<float>& verts, std::vector<SprR
 }
 
 // Before-post screen sprites reuse the in-scene sprite PSO (NDC z=0 => drawn on top of the scene).
-void NukeDiligent::Impl::FlushScreenPre() { FlushScreen(spriteScrPreVerts, spriteScrPreRuns, spritePSO, spriteSRB, spriteTexVar); }
+void NukeDiligent::Impl::FlushScreenPre()
+{
+	// Pre-post canvas sprites reuse the depth-tested sprite PSO -> camera targets required.
+	if (!cameraPassActive) { spriteScrPreVerts.clear(); spriteScrPreRuns.clear(); return; }
+	FlushScreen(spriteScrPreVerts, spriteScrPreRuns, spritePSO, spriteSRB, spriteTexVar);
+}
 
 void NukeDiligent::Impl::FlushScreenPost(bool toBackbuffer)
 {

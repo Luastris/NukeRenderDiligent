@@ -277,6 +277,7 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	}
 	if (!rtv) return;
 	m_impl->curRTV = rtv; m_impl->curRTW = w; m_impl->curRTH = h;   // for the selection-outline pass
+	m_impl->cameraPassActive = true;   // sprites may draw from here until endCamera completes
 
 	IDeviceContext* ctx = m_impl->context;
 	ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -395,6 +396,7 @@ void NukeDiligent::Impl::DrawDebugLines(bool toBackbuffer)
 
 	if (!debugVB || debugVBSize < vertCount)
 	{
+		Trash(debugVB);   // grows mid-frame
 		debugVB.Release();
 		while (debugVBSize < vertCount) debugVBSize = debugVBSize ? debugVBSize * 2 : 1024;
 		BufferDesc bd; bd.Name = "Debug VB"; bd.BindFlags = BIND_VERTEX_BUFFER;
@@ -511,6 +513,7 @@ void NukeDiligent::endCamera()
 	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
 	m_impl->curPostSrc = nullptr; m_impl->curPostDst = nullptr;
 	m_impl->curTarget = 0;
+	m_impl->cameraPassActive = false;
 }
 
 void NukeDiligent::getViewProj(float* view16, float* proj16)

@@ -6,6 +6,10 @@
 void NukeDiligent::Impl::BuildCube(CubeRT& c, int res)
 {
 	res = res < 16 ? 16 : (res > 1024 ? 1024 : res);
+	// A rebuild (HDR toggle / res change) can land mid-frame while the world PSOs still sample the old
+	// cube SRV — park everything first (centralized lifetime rule).
+	Trash(c.color); Trash(c.depth); Trash(c.dsv);
+	for (auto& v : c.faceRTV) Trash(v);
 	c.color.Release(); c.depth.Release(); c.dsv.Release();
 	for (auto& v : c.faceRTV) v.Release();
 	c.srv = nullptr;

@@ -290,6 +290,7 @@ void NukeDiligent::buildRTScene()
 	if (!d->tlas || d->tlasMaxInstances < count)   // (re)create when capacity grows
 	{
 		recreated = true;
+		d->Trash(d->tlas); d->Trash(d->tlasScratch); d->Trash(d->tlasInstanceBuf);
 		d->tlas.Release(); d->tlasScratch.Release(); d->tlasInstanceBuf.Release();
 		TopLevelASDesc td; td.Name = "Scene TLAS"; td.MaxInstanceCount = count;
 		td.Flags = RAYTRACING_BUILD_AS_PREFER_FAST_TRACE | RAYTRACING_BUILD_AS_ALLOW_UPDATE;   // allow per-frame refit
@@ -330,6 +331,7 @@ void NukeDiligent::buildRTScene()
 	// Concatenated normals (immutable; rebuilt only when a new mesh appeared).
 	if (d->allNrmDirty && !d->allNrmCPU.empty())
 	{
+		d->Trash(d->rtNrmBuf);
 		d->rtNrmBuf.Release(); d->rtNrmSRV = nullptr;
 		BufferDesc bd; bd.Name = "RT Normals"; bd.Usage = USAGE_IMMUTABLE; bd.BindFlags = BIND_SHADER_RESOURCE;
 		bd.Mode = BUFFER_MODE_RAW; bd.Size = (Uint64)d->allNrmCPU.size() * sizeof(float);
@@ -337,6 +339,7 @@ void NukeDiligent::buildRTScene()
 		d->device->CreateBuffer(bd, &bdat, &d->rtNrmBuf);
 		if (d->rtNrmBuf) d->rtNrmSRV = d->rtNrmBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE);
 
+		d->Trash(d->rtUVBuf);
 		d->rtUVBuf.Release(); d->rtUVSRV = nullptr;
 		if (!d->allUVCPU.empty())
 		{
@@ -347,6 +350,7 @@ void NukeDiligent::buildRTScene()
 			if (d->rtUVBuf) d->rtUVSRV = d->rtUVBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE);
 		}
 
+		d->Trash(d->rtPosBuf);
 		d->rtPosBuf.Release(); d->rtPosSRV = nullptr;
 		if (!d->allPosCPU.empty())
 		{
@@ -361,6 +365,7 @@ void NukeDiligent::buildRTScene()
 	// Per-instance data (rebuilt each frame; grows capacity as needed).
 	if (!d->rtInstBuf || d->rtInstCapacity < count)
 	{
+		d->Trash(d->rtInstBuf);
 		d->rtInstBuf.Release(); d->rtInstSRV = nullptr; d->rtInstCapacity = count;
 		BufferDesc bd; bd.Name = "RT Instances"; bd.Usage = USAGE_DEFAULT; bd.BindFlags = BIND_SHADER_RESOURCE;
 		bd.Mode = BUFFER_MODE_STRUCTURED; bd.ElementByteStride = sizeof(Impl::RTInstanceData);
@@ -377,6 +382,7 @@ void NukeDiligent::buildRTScene()
 	{
 		if (!d->rtMatBuf || d->rtMatCapacity < (uint32_t)d->allMatCPU.size())
 		{
+			d->Trash(d->rtMatBuf);
 			d->rtMatBuf.Release(); d->rtMatSRV = nullptr; d->rtMatCapacity = (uint32_t)d->allMatCPU.size();
 			BufferDesc bd; bd.Name = "RT MatBytes"; bd.Usage = USAGE_DEFAULT; bd.BindFlags = BIND_SHADER_RESOURCE;
 			bd.Mode = BUFFER_MODE_RAW; bd.Size = (Uint64)d->allMatCPU.size();
@@ -492,11 +498,21 @@ void NukeDiligent::Impl::EnsureRTOutput(int w, int h)
 {
 	if (w <= 0 || h <= 0) return;
 	if (rtOutTex && rtOutW == w && rtOutH == h) return;
-	rtOutW = w; rtOutH = h; rtOutTex.Release();
-	TextureDesc td; td.Name = "RT Reflect Output"; td.Type = RESOURCE_DIM_TEX_2D;
-	td.Width = (Uint32)w; td.Height = (Uint32)h; td.Format = HDR_FMT;
-	td.BindFlags = BIND_UNORDERED_ACCESS | BIND_SHADER_RESOURCE;
-	device->CreateTexture(td, nullptr, &rtOutTex);
+	// Per-size cache: two RTX cameras of different sizes in one frame must not release + recreate a
+	// shared UAV mid-frame (lifetime race + churn) — same pattern as the G-buffer / scratch caches.
+	const uint64_t key = ((uint64_t)(uint32_t)w << 32) | (uint32_t)h;
+	SizedTexSet& s = rtOutCache[key];
+	if (!s.a)
+	{
+		TextureDesc td; td.Name = "RT Reflect Output"; td.Type = RESOURCE_DIM_TEX_2D;
+		td.Width = (Uint32)w; td.Height = (Uint32)h; td.Format = HDR_FMT;
+		td.BindFlags = BIND_UNORDERED_ACCESS | BIND_SHADER_RESOURCE;
+		device->CreateTexture(td, nullptr, &s.a);
+	}
+	rtOutTex = s.a;
+	rtOutW = w; rtOutH = h;
+	s.lastUsed = ++sizedClock;
+	EvictSized(rtOutCache, key);
 }
 
 void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params)
@@ -506,7 +522,16 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	// BOUND render target makes Diligent auto-unbind with an Info nag every frame ("Texture
 	// 'Post Scratch' is currently bound as render target...") — unbind explicitly, silently.
 	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
-	if (rtPipelineDirty) BuildRTPipeline();   // a custom shader appeared/changed -> rebuild with its hit group
+	if (rtPipelineDirty)
+	{
+		BuildRTPipeline();   // a custom shader appeared/changed -> rebuild with its hit group
+		// The FIRST ray-traced frame otherwise lands in ONE giant command list: every BLAS build,
+		// the TLAS, a cold-compiled DXR PSO and TraceRays on top of the whole scene pass. That
+		// single submission intermittently starves the frame waitable ("Timeout elapsed ..." every
+		// frame -> the editor hangs at boot) or trips the TDR (device removed). Submit everything
+		// recorded so far — the GPU starts executing the AS builds while the rest is recorded.
+		context->Flush();
+	}
 	// No scene to trace (no opaque meshes) -> pass the chain colour through unchanged.
 	// BlitTexture, NOT CopyTexture: on the FIRST chain stage the source is the SCENE
 	// color (RGBA8 with HDR off) while the destination is the RGBA16F chain scratch —

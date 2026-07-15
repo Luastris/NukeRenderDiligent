@@ -239,6 +239,12 @@ int NukeDiligent::init(const WindowDesc& desc)
 	const char*  title   = (desc.title && desc.title[0]) ? desc.title : "NukeEngine";
 	m_window = glfwCreateWindow(w, h, title, nullptr, nullptr);
 	if (!m_window) { cout << "[NukeDiligent]\tglfwCreateWindow failed" << endl; glfwTerminate(); return 1; }
+	// GLFW window hints are STICKY (process-global). Reset transparency IMMEDIATELY: every window
+	// created later through this GLFW instance (ImGui multi-viewport secondary windows) would
+	// inherit it — and our patched GLFW gives transparent windows WS_EX_NOREDIRECTIONBITMAP, on
+	// which an ordinary HWND swap chain's Present fails with DXGI_ERROR_ACCESS_DENIED and REMOVES
+	// THE DEVICE (the "opening any detached window crashes" bug when the config was transparent).
+	glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, GLFW_FALSE);
 
 	glfwSetWindowUserPointer(m_window, this);
 	glfwSetCursorPosCallback(m_window, cb_cursorpos);
@@ -434,6 +440,22 @@ int NukeDiligent::render()
 	DrainD3D12DebugMessages(m_impl->device, m_impl->useD3D12);   // real validation errors -> console
 #endif
 
+	// A removed device can't run ANY of the frame below — mapping/creating on it just cascades
+	// ("Failed to create dynamic page", "Buffer already mapped" asserts). Suspend rendering
+	// entirely (events still pump, the reason was already printed once) so the process stays
+	// alive and the console keeps the REAL cause on top instead of post-mortem noise.
+	if (m_impl->DeviceRemoved())
+	{
+		static bool said = false;
+		if (!said) { said = true; cout << "[NukeDiligent]\trendering SUSPENDED (device removed — see the report above)" << endl; }
+		return 1;
+	}
+
+	// Centralized GPU lifetime: advance the frame clock and free trash old enough that no in-flight
+	// command list or recorded draw data can still reference it.
+	++m_impl->frameId;
+	m_impl->PurgeTrash();
+
 	// Frame stats: latch the completed frame's counters for getFrameStats, start fresh.
 	m_impl->statDrawsOut = m_impl->statDraws;
 	m_impl->statTrisOut  = m_impl->statTris;
@@ -538,6 +560,13 @@ void NukeDiligent::requestClose()
 void NukeDiligent::deinit()
 {
 	for (auto& cb : m_impl->onClose) cb();
+	// Drain the GPU trash AFTER the queue settles — parked objects must not outlive the device.
+	if (m_impl->context && m_impl->device)
+	{
+		m_impl->context->Flush();
+		m_impl->device->IdleGPU();
+	}
+	m_impl->PurgeTrash(true);
 	// DirectComposition (transparent window): release visual -> target -> device before the
 	// swap chain they reference.
 	if (m_impl->dcompVisual) { m_impl->dcompVisual->Release(); m_impl->dcompVisual = nullptr; }

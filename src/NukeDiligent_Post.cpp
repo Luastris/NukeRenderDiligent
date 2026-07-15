@@ -341,32 +341,51 @@ void NukeDiligent::Impl::BlitTexture(ITextureView* srcSRV, ITexture* dstTex)
 	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 }
 
+// Per-size cache (G-buffer pattern): several DIFFERENT-sized chain cameras render in ONE frame
+// (viewport + camera preview + asset previews). Releasing + recreating one shared pair on every size
+// change was a mid-frame lifetime race (intermittent device removal) and an allocation storm.
 void NukeDiligent::Impl::EnsureScratch(int w, int h)
 {
 	if (w <= 0 || h <= 0) return;
 	if (scratch[0] && scratchW == w && scratchH == h) return;
-	scratchW = w; scratchH = h;
+	const uint64_t key = ((uint64_t)(uint32_t)w << 32) | (uint32_t)h;
+	SizedTexSet& s = scratchCache[key];
 	for (int i = 0; i < 2; ++i)
 	{
-		scratch[i].Release();
-		TextureDesc td; td.Name = "Post Scratch"; td.Type = RESOURCE_DIM_TEX_2D; td.Width = (Uint32)w; td.Height = (Uint32)h;
-		td.Format = HDR_FMT; td.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
-		device->CreateTexture(td, nullptr, &scratch[i]);
+		RefCntAutoPtr<ITexture>& t = i ? s.b : s.a;
+		if (!t)
+		{
+			TextureDesc td; td.Name = "Post Scratch"; td.Type = RESOURCE_DIM_TEX_2D; td.Width = (Uint32)w; td.Height = (Uint32)h;
+			td.Format = HDR_FMT; td.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+			device->CreateTexture(td, nullptr, &t);
+		}
+		scratch[i] = t;
 	}
+	s.lastUsed = ++sizedClock;
+	scratchW = w; scratchH = h;
+	EvictSized(scratchCache, key);
 }
 
 void NukeDiligent::Impl::EnsureBloom(int w, int h)
 {
 	int bw = w > 1 ? w / 2 : 1, bh = h > 1 ? h / 2 : 1;
 	if (bloomTex[0] && bloomW == bw && bloomH == bh) return;
-	bloomW = bw; bloomH = bh;
+	const uint64_t key = ((uint64_t)(uint32_t)bw << 32) | (uint32_t)bh;
+	SizedTexSet& s = bloomCache[key];
 	for (int i = 0; i < 2; ++i)
 	{
-		bloomTex[i].Release();
-		TextureDesc td; td.Name = "Bloom"; td.Type = RESOURCE_DIM_TEX_2D; td.Width = (Uint32)bw; td.Height = (Uint32)bh;
-		td.Format = HDR_FMT; td.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
-		device->CreateTexture(td, nullptr, &bloomTex[i]);
+		RefCntAutoPtr<ITexture>& t = i ? s.b : s.a;
+		if (!t)
+		{
+			TextureDesc td; td.Name = "Bloom"; td.Type = RESOURCE_DIM_TEX_2D; td.Width = (Uint32)bw; td.Height = (Uint32)bh;
+			td.Format = HDR_FMT; td.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+			device->CreateTexture(td, nullptr, &t);
+		}
+		bloomTex[i] = t;
 	}
+	s.lastUsed = ++sizedClock;
+	bloomW = bw; bloomH = bh;
+	EvictSized(bloomCache, key);
 }
 
 // Built-in bloom: bright-pass (-> half-res A) -> separable blur (A<->B, a few iterations) -> composite

@@ -35,6 +35,7 @@ void NukeDiligent::Impl::DrawUILists(ITextureView* uirtv, Uint32 surfW, Uint32 s
 
 	if (!uiVB || uiVBSize < totalVtx)
 	{
+		Trash(uiVB);   // grows MID-FRAME (main window drew, a bigger secondary window follows)
 		uiVB.Release();
 		while (uiVBSize < totalVtx) uiVBSize = uiVBSize ? uiVBSize * 2 : 4096;
 		BufferDesc bd;
@@ -44,6 +45,7 @@ void NukeDiligent::Impl::DrawUILists(ITextureView* uirtv, Uint32 surfW, Uint32 s
 	}
 	if (!uiIB || uiIBSize < totalIdx)
 	{
+		Trash(uiIB);
 		uiIB.Release();
 		while (uiIBSize < totalIdx) uiIBSize = uiIBSize ? uiIBSize * 2 : 8192;
 		BufferDesc bd;
@@ -130,11 +132,12 @@ void NukeDiligent::Impl::DrawUILists(ITextureView* uirtv, Uint32 surfW, Uint32 s
 	}
 
 	// LRU purge: drop SRBs of textures not drawn for a while (resized RTs leave stale
-	// views behind — the SRB's strong ref must not keep them alive forever).
+	// views behind — the SRB's strong ref must not keep them alive forever). Parked, not
+	// freed inline (centralized lifetime rule).
 	if ((uiFrame & 511) == 0)
 		for (auto it = uiSRBCache.begin(); it != uiSRBCache.end(); )
 		{
-			if (uiFrame - it->second.lastUse > 512) it = uiSRBCache.erase(it);
+			if (uiFrame - it->second.lastUse > 512) { Trash(it->second.srb); it = uiSRBCache.erase(it); }
 			else ++it;
 		}
 }

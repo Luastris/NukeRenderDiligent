@@ -1,6 +1,43 @@
 #include "NukeDiligentImpl.h"
 
 
+// ---- centralized GPU-resource lifetime manager (see the header block for THE rule) ----------------
+void NukeDiligent::Impl::Trash(IObject* o)
+{
+	if (!o) return;
+	std::lock_guard<std::mutex> lk(trashMutex);
+	gpuTrash.emplace_back(RefCntAutoPtr<IObject>(o), frameId);
+}
+void NukeDiligent::Impl::TrashRT(RT& rt)
+{
+	Trash(rt.color); Trash(rt.colorMS); Trash(rt.depth); Trash(rt.depthMS); Trash(rt.post);
+}
+void NukeDiligent::Impl::PurgeTrash(bool everything)
+{
+	std::lock_guard<std::mutex> lk(trashMutex);
+	if (everything) { gpuTrash.clear(); return; }
+	gpuTrash.erase(std::remove_if(gpuTrash.begin(), gpuTrash.end(),
+		[&](const std::pair<RefCntAutoPtr<IObject>, uint64_t>& e) { return frameId - e.second > kTrashFrames; }),
+		gpuTrash.end());
+}
+void NukeDiligent::Impl::EvictSized(std::unordered_map<uint64_t, SizedTexSet>& cache, uint64_t curKey)
+{
+	const size_t CAP = 6;   // main + previews + drag-resize transient slack
+	while (cache.size() > CAP)
+	{
+		uint64_t lruKey = 0, lru = ~0ull; bool found = false;
+		for (auto& kv : cache)
+		{
+			if (kv.first == curKey) continue;   // never evict the set in use this frame
+			if (kv.second.lastUsed < lru) { lru = kv.second.lastUsed; lruKey = kv.first; found = true; }
+		}
+		if (!found) break;
+		auto it = cache.find(lruKey);
+		Trash(it->second.a); Trash(it->second.b);   // may have been used < kTrashFrames ago (drag-resize)
+		cache.erase(it);
+	}
+}
+
 ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 {
 	if (!t) return nullptr;
@@ -144,6 +181,7 @@ void NukeDiligent::Impl::EnsureBackbufferMS(int w, int h)
 {
 	if (w <= 0 || h <= 0) return;
 	if (backbufferMS.color && backbufferMS.w == w && backbufferMS.h == h) return;
+	TrashRT(backbufferMS);   // a window-resize replaces it mid-loop; the old targets may be in flight
 	backbufferMS = MakeRT(w, h);
 }
 
@@ -182,7 +220,10 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 	{
 		if (g.numVerts != mesh->numVerts)   // topology changed: rebuild from scratch
 		{
+			Trash(g.pos); Trash(g.nrm); Trash(g.uv);   // this frame's earlier draws may reference them
 			meshCache.erase(it);
+			auto bit = blasCache.find(mesh);           // BLAS built over the OLD pos buffer -> stale + dangling
+			if (bit != blasCache.end()) { Trash(bit->second); blasCache.erase(bit); }
 			return GetMeshGPU(mesh);
 		}
 		const Uint64 sz3 = (Uint64)mesh->numVerts * 3 * sizeof(float);
@@ -199,12 +240,34 @@ void NukeDiligent::bindRenderTarget(uint64_t id)
 	if (it == m_impl->rts.end()) { m_impl->uiRTV = nullptr; m_impl->uiTW = m_impl->uiTH = 0; return; }
 	m_impl->uiRTV = it->second.rtv; m_impl->uiTW = (Uint32)it->second.w; m_impl->uiTH = (Uint32)it->second.h;
 }
-void NukeDiligent::invalidateTexture(Texture* t) { if (t) m_impl->texCache.erase(t); }   // re-uploaded on next GetTexSRV
+void NukeDiligent::invalidateTexture(Texture* t)   // re-uploaded on next GetTexSRV
+{
+	if (!t) return;
+	// The old SRV pointer may still sit in UI draw data recorded this frame (thumbnails, GUI images)
+	// and in per-frame bindless tables — park, don't free inline.
+	auto it = m_impl->texCache.find(t);
+	if (it != m_impl->texCache.end()) { m_impl->Trash(it->second); m_impl->texCache.erase(it); }
+	auto at = m_impl->animTex.find(t);
+	if (at != m_impl->animTex.end())
+	{
+		for (auto& f : at->second) m_impl->Trash(f);
+		m_impl->animTex.erase(at);
+	}
+}
 
 void NukeDiligent::invalidateMesh(Mesh* m)
 {
 	if (!m) return;
-	m_impl->meshCache.erase(m);   // buffers are ref-counted; Diligent releases them GPU-safely
+	auto it = m_impl->meshCache.find(m);
+	if (it != m_impl->meshCache.end())
+	{
+		m_impl->Trash(it->second.pos); m_impl->Trash(it->second.nrm); m_impl->Trash(it->second.uv);
+		m_impl->meshCache.erase(it);
+	}
+	// The BLAS references the OLD pos buffer's GPU memory — after the buffers go, a cached BLAS would
+	// make the TLAS trace freed memory (device removed). Rebuilt lazily from the new buffers.
+	auto bit = m_impl->blasCache.find(m);
+	if (bit != m_impl->blasCache.end()) { m_impl->Trash(bit->second); m_impl->blasCache.erase(bit); }
 }
 
 // ---- Neutral UI seam: generic 2D draw (no ImGui types) ----
@@ -240,8 +303,12 @@ uint64_t NukeDiligent::createTexture2D(const void* rgba, int width, int height)
 
 void NukeDiligent::destroyTexture2D(uint64_t handle)
 {
-	m_impl->uiSRBCache.erase(reinterpret_cast<ITextureView*>(handle));   // drop its cached SRB too
-	m_impl->textures.erase(handle);
+	// Centralized lifetime: the view pointer may still sit in UI draw data recorded this frame (any
+	// window, incl. detached OS viewports) — park the texture + its cached SRB, never free inline.
+	auto sit = m_impl->uiSRBCache.find(reinterpret_cast<ITextureView*>(handle));
+	if (sit != m_impl->uiSRBCache.end()) { m_impl->Trash(sit->second.srb); m_impl->uiSRBCache.erase(sit); }
+	auto it = m_impl->textures.find(handle);
+	if (it != m_impl->textures.end()) { m_impl->Trash(it->second); m_impl->textures.erase(it); }
 }
 
 uint64_t NukeDiligent::createRenderTarget(int w, int h)
@@ -258,7 +325,14 @@ void NukeDiligent::resizeRenderTarget(uint64_t id, int w, int h)
 	auto it = m_impl->rts.find(id);
 	if (it == m_impl->rts.end()) return;
 	if (it->second.w == w && it->second.h == h) return;
+	// Resize happens MID-FRAME (a panel resizing during the UI pass): the old post SRV may already be
+	// recorded in this frame's draw lists, and this frame's world pass wrote into the old RTV. Park
+	// everything; drop the old SRV's cached UI SRB (keyed by the now-parked view pointer).
+	Impl::RT old = it->second;
+	auto sit = m_impl->uiSRBCache.find(old.srv);
+	if (sit != m_impl->uiSRBCache.end()) { m_impl->Trash(sit->second.srb); m_impl->uiSRBCache.erase(sit); }
 	it->second = m_impl->MakeRT(w, h);
+	m_impl->TrashRT(old);
 }
 
 uint64_t NukeDiligent::getRenderTargetTexture(uint64_t id)
