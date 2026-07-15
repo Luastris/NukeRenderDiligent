@@ -471,7 +471,8 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IShaderResourceBinding> spriteScreenSRB, spriteScreenSRBBB;
 	IShaderResourceVariable*              spriteScreenTexVar = nullptr, *spriteScreenTexVarBB = nullptr;
 	void AppendScreenSprite(std::vector<float>& verts, std::vector<SprRun>& runs, Texture* tex,
-	                        const float rect[4], const float refSize[2], const float uv[4], const float tint[4]);
+	                        const float rect[4], const float refSize[2], const float uv[4], const float tint[4],
+	                        int scaleMode = 0);   // 0 Fit / 1 Stretch / 2 Expand / 3 FitWidth / 4 FitHeight
 	void FlushScreen(std::vector<float>& verts, std::vector<SprRun>& runs, IPipelineState* pso,
 	                 IShaderResourceBinding* srb, IShaderResourceVariable* texVar);
 	void FlushScreenPre();                    // at endCamera, before the MSAA resolve (into the scene target)
@@ -539,8 +540,15 @@ struct NukeDiligent::Impl
 	void EnsureOutlineMask(int w, int h);
 
 	// UI multi-viewport: one swap chain per detached OS window (keyed by native handle,
-	// HWND on Windows). Created lazily in uiViewportRender, dropped in uiViewportDestroy.
+	// HWND on Windows). Swap-chain CREATION/RESIZE/DESTRUCTION never happens mid-frame —
+	// uiViewportRender/Destroy only QUEUE the request and render() applies them at the top
+	// of the next frame, when nothing is recorded (creating or resizing a DXGI swap chain
+	// between passes under heavy GPU load intermittently wedged the queue: endless "Timeout
+	// elapsed while waiting for the frame waitable object"). Destruction parks the swap
+	// chain in the GPU trash instead of a mid-frame IdleGPU.
 	std::map<void*, RefCntAutoPtr<ISwapChain>> uiVpSC;
+	std::map<void*, std::pair<int, int>>       uiVpPending;   // create/resize requests (handle -> size)
+	void ApplyPendingViewportOps();                            // render() top: create/resize queued swap chains
 	// Shared UI draw body (renderDrawLists + secondary viewports draw with it).
 	void DrawUILists(ITextureView* rtv, Uint32 surfW, Uint32 surfH, const NukeUIDrawData& data);
 

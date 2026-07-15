@@ -33,16 +33,28 @@ static void DumpDeviceRemoval(ID3D12Device* d3dDev)
 	{
 		D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
 		if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc)))
+		{
+			// Removals that aren't a classic page fault (e.g. ACCESS_DENIED) often leave every
+			// list either untouched or fully completed — the old mid-list-only filter printed
+			// NOTHING for those ("empty report"). Print one line per list so the state right
+			// before the removal is always visible; mid-list ones are the actual suspects.
+			int lists = 0;
 			for (const D3D12_AUTO_BREADCRUMB_NODE* n = bc.pHeadAutoBreadcrumbNode; n; n = n->pNext)
 			{
+				++lists;
 				const UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
-				if (done == 0 || done == n->BreadcrumbCount) continue;   // untouched or fully completed list
-				std::cout << "[D3D12] FAULTING command list '"
+				const bool midList = done != 0 && done != n->BreadcrumbCount;
+				std::cout << "[D3D12] command list '"
 				          << (n->pCommandListDebugNameA ? n->pCommandListDebugNameA : "?")
-				          << "' stopped at op " << done << "/" << n->BreadcrumbCount
-				          << ", breadcrumb op id=" << (n->pCommandHistory ? (int)n->pCommandHistory[done] : -1)
+				          << (done == 0 ? "' not started " : midList ? "' STOPPED MID-LIST (fault suspect) at " : "' completed ")
+				          << done << "/" << n->BreadcrumbCount
+				          << ", last op id=" << (n->pCommandHistory && n->BreadcrumbCount
+				                                 ? (int)n->pCommandHistory[done ? done - 1 : 0] : -1)
 				          << " (2=Draw 3=DrawIndexed 4=ExecuteIndirect 8=CopyResource 13=Dispatch 27=DispatchRays 30=BuildRaytracingAS)" << std::endl;
 			}
+			if (lists == 0)
+				std::cout << "[D3D12] no DRED breadcrumbs recorded (arm with NUKE_DRED=1)" << std::endl;
+		}
 		D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
 		if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) && pf.PageFaultVA)
 		{
@@ -310,9 +322,16 @@ int NukeDiligent::init(const WindowDesc& desc)
 		{
 			// Validation errors (the CAUSE of a device removal) land in THIS log.
 			EngineCI.SetValidationLevel(VALIDATION_LEVEL_1);
-			// DRED: when the GPU faults ASYNCHRONOUSLY (page fault mid-execution — the CPU only
-			// notices frames later, at a random fence/Close), auto-breadcrumbs record the exact
-			// command list + operation the GPU died on, and the page-fault output names the allocation.
+			cout << "[NukeDiligent]\tD3D12 debug layer ENABLED (gpuValidation) — expect lower FPS" << endl;
+		}
+		// DRED is a SEPARATE opt-in (env NUKE_DRED=1): its auto-breadcrumbs instrument EVERY command
+		// list — and instrumented DXR dispatches (TraceRays / AS builds) intermittently wedge the
+		// queue or remove the device with DXGI_ERROR_ACCESS_DENIED on some drivers (seen on RTX 50xx:
+		// random first-RT-frame removals with an EMPTY DRED report and zero validation messages).
+		// Never tie it to gpuValidation — enable it only when hunting an actual GPU fault.
+		const char* dredEnv = std::getenv("NUKE_DRED");
+		if (dredEnv && dredEnv[0] && dredEnv[0] != '0')
+		{
 			ID3D12DeviceRemovedExtendedDataSettings* dredSettings = nullptr;
 			if (SUCCEEDED(D3D12GetDebugInterface(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
 			                                     (void**)&dredSettings)) && dredSettings)
@@ -321,7 +340,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 				dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
 				dredSettings->Release();
 			}
-			cout << "[NukeDiligent]\tD3D12 GPU validation + DRED ENABLED (NUKE_GPU_VALIDATION) — expect lower FPS" << endl;
+			cout << "[NukeDiligent]\tDRED ENABLED (NUKE_DRED) — breadcrumb instrumentation on every command list" << endl;
 		}
 #endif
 		// Editor-class descriptor budgets. The UI commits its SRB on every texture switch
@@ -455,6 +474,9 @@ int NukeDiligent::render()
 	// command list or recorded draw data can still reference it.
 	++m_impl->frameId;
 	m_impl->PurgeTrash();
+	// Secondary-window swap chains: apply queued creations/resizes NOW, before anything is
+	// recorded — doing it mid-frame under load intermittently wedged the queue.
+	m_impl->ApplyPendingViewportOps();
 
 	// Frame stats: latch the completed frame's counters for getFrameStats, start fresh.
 	m_impl->statDrawsOut = m_impl->statDraws;

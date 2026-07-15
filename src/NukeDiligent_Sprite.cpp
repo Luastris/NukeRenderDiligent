@@ -169,20 +169,39 @@ void NukeDiligent::drawSpriteScreen(Texture* tex, const float rect[4], const flo
                                     const float uv[4], const float tint[4], int afterPost)
 {
 	if (!tex) return;
-	if (afterPost) m_impl->AppendScreenSprite(m_impl->spriteScrPostVerts, m_impl->spriteScrPostRuns, tex, rect, refSize, uv, tint);
-	else           m_impl->AppendScreenSprite(m_impl->spriteScrPreVerts,  m_impl->spriteScrPreRuns,  tex, rect, refSize, uv, tint);
+	drawSpriteScreenEx(tex, rect, refSize, uv, tint, afterPost, 0);
 }
 
-// Build one NDC quad from a reference-pixel rect (centre + size), fit-scaled to the current target,
-// and append it (+ a per-texture run marker) to a screen batch.
+void NukeDiligent::drawSpriteScreenEx(Texture* tex, const float rect[4], const float refSize[2],
+                                      const float uv[4], const float tint[4], int afterPost, int scaleMode)
+{
+	if (!tex) return;
+	if (!m_impl->cameraPassActive) return;   // canvas sprites need the camera targets (see Impl flag)
+	if (afterPost) m_impl->AppendScreenSprite(m_impl->spriteScrPostVerts, m_impl->spriteScrPostRuns, tex, rect, refSize, uv, tint, scaleMode);
+	else           m_impl->AppendScreenSprite(m_impl->spriteScrPreVerts,  m_impl->spriteScrPreRuns,  tex, rect, refSize, uv, tint, scaleMode);
+}
+
+// Build one NDC quad from a reference-pixel rect (centre + size), mapped to the current target per
+// the canvas scale mode, and append it (+ a per-texture run marker) to a screen batch.
 void NukeDiligent::Impl::AppendScreenSprite(std::vector<float>& verts, std::vector<SprRun>& runs, Texture* tex,
-                                            const float rect[4], const float refSize[2], const float uv[4], const float tint[4])
+                                            const float rect[4], const float refSize[2], const float uv[4], const float tint[4],
+                                            int scaleMode)
 {
 	const float tw = (float)(curRTW > 0 ? curRTW : 1), th = (float)(curRTH > 0 ? curRTH : 1);
 	const float refW = refSize[0] > 1.f ? refSize[0] : 1.f, refH = refSize[1] > 1.f ? refSize[1] : 1.f;
-	float scale = tw / refW; { float sh = th / refH; if (sh < scale) scale = sh; }   // fit (uniform, letterboxed)
-	const float cx = rect[0] * scale / (tw * 0.5f), cy = rect[1] * scale / (th * 0.5f);
-	const float hw = rect[2] * 0.5f * scale / (tw * 0.5f), hh = rect[3] * 0.5f * scale / (th * 0.5f);
+	const float sw = tw / refW, sh = th / refH;   // per-axis reference->target scale
+	float sx, sy;
+	switch (scaleMode)
+	{
+		default:
+		case 0: sx = sy = (sh < sw ? sh : sw); break;   // Fit: uniform, whole canvas visible (letterboxed)
+		case 1: sx = sw; sy = sh;              break;   // Stretch: canvas corners = screen corners
+		case 2: sx = sy = (sh > sw ? sh : sw); break;   // Expand: uniform, covers the screen (may crop)
+		case 3: sx = sy = sw;                  break;   // FitWidth
+		case 4: sx = sy = sh;                  break;   // FitHeight
+	}
+	const float cx = rect[0] * sx / (tw * 0.5f), cy = rect[1] * sy / (th * 0.5f);
+	const float hw = rect[2] * 0.5f * sx / (tw * 0.5f), hh = rect[3] * 0.5f * sy / (th * 0.5f);
 	const float u0 = uv[0], v0 = uv[1], u1 = uv[2], v1 = uv[3];
 	auto push = [&](float x, float y, float u, float vv)
 	{

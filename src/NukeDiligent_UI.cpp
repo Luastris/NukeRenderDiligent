@@ -159,49 +159,64 @@ void* NukeDiligent::nativeWindow()
 	return m_window;
 }
 
+// Applied at the TOP of render(), before anything is recorded: create queued swap chains and
+// resize mismatched ones. Never mid-frame — see the Impl field comment.
+void NukeDiligent::Impl::ApplyPendingViewportOps()
+{
+	if (uiVpPending.empty() || !device) return;
+	for (auto& kv : uiVpPending)
+	{
+		void* handle = kv.first;
+		const int w = kv.second.first, h = kv.second.second;
+		if (w < 8 || h < 8) continue;
+		RefCntAutoPtr<ISwapChain>& sc = uiVpSC[handle];
+		if (!sc)
+		{
+			// Same color format as the main swap chain (the UI PSO was built for it);
+			// no depth — the UI never depth-tests.
+			SwapChainDesc scd;
+			scd.ColorBufferFormat = swapChain->GetDesc().ColorBufferFormat;
+			scd.DepthBufferFormat = TEX_FORMAT_UNKNOWN;
+			scd.Width = (Uint32)w; scd.Height = (Uint32)h;
+			// THE ROOT of two weeks of "device removed" asserts: SwapChainDesc defaults to
+			// IsPrimary = true, and a PRIMARY swap chain's Present() runs FinishFrame() +
+			// ReleaseStaleResources() — with a secondary window open that happened TWICE per
+			// frame, corrupting the frame-resource lifetime bookkeeping. Secondary windows
+			// are NOT primary.
+			scd.IsPrimary = False;
+			Win32NativeWindow win{ handle };
+			if (useD3D12)
+				GetEngineFactoryD3D12()->CreateSwapChainD3D12(device, context, scd, FullScreenModeDesc{}, win, &sc);
+			else
+				GetEngineFactoryD3D11()->CreateSwapChainD3D11(device, context, scd, FullScreenModeDesc{}, win, &sc);
+			if (!sc) uiVpSC.erase(handle);
+		}
+		else if ((int)sc->GetDesc().Width != w || (int)sc->GetDesc().Height != h)
+		{
+			// Resize needs the back buffers UNBOUND and NOT referenced by in-flight GPU
+			// work. At frame start nothing is recorded yet — idle covers previous frames.
+			context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
+			context->Flush();
+			device->IdleGPU();
+			sc->Resize((Uint32)w, (Uint32)h);
+		}
+	}
+	uiVpPending.clear();
+}
+
 void NukeDiligent::uiViewportRender(void* nativeHandle, int w, int h, const NukeUIDrawData& data)
 {
 	// Degenerate sizes come through while a window is minimizing/restoring — presenting
 	// or resizing then can remove the D3D12 device. Sit those frames out.
 	if (!nativeHandle || w < 8 || h < 8 || !m_impl->device) return;
 
-	RefCntAutoPtr<ISwapChain>& sc = m_impl->uiVpSC[nativeHandle];
-	if (!sc)
-	{
-		// Same color format as the main swap chain (the UI PSO was built for it);
-		// no depth — the UI never depth-tests.
-		SwapChainDesc scd;
-		scd.ColorBufferFormat = m_impl->swapChain->GetDesc().ColorBufferFormat;
-		scd.DepthBufferFormat = TEX_FORMAT_UNKNOWN;
-		scd.Width = (Uint32)w; scd.Height = (Uint32)h;
-		// THE ROOT of two weeks of "device removed" asserts: SwapChainDesc defaults to
-		// IsPrimary = true, and a PRIMARY swap chain's Present() runs FinishFrame() +
-		// ReleaseStaleResources() — with a secondary window open that happened TWICE per
-		// frame, corrupting the frame-resource lifetime bookkeeping (the GPU kept reading
-		// memory the second FinishFrame released) -> random device removals. It also gave
-		// every secondary window its own frame-latency waitable (500 ms stalls when the
-		// window is occluded -> the stutters). Secondary windows are NOT primary.
-		scd.IsPrimary = False;
-		Win32NativeWindow win{ nativeHandle };
-		if (m_impl->useD3D12)
-			GetEngineFactoryD3D12()->CreateSwapChainD3D12(m_impl->device, m_impl->context, scd, FullScreenModeDesc{}, win, &sc);
-		else
-			GetEngineFactoryD3D11()->CreateSwapChainD3D11(m_impl->device, m_impl->context, scd, FullScreenModeDesc{}, win, &sc);
-		if (!sc) { m_impl->uiVpSC.erase(nativeHandle); return; }
-	}
-	IDeviceContext* ctx = m_impl->context;
-	const SwapChainDesc& scd = sc->GetDesc();
-	if ((int)scd.Width != w || (int)scd.Height != h)
-	{
-		// Resize needs the back buffers UNBOUND and NOT referenced by in-flight GPU
-		// work, or D3D12 removes the device. A window-resize event is rare — a full
-		// GPU idle here is cheap insurance.
-		ctx->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
-		ctx->Flush();
-		m_impl->device->IdleGPU();
-		sc->Resize((Uint32)w, (Uint32)h);
-	}
+	auto it = m_impl->uiVpSC.find(nativeHandle);
+	ISwapChain* sc = (it != m_impl->uiVpSC.end()) ? it->second.RawPtr() : nullptr;
+	if (!sc || (int)sc->GetDesc().Width != w || (int)sc->GetDesc().Height != h)
+		m_impl->uiVpPending[nativeHandle] = { w, h };   // create/resize at the NEXT frame's top
+	if (!sc) return;                                    // first frame after opening: nothing to draw into yet
 
+	IDeviceContext* ctx = m_impl->context;
 	ITextureView* rtv = sc->GetCurrentBackBufferRTV();
 	if (!rtv) return;
 	ctx->SetRenderTargets(1, &rtv, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -219,18 +234,14 @@ void NukeDiligent::uiViewportDestroy(void* nativeHandle)
 {
 	auto it = m_impl->uiVpSC.find(nativeHandle);
 	if (it == m_impl->uiVpSC.end()) return;
-	// The GPU may still be reading this swap chain's back buffers (frames in flight);
-	// releasing them mid-use REMOVES THE DEVICE — it surfaces later as the
-	// GetCompletedFenceValue == UINT64_MAX assert storm. Settle the queue first: window
-	// destruction is rare, a full idle is cheap insurance. NOTE imgui also RECREATES
-	// platform windows on viewport merge/DPI changes, not just on user close.
-	if (m_impl->context && m_impl->device)
-	{
-		m_impl->context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
-		m_impl->context->Flush();
-		m_impl->device->IdleGPU();
-	}
+	// The GPU may still be reading this swap chain's back buffers (frames in flight) —
+	// PARK the swap chain in the centralized GPU trash instead of a mid-frame IdleGPU:
+	// it stays alive for kTrashFrames, by which point every present that referenced it
+	// has completed. NOTE imgui also RECREATES platform windows on viewport merge/DPI
+	// changes, not just on user close.
+	m_impl->Trash(it->second);
 	m_impl->uiVpSC.erase(it);
+	m_impl->uiVpPending.erase(nativeHandle);
 }
 
 void NukeDiligent::getFrameStats(int& drawCalls, int& triangles)
