@@ -126,6 +126,18 @@ void NukeDiligent::drawSprite(Texture* tex, const float center[3], const float r
 	push(-1.f,  1.f, u0, v0); push( 1.f, -1.f, u1, v1); push(-1.f, -1.f, u0, v1);   // TL, BR, BL
 }
 
+// BULK append (tilemap chunks): pre-baked quads in the batch's exact vertex layout —
+// one memcpy instead of thousands of drawSprite calls. Same per-texture run semantics.
+void NukeDiligent::drawSpriteRun(Texture* tex, const float* verts, int vertCount)
+{
+	if (!m_impl->spritePSO || !tex || !verts || vertCount <= 0) return;
+	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw
+	if (m_impl->spriteBatchTex && tex != m_impl->spriteBatchTex) m_impl->FlushSprites();
+	m_impl->spriteBatchTex = tex;
+	std::vector<float>& b = m_impl->spriteBatchVerts;
+	b.insert(b.end(), verts, verts + (size_t)vertCount * 9);
+}
+
 // Draw the accumulated batch (one texture) in a single call. Called on a texture change and at
 // endCamera (before the MSAA resolve, while the camera targets are still bound).
 void NukeDiligent::Impl::FlushSprites()

@@ -44,6 +44,7 @@ public:
 	void setWireframe(bool on) override;                 // scene fill mode (world meshes only)
 	bool getWireframe() override;
 	void drawDebugLineDepth(const float a[3], const float b[3], const float color[4]) override;
+	void drawSpriteRun(Texture* tex, const float* verts, int vertCount) override;
 	void getCursorPos(double& x, double& y) override;
 	bool isMouseButtonDown(int button) override;
 	void bindRenderTarget(uint64_t rtId) override;
