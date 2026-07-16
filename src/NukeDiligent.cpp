@@ -519,9 +519,11 @@ int NukeDiligent::render()
 		m_impl->pendingSamples = -1; m_impl->pendingHDR = -1;
 	}
 	// New frame: drop last frame's debug/gizmo lines (emission happens in onRender below).
+	// The depth batch is normally consumed per camera; clearing covers a pass that never ran.
 	{
 		std::lock_guard<std::mutex> lock(m_impl->debugMutex);
 		m_impl->debugVerts.clear();
+		m_impl->debugVertsDepth.clear();
 	}
 	// Deferred shadow-resolution change (rebuilds the shadow maps; never mid-frame).
 	if (m_impl->pendingShadowRes > 0)
@@ -562,6 +564,8 @@ int NukeDiligent::render()
 
 void NukeDiligent::setVSync(bool on) { m_impl->vsync = on; }   // takes effect on the next Present
 bool NukeDiligent::getVSync()        { return m_impl->vsync; }
+void NukeDiligent::setWireframe(bool on) { m_impl->wireframe = on; }   // renderObject picks psoWire per draw
+bool NukeDiligent::getWireframe()        { return m_impl->wireframe; }
 
 void NukeDiligent::loop()
 {

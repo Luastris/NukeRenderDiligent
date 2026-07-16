@@ -350,7 +350,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	};
 
 	// Release any previous objects first (rebuild path) — Diligent asserts on Create over a non-null ref.
-	wp.pso.Release(); wp.psoBlend.Release(); wp.psoAdd.Release(); wp.srb.Release();
+	wp.pso.Release(); wp.psoBlend.Release(); wp.psoAdd.Release(); wp.psoWire.Release(); wp.srb.Release();
 
 	// 1) Opaque — blend off, depth write on (base ci as configured above).
 	device->CreateGraphicsPipelineState(ci, &wp.pso);
@@ -377,6 +377,16 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		ci.PSODesc.Name = "World (add)";
 		device->CreateGraphicsPipelineState(ci, &wp.psoAdd);
 		if (wp.psoAdd) setStatics(wp.psoAdd);
+	}
+	// 4) Wireframe — opaque state (blend off, depth write on) with line fill; the scene draw-mode
+	// toggle (setWireframe) makes renderObject pick this variant for EVERY material.
+	{
+		ci.GraphicsPipeline.BlendDesc.RenderTargets[0] = RenderTargetBlendDesc{};
+		ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = True;
+		ci.GraphicsPipeline.RasterizerDesc.FillMode = FILL_MODE_WIREFRAME;
+		ci.PSODesc.Name = "World (wire)";
+		device->CreateGraphicsPipelineState(ci, &wp.psoWire);
+		if (wp.psoWire) setStatics(wp.psoWire);
 	}
 
 	wp.pso->CreateShaderResourceBinding(&wp.srb, true);

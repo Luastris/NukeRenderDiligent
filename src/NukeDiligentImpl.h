@@ -359,6 +359,7 @@ struct NukeDiligent::Impl
 	bool hdr = true;                   // HDR pipeline on (scene = RGBA16F, post tonemaps) / off (RGBA8, world.ps tonemaps)
 	int  pendingHDR = -1;              // requested hdr (0/1); applied with pendingSamples at the start of render()
 	TEXTURE_FORMAT SceneFmt() const { return hdr ? HDR_FMT : TEX_FORMAT_RGBA8_UNORM; }
+	bool wireframe = false;            // scene fill mode: renderObject picks WorldPipe::psoWire when set
 
 	// --- 3D world pipelines (one per shader; all share the layout + CBs + white fallback) ---
 	struct WorldPipe
@@ -366,6 +367,7 @@ struct NukeDiligent::Impl
 		RefCntAutoPtr<IPipelineState>         pso;        // opaque (blend off, depth write on)
 		RefCntAutoPtr<IPipelineState>         psoBlend;   // transparent: alpha blend, depth test on / write off
 		RefCntAutoPtr<IPipelineState>         psoAdd;     // additive: add blend, depth write off
+		RefCntAutoPtr<IPipelineState>         psoWire;    // wireframe fill (scene draw-mode toggle)
 		RefCntAutoPtr<IShaderResourceBinding> srb;
 		IShaderResourceVariable*              texVar  = nullptr;  // PS "g_Tex"        (base color, dynamic)
 		IShaderResourceVariable*              normVar = nullptr;  // PS "g_Normal"     (normal map, dynamic)
@@ -442,6 +444,17 @@ struct NukeDiligent::Impl
 	std::mutex debugMutex;
 	void CreateDebugResources();
 	void DrawDebugLines(bool toBackbuffer);
+	// DEPTH-TESTED lines (drawDebugLineDepth): drawn INSIDE the camera pass while the MS scene
+	// targets are still bound (endCamera top), so geometry occludes them — quiet gizmos like
+	// unselected canvas frames. PSO depends on samples/HDR -> built lazily against the current
+	// SceneFmt()/samples and rebuilt when they change. Batch is CONSUMED per camera (cleared
+	// after the draw) so one camera's gizmos never leak into another camera's pass.
+	RefCntAutoPtr<IPipelineState>         debugDepthPSO;
+	RefCntAutoPtr<IShaderResourceBinding> debugDepthSRB;
+	int            debugDepthSamples = 0;                        // PSO built for this sample count
+	TEXTURE_FORMAT debugDepthFmt     = TEX_FORMAT_UNKNOWN;       // ...and this scene format
+	std::vector<float> debugVertsDepth;   // 7 floats per vertex (shares debugMutex + debugVB)
+	void DrawDepthDebugLines();
 
 	// Sprites (iRender::drawSprite): unlit textured quads, alpha-blended, drawn IN the camera pass
 	// (SceneFmt + MSAA + depth-test, no depth write). PSO depends on samples/HDR -> rebuilt with them.

@@ -142,8 +142,10 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	Uint64   offs[]   = { 0, 0, 0 };
 	ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	// Pick the blend variant for this material (engine sorts transparent/additive back-to-front).
+	// Wireframe draw mode overrides them all — every mesh renders as lines.
 	IPipelineState* pso = wp.pso;
-	if (mat) { if (mat->blendMode == 1 && wp.psoBlend) pso = wp.psoBlend; else if (mat->blendMode == 2 && wp.psoAdd) pso = wp.psoAdd; }
+	if (m_impl->wireframe && wp.psoWire) pso = wp.psoWire;
+	else if (mat) { if (mat->blendMode == 1 && wp.psoBlend) pso = wp.psoBlend; else if (mat->blendMode == 2 && wp.psoAdd) pso = wp.psoAdd; }
 	ctx->SetPipelineState(pso);
 	ctx->CommitShaderResources(wp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
@@ -333,6 +335,14 @@ void NukeDiligent::drawDebugLine(const float a[3], const float b[3], const float
 	                    b[0], b[1], b[2], color[0], color[1], color[2], color[3] });
 }
 
+void NukeDiligent::drawDebugLineDepth(const float a[3], const float b[3], const float color[4])
+{
+	std::lock_guard<std::mutex> lock(m_impl->debugMutex);
+	auto& v = m_impl->debugVertsDepth;
+	v.insert(v.end(), { a[0], a[1], a[2], color[0], color[1], color[2], color[3],
+	                    b[0], b[1], b[2], color[0], color[1], color[2], color[3] });
+}
+
 void NukeDiligent::Impl::CreateDebugResources()
 {
 	debugPSO.Release(); debugPSOBB.Release(); debugSRB.Release(); debugSRBBB.Release(); debugCB.Release();
@@ -422,8 +432,84 @@ void NukeDiligent::Impl::DrawDebugLines(bool toBackbuffer)
 	context->Draw(da);
 }
 
+// Depth-tested gizmo lines: drawn while the (MS) scene color+depth are still bound, so the
+// scene geometry occludes them. The PSO is built lazily against the CURRENT SceneFmt()/samples
+// (and rebuilt when MSAA/HDR change — those flip only at the frame boundary). The batch is
+// consumed here: one camera's quiet gizmos never bleed into the next camera's pass.
+void NukeDiligent::Impl::DrawDepthDebugLines()
+{
+	std::vector<float> verts;
+	{
+		std::lock_guard<std::mutex> lock(debugMutex);
+		verts.swap(debugVertsDepth);   // consume
+	}
+	if (verts.empty() || !debugCB) return;
+
+	if (!debugDepthPSO || debugDepthSamples != (int)samples || debugDepthFmt != SceneFmt())
+	{
+		if (debugDepthPSO) Trash(debugDepthPSO);   // rebuild on an MSAA/HDR flip
+		debugDepthPSO.Release(); debugDepthSRB.Release();
+		std::string vsSrc = shaderSource("debug.vs"), psSrc = shaderSource("debug.ps");
+		if (vsSrc.empty() || psSrc.empty()) return;
+		ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+		RefCntAutoPtr<IShader> v, p;
+		sci.Desc = {"Debug VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); device->CreateShader(sci, &v);
+		sci.Desc = {"Debug PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); device->CreateShader(sci, &p);
+		if (!v || !p) return;
+		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Debug Lines PSO (depth)";
+		auto& gp = ci.GraphicsPipeline;
+		gp.NumRenderTargets = 1; gp.RTVFormats[0] = SceneFmt();
+		gp.DSVFormat = TEX_FORMAT_D32_FLOAT;
+		gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_LINE_LIST;
+		gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
+		gp.DepthStencilDesc.DepthEnable = True;         // occluded by the scene — the whole point
+		gp.DepthStencilDesc.DepthWriteEnable = False;
+		gp.SmplDesc.Count = samples;                    // matches the bound MS camera targets
+		LayoutElement layout[] = {
+			{0, 0, 3, VT_FLOAT32, False},   // pos
+			{1, 0, 4, VT_FLOAT32, False},   // color
+		};
+		gp.InputLayout.LayoutElements = layout; gp.InputLayout.NumElements = 2;
+		ci.pVS = v; ci.pPS = p;
+		device->CreateGraphicsPipelineState(ci, &debugDepthPSO);
+		if (!debugDepthPSO) return;
+		if (auto* sv = debugDepthPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "DebugCB")) sv->Set(debugCB);
+		debugDepthPSO->CreateShaderResourceBinding(&debugDepthSRB, true);
+		debugDepthSamples = (int)samples; debugDepthFmt = SceneFmt();
+	}
+
+	const int vertCount = (int)(verts.size() / 7);
+	if (!debugVB || debugVBSize < vertCount)   // shared dynamic VB (each draw maps with DISCARD)
+	{
+		Trash(debugVB);
+		debugVB.Release();
+		while (debugVBSize < vertCount) debugVBSize = debugVBSize ? debugVBSize * 2 : 1024;
+		BufferDesc bd; bd.Name = "Debug VB"; bd.BindFlags = BIND_VERTEX_BUFFER;
+		bd.Usage = USAGE_DYNAMIC; bd.CPUAccessFlags = CPU_ACCESS_WRITE;
+		bd.Size = (Uint64)debugVBSize * 7 * sizeof(float);
+		device->CreateBuffer(bd, nullptr, &debugVB);
+		if (!debugVB) return;
+	}
+	{
+		MapHelper<float> mv(context, debugVB, MAP_WRITE, MAP_FLAG_DISCARD);
+		std::memcpy(mv, verts.data(), verts.size() * sizeof(float));
+	}
+	{
+		MapHelper<float4x4> cb(context, debugCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		*cb = curView * curProj;
+	}
+	IBuffer* vbs[] = { debugVB };
+	const Uint64 offs[] = { 0 };
+	context->SetVertexBuffers(0, 1, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	context->SetPipelineState(debugDepthPSO);
+	context->CommitShaderResources(debugDepthSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{(Uint32)vertCount, DRAW_FLAG_VERIFY_STATES};
+	context->Draw(da);
+}
+
 void NukeDiligent::endCamera()
 {
+	m_impl->DrawDepthDebugLines();   // depth-tested gizmos: against this camera's still-bound MS depth
 	m_impl->FlushSprites();     // draw any pending sprite batch WHILE the (MS) camera targets are still bound
 	m_impl->FlushScreenPre();   // WithWorld screen-space canvas sprites: into the scene, before post
 	// 1) Resolve the multisampled HDR color into the single-sample HDR texture (post-pass input).
