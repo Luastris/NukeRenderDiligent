@@ -16,8 +16,8 @@ void NukeDiligent::Impl::CreateSpriteResources()
 
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	RefCntAutoPtr<IShader> v, p;
-	sci.Desc = {"Sprite VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); device->CreateShader(sci, &v);
-	sci.Desc = {"Sprite PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &p);
+	sci.Desc = {"Sprite VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &v);
+	sci.Desc = {"Sprite PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &p);
 	if (!v || !p) return;
 
 	BufferDesc cbd; cbd.Name = "SpriteCB"; cbd.Size = sizeof(float4x4);
@@ -57,7 +57,7 @@ void NukeDiligent::Impl::CreateSpriteResources()
 	ci.PSODesc.ResourceLayout.ImmutableSamplers    = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
 	ci.PSODesc.ResourceLayout.DefaultVariableType  = SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
 
-	device->CreateGraphicsPipelineState(ci, &spritePSO);
+	CreateGraphicsPipelineStateCached(ci, &spritePSO);
 	if (spritePSO)
 	{
 		if (auto* sv = spritePSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "SpriteCB")) sv->Set(spriteCB);
@@ -86,7 +86,7 @@ void NukeDiligent::Impl::CreateSpriteResources()
 		si.PSODesc.ResourceLayout.Variables            = vars; si.PSODesc.ResourceLayout.NumVariables         = 1;
 		si.PSODesc.ResourceLayout.ImmutableSamplers    = imms; si.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
 		si.PSODesc.ResourceLayout.DefaultVariableType  = SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
-		device->CreateGraphicsPipelineState(si, &pso);
+		CreateGraphicsPipelineStateCached(si, &pso);
 		if (pso)
 		{
 			if (auto* sv = pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "SpriteCB")) sv->Set(spriteCB);
@@ -98,7 +98,46 @@ void NukeDiligent::Impl::CreateSpriteResources()
 	TEXTURE_FORMAT bbFmt = swapChain ? swapChain->GetDesc().ColorBufferFormat : TEX_FORMAT_RGBA8_UNORM;
 	buildScreen(bbFmt, "Sprite Screen PSO BB", spriteScreenPSOBB, spriteScreenSRBBB, spriteScreenTexVarBB);
 
-	std::cout << "[NukeDiligent]\tsprite pipeline" << (spritePSO ? " ready" : " FAILED") << std::endl;
+	// LIT variant (drawSpriteRunLit): sprite_lit shaders — diffuse+normal, Lambert from the
+	// shared worldFrameCB, per-batch plane TBN. Same blend/depth/MSAA as the unlit sprite PSO.
+	spriteLitPSO.Release(); spriteLitCB.Release(); spriteLitSRBs.clear();
+	std::string lvs = shaderSource("sprite_lit.vs"), lps = shaderSource("sprite_lit.ps");
+	if (!lvs.empty() && !lps.empty() && worldFrameCB)
+	{
+		RefCntAutoPtr<IShader> lv, lp;
+		sci.Desc = {"SpriteLit VS", SHADER_TYPE_VERTEX, true}; sci.Source = lvs.c_str(); CreateShaderCached(sci, &lv);
+		sci.Desc = {"SpriteLit PS", SHADER_TYPE_PIXEL, true};  sci.Source = lps.c_str(); CreateShaderCached(sci, &lp);
+		if (lv && lp)
+		{
+			BufferDesc lcb; lcb.Name = "SpriteLitCB"; lcb.Size = sizeof(float) * 12;
+			lcb.Usage = USAGE_DYNAMIC; lcb.BindFlags = BIND_UNIFORM_BUFFER; lcb.CPUAccessFlags = CPU_ACCESS_WRITE;
+			device->CreateBuffer(lcb, nullptr, &spriteLitCB);
+
+			GraphicsPipelineStateCreateInfo li; li.PSODesc.Name = "SpriteLit PSO";
+			auto& lg = li.GraphicsPipeline;
+			lg = gp;   // same targets/blend/depth/MSAA/topology/cull as the unlit sprite PSO
+			lg.InputLayout.LayoutElements = layout; lg.InputLayout.NumElements = 3;
+			li.pVS = lv; li.pPS = lp;
+			ShaderResourceVariableDesc lvars[] = {
+				{SHADER_TYPE_PIXEL, "g_Sprite", SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+				{SHADER_TYPE_PIXEL, "g_Normal", SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE} };
+			ImmutableSamplerDesc limms[] = { {SHADER_TYPE_PIXEL, "g_Sprite", samp},
+			                                 {SHADER_TYPE_PIXEL, "g_Normal", samp} };
+			li.PSODesc.ResourceLayout.Variables            = lvars; li.PSODesc.ResourceLayout.NumVariables         = 2;
+			li.PSODesc.ResourceLayout.ImmutableSamplers    = limms; li.PSODesc.ResourceLayout.NumImmutableSamplers = 2;
+			li.PSODesc.ResourceLayout.DefaultVariableType  = SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
+			CreateGraphicsPipelineStateCached(li, &spriteLitPSO);
+			if (spriteLitPSO)
+			{
+				if (auto* sv = spriteLitPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "SpriteCB"))     sv->Set(spriteCB);
+				if (auto* sv = spriteLitPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "SpriteLitCB"))  sv->Set(spriteLitCB);
+				if (auto* sv = spriteLitPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "FrameCB"))      sv->Set(worldFrameCB);
+			}
+		}
+	}
+
+	std::cout << "[NukeDiligent]\tsprite pipeline" << (spritePSO ? " ready" : " FAILED")
+	          << (spriteLitPSO ? " (+lit)" : "") << std::endl;
 }
 
 // Accumulate one quad. The batch flushes when the texture changes (a new run) or at endCamera —
@@ -108,6 +147,7 @@ void NukeDiligent::drawSprite(Texture* tex, const float center[3], const float r
 {
 	if (!m_impl->spritePSO || !tex) return;
 	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw (see Impl flag)
+	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();   // kind switch: keep paint order
 	if (m_impl->spriteBatchTex && tex != m_impl->spriteBatchTex) m_impl->FlushSprites();   // texture changed -> new batch
 	m_impl->spriteBatchTex = tex;
 
@@ -132,9 +172,26 @@ void NukeDiligent::drawSpriteRun(Texture* tex, const float* verts, int vertCount
 {
 	if (!m_impl->spritePSO || !tex || !verts || vertCount <= 0) return;
 	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw
+	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();   // kind switch: keep paint order
 	if (m_impl->spriteBatchTex && tex != m_impl->spriteBatchTex) m_impl->FlushSprites();
 	m_impl->spriteBatchTex = tex;
 	std::vector<float>& b = m_impl->spriteBatchVerts;
+	b.insert(b.end(), verts, verts + (size_t)vertCount * 9);
+}
+
+// LIT bulk append: same layout, drawn with the normal-mapped Lambert pipeline. Falls back
+// to the unlit run when the lit PSO/normal map is unavailable (backends stay honest).
+void NukeDiligent::drawSpriteRunLit(Texture* tex, Texture* normal, const float* verts, int vertCount,
+                                    bool normalFlipY)
+{
+	if (!m_impl->spriteLitPSO || !normal) { drawSpriteRun(tex, verts, vertCount); return; }
+	if (!tex || !verts || vertCount <= 0) return;
+	if (!m_impl->cameraPassActive) return;
+	if (m_impl->spriteBatchTex) m_impl->FlushSprites();    // kind switch: keep paint order
+	if (m_impl->spriteLitTex && (tex != m_impl->spriteLitTex || normal != m_impl->spriteLitNormal))
+		m_impl->FlushSpritesLit();
+	m_impl->spriteLitTex = tex; m_impl->spriteLitNormal = normal; m_impl->spriteLitFlipY = normalFlipY;
+	std::vector<float>& b = m_impl->spriteLitVerts;
 	b.insert(b.end(), verts, verts + (size_t)vertCount * 9);
 }
 
@@ -147,6 +204,29 @@ void NukeDiligent::Impl::FlushSprites()
 	// D32. Drop the batch instead of spamming D3D12 with format-mismatch draws.
 	if (!cameraPassActive) { spriteBatchVerts.clear(); spriteBatchTex = nullptr; return; }
 	ITextureView* srv = GetTexSRV(spriteBatchTex);
+	// Draw-path diagnostics (NUKE_TM_DIAG=1): a dropped batch is invisible art with no error.
+	static const bool diag = []{ const char* e = std::getenv("NUKE_TM_DIAG"); return e && *e == '1'; }();
+	if (diag)
+	{
+		static int n = 0;
+		if (n < 6)
+		{
+			++n;
+			std::cout << "[NukeDiligent]\tDIAG sprite flush " << spriteBatchVerts.size() / 9
+			          << " verts, srv " << (srv ? "ok" : "NULL") << std::endl;
+			const std::vector<float>& b = spriteBatchVerts;
+			for (size_t v = 0; v + 9 <= b.size() && v < 27; v += 9)
+				std::cout << "[NukeDiligent]\tDIAG v" << v / 9 << " pos(" << b[v] << "," << b[v+1] << "," << b[v+2]
+				          << ") uv(" << b[v+3] << "," << b[v+4] << ") col(" << b[v+5] << "," << b[v+6]
+				          << "," << b[v+7] << "," << b[v+8] << ")" << std::endl;
+			if (b.size() >= 9 * 9)
+			{
+				size_t v = ((b.size() / 9) - 1) * 9;   // last vert (the sprite's, when appended after tiles)
+				std::cout << "[NukeDiligent]\tDIAG vLAST pos(" << b[v] << "," << b[v+1] << "," << b[v+2]
+				          << ") uv(" << b[v+3] << "," << b[v+4] << ")" << std::endl;
+			}
+		}
+	}
 	if (!srv) { spriteBatchVerts.clear(); spriteBatchTex = nullptr; return; }
 
 	const int vertCount = (int)(spriteBatchVerts.size() / 9);
@@ -173,6 +253,70 @@ void NukeDiligent::Impl::FlushSprites()
 
 	spriteBatchVerts.clear();
 	spriteBatchTex = nullptr;
+}
+
+// Draw the accumulated LIT batch (one diffuse+normal pair). Plane TBN comes from the first
+// quad's corners (a run shares one plane: TL,TR,BR — T = TL->TR, B = BR->TR ⊥ish, N = T×B).
+void NukeDiligent::Impl::FlushSpritesLit()
+{
+	if (spriteLitVerts.empty() || !spriteLitTex) { spriteLitVerts.clear(); spriteLitTex = nullptr; spriteLitNormal = nullptr; return; }
+	auto drop = [&]{ spriteLitVerts.clear(); spriteLitTex = nullptr; spriteLitNormal = nullptr; };
+	if (!spriteLitPSO || !cameraPassActive) { drop(); return; }
+	ITextureView* srv  = GetTexSRV(spriteLitTex);
+	ITextureView* nsrv = GetTexSRV(spriteLitNormal);
+	if (!srv || !nsrv) { drop(); return; }
+
+	// Per-batch TBN from the first quad (verts: TL, TR, BR, ... — 9 floats each).
+	{
+		const float* v = spriteLitVerts.data();
+		float3 tl(v[0], v[1], v[2]), tr(v[9], v[10], v[11]), br(v[18], v[19], v[20]);
+		float3 T = tr - tl, B = tr - br;
+		float tl2 = length(T), bl2 = length(B);
+		T = (tl2 > 1e-6f) ? T / tl2 : float3(1, 0, 0);
+		B = (bl2 > 1e-6f) ? B / bl2 : float3(0, 1, 0);
+		float3 N = cross(T, B);
+		float nl = length(N); N = (nl > 1e-6f) ? N / nl : float3(0, 0, 1);
+		MapHelper<float> cb(context, spriteLitCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (cb)
+		{
+			float* d = cb;
+			d[0] = T.x; d[1] = T.y; d[2]  = T.z; d[3]  = 0;
+			d[4] = B.x; d[5] = B.y; d[6]  = B.z; d[7]  = 0;
+			d[8] = N.x; d[9] = N.y; d[10] = N.z; d[11] = spriteLitFlipY ? 1.0f : -1.0f;
+		}
+	}
+
+	const int vertCount = (int)(spriteLitVerts.size() / 9);
+	if (!spriteVB || spriteVBSize < vertCount)   // shared VB with the unlit flush (sequential use)
+	{
+		Trash(spriteVB);
+		spriteVB.Release();
+		while (spriteVBSize < vertCount) spriteVBSize = spriteVBSize ? spriteVBSize * 2 : 384;
+		BufferDesc bd; bd.Name = "Sprite VB"; bd.BindFlags = BIND_VERTEX_BUFFER;
+		bd.Usage = USAGE_DYNAMIC; bd.CPUAccessFlags = CPU_ACCESS_WRITE; bd.Size = (Uint64)spriteVBSize * 9 * sizeof(float);
+		device->CreateBuffer(bd, nullptr, &spriteVB);
+		if (!spriteVB) { drop(); return; }
+	}
+	{ MapHelper<float>    mv(context, spriteVB, MAP_WRITE, MAP_FLAG_DISCARD); std::memcpy(mv, spriteLitVerts.data(), spriteLitVerts.size() * sizeof(float)); }
+	{ MapHelper<float4x4> cb(context, spriteCB, MAP_WRITE, MAP_FLAG_DISCARD); *cb = curView * curProj; }
+
+	// SRB per (diffuse, normal) pair — MUTABLE vars set once (no dynamic-descriptor churn).
+	RefCntAutoPtr<IShaderResourceBinding>& srb = spriteLitSRBs[{srv, nsrv}];
+	if (!srb)
+	{
+		spriteLitPSO->CreateShaderResourceBinding(&srb, true);
+		if (!srb) { spriteLitSRBs.erase({srv, nsrv}); drop(); return; }
+		if (auto* v = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Sprite")) v->Set(srv);
+		if (auto* v = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal")) v->Set(nsrv);
+	}
+
+	Uint64 offset = 0; IBuffer* vbs[] = { spriteVB };
+	context->SetVertexBuffers(0, 1, vbs, &offset, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	context->SetPipelineState(spriteLitPSO);
+	context->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da; da.NumVertices = (Uint32)vertCount; da.Flags = DRAW_FLAG_VERIFY_ALL;
+	context->Draw(da);
+	drop();
 }
 
 // ---- screen-space (Canvas HUD) sprites --------------------------------------------------------

@@ -8,12 +8,12 @@ void NukeDiligent::Impl::BuildCube(CubeRT& c, int res)
 	res = res < 16 ? 16 : (res > 1024 ? 1024 : res);
 	// A rebuild (HDR toggle / res change) can land mid-frame while the world PSOs still sample the old
 	// cube SRV — park everything first (centralized lifetime rule).
-	Trash(c.color); Trash(c.depth); Trash(c.dsv);
+	Trash(c.color); Trash(c.depth); Trash(c.dsv); Trash(c.msColor); Trash(c.msDepth);
 	for (auto& v : c.faceRTV) Trash(v);
-	c.color.Release(); c.depth.Release(); c.dsv.Release();
+	c.color.Release(); c.depth.Release(); c.dsv.Release(); c.msColor.Release(); c.msDepth.Release();
 	for (auto& v : c.faceRTV) v.Release();
 	c.srv = nullptr;
-	c.res = res; c.fmtHdr = hdr;
+	c.res = res; c.fmtHdr = hdr; c.msSamples = (int)samples;
 	int mips = 1; { int s = res; while (s > 1) { s >>= 1; ++mips; } } c.mips = mips;
 
 	TextureDesc cd; cd.Name = "Probe Cube"; cd.Type = RESOURCE_DIM_TEX_CUBE; cd.Width = (Uint32)res; cd.Height = (Uint32)res;
@@ -34,6 +34,22 @@ void NukeDiligent::Impl::BuildCube(CubeRT& c, int res)
 	dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL;
 	device->CreateTexture(dd, nullptr, &c.depth);
 	if (c.depth) c.dsv = c.depth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
+
+	// MSAA intermediates: the geometry/sky PSOs are MSAA-only when MSAA is on — capture
+	// renders here and RESOLVES into the cube face (single-sample direct rendering with an
+	// MSAA PSO device-losts Vulkan).
+	if (samples > 1)
+	{
+		TextureDesc md; md.Name = "Probe MS color"; md.Type = RESOURCE_DIM_TEX_2D;
+		md.Width = (Uint32)res; md.Height = (Uint32)res; md.Format = SceneFmt();
+		md.SampleCount = samples; md.MipLevels = 1; md.BindFlags = BIND_RENDER_TARGET;
+		device->CreateTexture(md, nullptr, &c.msColor);
+		TextureDesc mdd; mdd.Name = "Probe MS depth"; mdd.Type = RESOURCE_DIM_TEX_2D;
+		mdd.Width = (Uint32)res; mdd.Height = (Uint32)res; mdd.Format = TEX_FORMAT_D32_FLOAT;
+		mdd.SampleCount = samples; mdd.MipLevels = 1; mdd.BindFlags = BIND_DEPTH_STENCIL;
+		device->CreateTexture(mdd, nullptr, &c.msDepth);
+		if (!c.msColor || !c.msDepth) { c.msColor.Release(); c.msDepth.Release(); }   // pair or nothing
+	}
 }
 
 uint64_t NukeDiligent::createReflectionCube(int resolution)
@@ -51,7 +67,8 @@ void NukeDiligent::beginCubeFace(uint64_t cube, int face, const float pos[3], fl
 	auto it = m_impl->cubes.find(cube);
 	if (it == m_impl->cubes.end() || face < 0 || face > 5) return;
 	Impl::CubeRT& c = it->second;
-	if (c.fmtHdr != m_impl->hdr) m_impl->BuildCube(c, c.res);   // HDR toggled -> rebuild to match the geometry PSO
+	// HDR or MSAA changed -> rebuild so capture targets match the geometry PSOs exactly.
+	if (c.fmtHdr != m_impl->hdr || c.msSamples != (int)m_impl->samples) m_impl->BuildCube(c, c.res);
 	if (!c.faceRTV[face] || !c.dsv) return;
 	m_impl->probeActive = false;   // never sample the probe while capturing it (analytic IBL) -> no feedback
 	m_impl->curTarget = 0;
@@ -64,14 +81,20 @@ void NukeDiligent::beginCubeFace(uint64_t cube, int face, const float pos[3], fl
 	m_impl->curView = float4x4(R.x,U.x,F.x,0, R.y,U.y,F.y,0, R.z,U.z,F.z,0, -dot(P,R),-dot(P,U),-dot(P,F),1);
 	m_impl->curProj = float4x4::Projection(1.5707963f, 1.0f, nearZ, farZ, false);   // 90deg, square
 	m_impl->curCamPos[0] = P.x; m_impl->curCamPos[1] = P.y; m_impl->curCamPos[2] = P.z;
-	m_impl->curRTV = c.faceRTV[face]; m_impl->curRTW = c.res; m_impl->curRTH = c.res;
+	// MSAA on: sky/world PSOs are MULTISAMPLED — render the face into the MS intermediate
+	// and resolve into the cube slice in endCubeFace. Rendering an MSAA PSO into the
+	// single-sample face RTV is a Vulkan render-pass incompatibility (DEVICE_LOST).
+	const bool ms = c.msColor && c.msDepth;
+	ITextureView* rtv = ms ? c.msColor->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET) : c.faceRTV[face].RawPtr();
+	ITextureView* dsv = ms ? c.msDepth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL) : c.dsv.RawPtr();
+	if (!rtv || !dsv) return;
+	m_impl->curRTV = rtv; m_impl->curRTW = c.res; m_impl->curRTH = c.res;
 
 	IDeviceContext* ctx = m_impl->context;
-	ITextureView* rtv = c.faceRTV[face];
-	ctx->SetRenderTargets(1, &rtv, c.dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	const float clr[4] = { 0, 0, 0, 1 };
 	ctx->ClearRenderTarget(rtv, clr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	ctx->ClearDepthStencil(c.dsv, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ctx->ClearDepthStencil(dsv, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)c.res; vp.Height = (float)c.res; vp.MinDepth = 0; vp.MaxDepth = 1;
 	ctx->SetViewports(1, &vp, c.res, c.res);
 
@@ -81,10 +104,22 @@ void NukeDiligent::beginCubeFace(uint64_t cube, int face, const float pos[3], fl
 
 void NukeDiligent::endCubeFace(uint64_t cube, int face)
 {
-	if (face != 5) return;   // all six faces captured -> build the mip chain for rough reflections
 	auto it = m_impl->cubes.find(cube);
-	if (it != m_impl->cubes.end() && it->second.srv)
-		m_impl->context->GenerateMips(it->second.srv);
+	if (it == m_impl->cubes.end() || face < 0 || face > 5) return;
+	Impl::CubeRT& c = it->second;
+	// MSAA capture: resolve the multisampled face into this cube slice.
+	if (c.msColor && c.color)
+	{
+		ResolveTextureSubresourceAttribs ra;
+		ra.SrcTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ra.DstTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ra.Format      = m_impl->SceneFmt();
+		ra.DstSlice    = (Uint32)face;
+		ra.DstMipLevel = 0;
+		m_impl->context->ResolveTextureSubresource(c.msColor, c.color, ra);
+	}
+	if (face != 5) return;   // all six faces captured -> build the mip chain for rough reflections
+	if (c.srv) m_impl->context->GenerateMips(c.srv);
 }
 
 void NukeDiligent::setReflectionProbe(uint64_t cube, const float pos[3], float intensity, float farZ, const float boxHalf[3])

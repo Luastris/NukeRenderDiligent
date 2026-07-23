@@ -75,8 +75,8 @@ void NukeDiligent::Impl::CreatePostResources()
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tpost shaders missing" << endl; return; }
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	RefCntAutoPtr<IShader> v, p;
-	sci.Desc = {"Post VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); device->CreateShader(sci, &v);
-	sci.Desc = {"Post PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &p);
+	sci.Desc = {"Post VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &v);
+	sci.Desc = {"Post PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &p);
 	if (!v || !p) return;
 
 	BufferDesc cbd; cbd.Name = "PostCB"; cbd.Size = sizeof(float) * 8; cbd.Usage = USAGE_DYNAMIC;   // g_Post + g_Grade
@@ -111,7 +111,7 @@ void NukeDiligent::Impl::CreatePostResources()
 		ImmutableSamplerDesc imm[] = {{SHADER_TYPE_PIXEL, "g_HDR", samp}};
 		ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
 		ci.pVS = v; ci.pPS = p;
-		device->CreateGraphicsPipelineState(ci, &pso);
+		CreateGraphicsPipelineStateCached(ci, &pso);
 		if (pso)
 		{
 			if (auto* c = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostCB")) c->Set(postCB);
@@ -133,8 +133,8 @@ void NukeDiligent::Impl::CreatePostResources()
 		std::string ps = shaderSource(psName);
 		if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tbloom shader missing: " << psName << endl; return; }
 		ShaderCreateInfo s; s.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
-		RefCntAutoPtr<IShader> vv, pp; s.Desc = {dbg, SHADER_TYPE_VERTEX, true}; s.Source = vs.c_str(); device->CreateShader(s, &vv);
-		s.Desc = {dbg, SHADER_TYPE_PIXEL, true}; s.Source = ps.c_str(); device->CreateShader(s, &pp);
+		RefCntAutoPtr<IShader> vv, pp; s.Desc = {dbg, SHADER_TYPE_VERTEX, true}; s.Source = vs.c_str(); CreateShaderCached(s, &vv);
+		s.Desc = {dbg, SHADER_TYPE_PIXEL, true}; s.Source = ps.c_str(); CreateShaderCached(s, &pp);
 		if (!vv || !pp) return;
 		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = dbg;
 		auto& gp = ci.GraphicsPipeline;
@@ -149,7 +149,7 @@ void NukeDiligent::Impl::CreatePostResources()
 		ci.PSODesc.ResourceLayout.Variables = vars.data(); ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
 		ci.PSODesc.ResourceLayout.ImmutableSamplers = imms.data(); ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)imms.size();
 		ci.pVS = vv; ci.pPS = pp;
-		device->CreateGraphicsPipelineState(ci, &pso);
+		CreateGraphicsPipelineStateCached(ci, &pso);
 		if (!pso) { cout << "[NukeDiligent]\tbloom PSO failed: " << dbg << endl; return; }
 		if (auto* c = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "BloomCB")) c->Set(bloomCB);
 		pso->CreateShaderResourceBinding(&srb, true);
@@ -171,6 +171,7 @@ void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV,
 	const float mode = !hdr ? 0.0f : ((toBackbuffer && hdr10Active) ? 2.0f : 1.0f);   // 0=passthrough,1=sRGB SDR,2=HDR10 PQ
 	{
 		MapHelper<float> cb(context, postCB, MAP_WRITE, MAP_FLAG_DISCARD);   // final pass = tonemap/encode ONLY
+		if (cb == nullptr) return;   // dead device (mid-frame removal): Map yields null — bail, render() suspends
 		for (int k = 0; k < 8; ++k) cb[k] = 0.0f;
 		// g_Post.x = transparent output: the final backbuffer pass emits PREMULTIPLIED scene
 		// alpha (rgb*a, a) so a DirectComposition window shows the desktop where alpha < 1.
@@ -204,8 +205,8 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	if (vs.empty() || ps.empty()) return 0;
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	RefCntAutoPtr<IShader> v, p;
-	sci.Desc = {"Post Effect VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); device->CreateShader(sci, &v);
-	sci.Desc = {"Post Effect PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &p);
+	sci.Desc = {"Post Effect VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &v);
+	sci.Desc = {"Post Effect PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &p);
 	if (!v || !p) return 0;
 
 	GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Post Effect PSO";
@@ -256,7 +257,7 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	ci.PSODesc.ResourceLayout.ImmutableSamplers = imms.data(); ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)imms.size();
 	ci.pVS = v; ci.pPS = p;
 	PostPipe pp;
-	device->CreateGraphicsPipelineState(ci, &pp.pso);
+	CreateGraphicsPipelineStateCached(ci, &pp.pso);
 	if (!pp.pso) { cout << "[NukeDiligent]\tpost effect PSO build failed" << endl; return 0; }
 	if (auto* c = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostParams")) c->Set(postParamsCB);
 	if (auto* f = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostFrame"))  f->Set(postFrameCB);
@@ -299,8 +300,8 @@ void NukeDiligent::Impl::BlitTexture(ITextureView* srcSRV, ITexture* dstTex)
 		if (vs.empty()) return;
 		ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 		RefCntAutoPtr<IShader> v, p;
-		sci.Desc = {"Blit VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str();  device->CreateShader(sci, &v);
-		sci.Desc = {"Blit PS", SHADER_TYPE_PIXEL,  true}; sci.Source = kBlitPS;     device->CreateShader(sci, &p);
+		sci.Desc = {"Blit VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str();  CreateShaderCached(sci, &v);
+		sci.Desc = {"Blit PS", SHADER_TYPE_PIXEL,  true}; sci.Source = kBlitPS;     CreateShaderCached(sci, &p);
 		if (!v || !p) return;
 		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Blit PSO";
 		auto& gp = ci.GraphicsPipeline;
@@ -318,7 +319,7 @@ void NukeDiligent::Impl::BlitTexture(ITextureView* srcSRV, ITexture* dstTex)
 		ci.PSODesc.ResourceLayout.ImmutableSamplers = &imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
 		ci.pVS = v; ci.pPS = p;
 		RefCntAutoPtr<IPipelineState> pso;
-		device->CreateGraphicsPipelineState(ci, &pso);
+		CreateGraphicsPipelineStateCached(ci, &pso);
 		if (!pso) return;
 		RefCntAutoPtr<IShaderResourceBinding> srb;
 		pso->CreateShaderResourceBinding(&srb, true);

@@ -139,6 +139,11 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
 void NukeDiligent::Impl::EnsureRTFallback()
 {
 	if (fallbackTLAS || !rtSupported) return;
+
+	// EMPTY TLAS (0 instances) — spec-legal, every ray query MISSES by definition. This is
+	// the safest possible fallback: no geometry for traversal to ever touch. The Vulkan
+	// zero-instance crash was a Diligent bug (null upload block for a 0-byte instance
+	// copy) — NUKE-patched in DeviceContextVkImpl::BuildTLAS.
 	TopLevelASDesc td; td.Name = "Fallback TLAS"; td.MaxInstanceCount = 1; td.Flags = RAYTRACING_BUILD_AS_PREFER_FAST_TRACE;
 	device->CreateTLAS(td, &fallbackTLAS);
 	if (!fallbackTLAS) return;

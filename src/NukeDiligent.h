@@ -45,6 +45,9 @@ public:
 	bool getWireframe() override;
 	void drawDebugLineDepth(const float a[3], const float b[3], const float color[4]) override;
 	void drawSpriteRun(Texture* tex, const float* verts, int vertCount) override;
+	void drawSpriteRunLit(Texture* tex, Texture* normal, const float* verts, int vertCount,
+	                      bool normalFlipY) override;
+	bool captureTarget(uint64_t rtId, int& w, int& h, std::vector<uint8_t>& rgba) override;
 	void getCursorPos(double& x, double& y) override;
 	bool isMouseButtonDown(int button) override;
 	void bindRenderTarget(uint64_t rtId) override;

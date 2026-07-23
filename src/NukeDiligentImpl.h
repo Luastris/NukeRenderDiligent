@@ -21,6 +21,7 @@
 // Diligent Engine
 #include "EngineFactoryD3D11.h"
 #include "EngineFactoryD3D12.h"   // D3D12 backend (ray tracing); chosen at launch via WindowDesc.backend
+#include "EngineFactoryVk.h"      // Vulkan backend (task #138): editor default; shaders HLSL->SPIRV via glslang
 #include "RenderDevice.h"
 #include "DeviceContext.h"
 #include "SwapChain.h"
@@ -89,6 +90,27 @@ struct NukeDiligent::Impl
 	bool  DeviceRemoved();
 	void* d3d12DevCache = nullptr;   // cached ID3D12Device* (void* keeps <d3d12.h> out of this header)
 	bool                          useD3D12 = false;   // active backend (set in init from WindowDesc.backend)
+	bool                          useVulkan = false;  // backend == 2: Vulkan (task #138) — no DXGI anywhere
+
+	// DISK shader-bytecode cache (OUR OWN, Vulkan only): a Vulkan boot re-runs glslang
+	// over every HLSL shader (~3s). Key = FNV-1a of the full compile inputs (source,
+	// entry, type, macros, flags); value = the compiled SPIR-V (IShader::GetBytecode),
+	// one file per shader under config/shadercache_vk/. A hit feeds ByteCode straight to
+	// CreateShader — glslang never runs; an edited shader changes the key and recompiles.
+	void CreateShaderCached(const Diligent::ShaderCreateInfo& ci, Diligent::IShader** pp);
+	void CreateGraphicsPipelineStateCached(const Diligent::GraphicsPipelineStateCreateInfo& ci, Diligent::IPipelineState** pp)
+	{
+		// Cache-miss shaders compile ASYNC on the worker pool — the PSO needs them ready,
+		// so wait here: by this point the whole batch created earlier has been compiling
+		// in parallel, and the bind sites never see a not-ready pipeline.
+		auto wait = [](Diligent::IShader* s) { if (s) s->GetStatus(true); };
+		wait(ci.pVS); wait(ci.pPS); wait(ci.pGS); wait(ci.pHS); wait(ci.pDS);
+		device->CreateGraphicsPipelineState(ci, pp);
+	}
+	// Async-compiled cache misses: the SPIR-V is grabbed and written to disk once the
+	// worker finishes (polled per frame — PollShaderSaves).
+	std::vector<std::pair<Diligent::RefCntAutoPtr<Diligent::IShader>, std::string>> pendingShaderSaves;
+	void PollShaderSaves();
 	bool                          vsync    = true;    // main-present sync interval: true = 1 (vsync), false = 0 (uncapped)
 	// DirectComposition objects for a TRANSPARENT window (per-pixel alpha to the desktop):
 	// the composition swap chain presents into this visual tree. Stored as IUnknown* so the
@@ -221,6 +243,12 @@ struct NukeDiligent::Impl
 		ITextureView*               srv = nullptr;   // cube SRV (default view, texture-owned)
 		int res = 0, mips = 1;
 		bool fmtHdr = true;   // which SceneFmt the cube was built with (rebuild on HDR toggle to match world PSO)
+		// MSAA capture intermediates: sky/world PSOs are built at the CURRENT sample count —
+		// rendering them straight into the single-sample cube face is a Vulkan render-pass
+		// incompatibility (DEVICE_LOST; D3D12 silently tolerated it). Faces render here and
+		// resolve into the cube slice per face.
+		RefCntAutoPtr<ITexture> msColor, msDepth;
+		int msSamples = 1;    // sample count the intermediates were built with (rebuild on change)
 	};
 	std::unordered_map<uint64_t, CubeRT> cubes;
 	void BuildCube(CubeRT& c, int res);   // (re)create the cube GPU resources at the current SceneFmt()
@@ -472,6 +500,18 @@ struct NukeDiligent::Impl
 	void CreateSpriteResources();
 	void FlushSprites();
 
+	// LIT sprite runs (drawSpriteRunLit — tilemap layers with a normal map): same batch layout,
+	// Lambert lighting from worldFrameCB, per-batch plane TBN in spriteLitCB. SRBs are cached
+	// per (diffuse, normal) SRV pair. Flushed on pair change / kind switch / endCamera.
+	RefCntAutoPtr<IPipelineState>         spriteLitPSO;
+	RefCntAutoPtr<IBuffer>                spriteLitCB;              // float4 T,B,N (N.w = green flip)
+	std::map<std::pair<ITextureView*, ITextureView*>, RefCntAutoPtr<IShaderResourceBinding>> spriteLitSRBs;
+	Texture*                              spriteLitTex = nullptr;
+	Texture*                              spriteLitNormal = nullptr;
+	bool                                  spriteLitFlipY = true;
+	std::vector<float>                    spriteLitVerts;
+	void FlushSpritesLit();
+
 	// Screen-space (Canvas HUD) sprites — verts already in NDC, identity transform. Two queues:
 	// PRE = drawn with the scene before post (reuses spritePSO; NDC z=0 => always on top); POST =
 	// drawn on the final image after post (own output-format PSO, single-sample, no depth). Both defer
@@ -561,6 +601,44 @@ struct NukeDiligent::Impl
 	// chain in the GPU trash instead of a mid-frame IdleGPU.
 	std::map<void*, RefCntAutoPtr<ISwapChain>> uiVpSC;
 	std::map<void*, std::pair<int, int>>       uiVpPending;   // create/resize requests (handle -> size)
+	// Resize DEBOUNCE per window: (last requested size, consecutive frames it held). A live
+	// drag re-requests a new size EVERY frame; resizing (Flush+IdleGPU+Resize) 30+ times/sec
+	// starves the main swap chain's frame-latency waitable object — permanent "Timeout
+	// elapsed waiting for the frame waitable object" stalls. Resize only once the size
+	// settles; meanwhile the old buffers present stretched (visually fine mid-drag).
+	std::map<void*, std::pair<std::pair<int, int>, int>> uiVpStable;
+	std::map<void*, int> uiVpCooldown;   // frames to skip a window after a FAILED chain creation
+	std::map<void*, int> uiVpGrace;      // frames to skip draw+present right after a resize (diag)
+	// Secondary presents are DEFERRED to after the MAIN Present: presenting (and its
+	// internal Flush) mid-frame splits the command stream between the preview RT's write
+	// and its SRV sampling — the D3D12 debug layer then kills the device with
+	// ACCESS_DENIED ("rendering to a texture with read access") on RT-sampling windows.
+	std::vector<void*> vpPresentQueue;
+	size_t vpPresentRR = 0;   // round-robin cursor: ONE secondary present per frame (see render())
+	uint64_t uiVpFrameNo = 0; // frame counter for the multi-window draw interleave (uiViewportRender)
+
+	// GDI-BLIT host windows (task #137): a detached window = offscreen RT + staging ring +
+	// SetDIBitsToDevice. ZERO DXGI objects per window — no secondary swap chains, resizes
+	// or presents, so the month-long "secondary present vs heavy frame" ACCESS_DENIED
+	// device removal cannot exist BY CONSTRUCTION. Readback is async (ring of 3, mapped
+	// with DO_NOT_WAIT after the main present): ~2 frames of latency, invisible for tool
+	// windows, and the main frame does no extra flushes at all.
+	struct HostBlit
+	{
+		Diligent::RefCntAutoPtr<Diligent::ITexture> rt;          // offscreen UI render target
+		Diligent::RefCntAutoPtr<Diligent::ITexture> staging[3];  // readback ring
+		int  w = 0, h = 0;
+		int  cur = 0;                  // ring slot written THIS frame
+		bool valid[3] = {};            // slot holds a issued copy
+		std::vector<uint8_t> scratch;  // BGRX rows for GDI
+	};
+	std::map<void*, HostBlit> uiHostBlits;
+	std::vector<void*> uiHostBlitQueue;   // windows to blit AFTER the main Present
+	void BlitHostWindows();               // map ready staging + SetDIBitsToDevice
+	// VULKAN native viewports: per-window SWAPCHAIN render (imgui multi-viewport).
+	// The Vulkan WSI has none of the DXGI create/resize/present races — this is the
+	// normal multi-window path; GDI blit stays the D3D fallback.
+	void ViewportRenderSwapchain(void* nativeHandle, int w, int h, const NukeUIDrawData& data);
 	void ApplyPendingViewportOps();                            // render() top: create/resize queued swap chains
 	// Shared UI draw body (renderDrawLists + secondary viewports draw with it).
 	void DrawUILists(ITextureView* rtv, Uint32 surfW, Uint32 surfH, const NukeUIDrawData& data);

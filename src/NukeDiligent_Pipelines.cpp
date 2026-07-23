@@ -22,10 +22,10 @@ void NukeDiligent::Impl::CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT d
 	RefCntAutoPtr<IShader> vs, ps;
 	ShaderCI.Desc = {"UI VS", SHADER_TYPE_VERTEX, true};
 	ShaderCI.Source = vsSrc.c_str();
-	device->CreateShader(ShaderCI, &vs);
+	CreateShaderCached(ShaderCI, &vs);
 	ShaderCI.Desc = {"UI PS", SHADER_TYPE_PIXEL, true};
 	ShaderCI.Source = psSrc.c_str();
-	device->CreateShader(ShaderCI, &ps);
+	CreateShaderCached(ShaderCI, &ps);
 
 	GraphicsPipelineStateCreateInfo PSOCreateInfo;
 	PSOCreateInfo.PSODesc.Name = "UI PSO";
@@ -73,7 +73,7 @@ void NukeDiligent::Impl::CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT d
 	PSOCreateInfo.PSODesc.ResourceLayout.ImmutableSamplers    = samplers;
 	PSOCreateInfo.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
 
-	device->CreateGraphicsPipelineState(PSOCreateInfo, &uiPSO);
+	CreateGraphicsPipelineStateCached(PSOCreateInfo, &uiPSO);
 
 	BufferDesc cbd;
 	cbd.Name = "UI projection CB";
@@ -176,8 +176,8 @@ void NukeDiligent::Impl::BuildOutlinePipelines()
 	if (!mvs.empty() && !mps.empty())
 	{
 		RefCntAutoPtr<IShader> vs, ps;
-		sci.Desc = {"Outline Mask VS", SHADER_TYPE_VERTEX, true}; sci.Source = mvs.c_str(); device->CreateShader(sci, &vs);
-		sci.Desc = {"Outline Mask PS", SHADER_TYPE_PIXEL, true};  sci.Source = mps.c_str(); device->CreateShader(sci, &ps);
+		sci.Desc = {"Outline Mask VS", SHADER_TYPE_VERTEX, true}; sci.Source = mvs.c_str(); CreateShaderCached(sci, &vs);
+		sci.Desc = {"Outline Mask PS", SHADER_TYPE_PIXEL, true};  sci.Source = mps.c_str(); CreateShaderCached(sci, &ps);
 		if (vs && ps)
 		{
 			GraphicsPipelineStateCreateInfo ci;
@@ -193,7 +193,7 @@ void NukeDiligent::Impl::BuildOutlinePipelines()
 			gp.InputLayout.NumElements    = 3;
 			gp.InputLayout.LayoutElements = layout;
 			ci.pVS = vs; ci.pPS = ps;
-			device->CreateGraphicsPipelineState(ci, &outlineMaskPSO);
+			CreateGraphicsPipelineStateCached(ci, &outlineMaskPSO);
 			if (outlineMaskPSO)
 			{
 				if (auto* v = outlineMaskPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB")) v->Set(worldCB);
@@ -212,8 +212,8 @@ void NukeDiligent::Impl::BuildOutlinePipelines()
 		device->CreateBuffer(cbd, nullptr, &outlineEdgeCB);
 
 		RefCntAutoPtr<IShader> vs, ps;
-		sci.Desc = {"Outline Edge VS", SHADER_TYPE_VERTEX, true}; sci.Source = evs.c_str(); device->CreateShader(sci, &vs);
-		sci.Desc = {"Outline Edge PS", SHADER_TYPE_PIXEL, true};  sci.Source = eps.c_str(); device->CreateShader(sci, &ps);
+		sci.Desc = {"Outline Edge VS", SHADER_TYPE_VERTEX, true}; sci.Source = evs.c_str(); CreateShaderCached(sci, &vs);
+		sci.Desc = {"Outline Edge PS", SHADER_TYPE_PIXEL, true};  sci.Source = eps.c_str(); CreateShaderCached(sci, &ps);
 		if (vs && ps)
 		{
 			GraphicsPipelineStateCreateInfo ci;
@@ -236,7 +236,7 @@ void NukeDiligent::Impl::BuildOutlinePipelines()
 			ci.PSODesc.ResourceLayout.ImmutableSamplers    = imm;
 			ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
 			ci.pVS = vs; ci.pPS = ps;
-			device->CreateGraphicsPipelineState(ci, &outlineEdgePSO);
+			CreateGraphicsPipelineStateCached(ci, &outlineEdgePSO);
 			if (outlineEdgePSO)
 			{
 				if (auto* c = outlineEdgePSO->GetStaticVariableByName(SHADER_TYPE_PIXEL, "EdgeCB")) c->Set(outlineEdgeCB);
@@ -283,8 +283,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		sci.Macros         = ShaderMacroArray{rtMacro, 1};
 	}
 	RefCntAutoPtr<IShader> vs, ps;
-	sci.Desc = {dbg, SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); device->CreateShader(sci, &vs);
-	sci.Desc = {dbg, SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); device->CreateShader(sci, &ps);
+	sci.Desc = {dbg, SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); CreateShaderCached(sci, &vs);
+	sci.Desc = {dbg, SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); CreateShaderCached(sci, &ps);
 	if (!vs || !ps) return false;
 
 	GraphicsPipelineStateCreateInfo ci;
@@ -331,6 +331,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	// unassigned immutable samplers (Diligent warns). Shadow + probe samplers are attached to their SRVs elsewhere.
 	static const char* const kMapTex[] = { "g_Tex", "g_Normal", "g_MetalRough", "g_Occlusion", "g_Emissive", "g_Spec" };
 	ImmutableSamplerDesc immSamp[6]; Uint32 nImm = 0;
+	ps->GetStatus(true);   // async compile (cache miss): reflection needs the FINISHED shader
 	const Uint32 nRes = ps->GetResourceCount();
 	for (const char* nm : kMapTex)
 		for (Uint32 r = 0; r < nRes; ++r)
@@ -353,7 +354,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.pso.Release(); wp.psoBlend.Release(); wp.psoAdd.Release(); wp.psoWire.Release(); wp.srb.Release();
 
 	// 1) Opaque — blend off, depth write on (base ci as configured above).
-	device->CreateGraphicsPipelineState(ci, &wp.pso);
+	CreateGraphicsPipelineStateCached(ci, &wp.pso);
 	if (!wp.pso) { cout << "[NukeDiligent]\tPSO build failed for shader '" << dbg << "'" << endl; return false; }
 	setStatics(wp.pso);
 
@@ -365,7 +366,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		rt.SrcBlendAlpha = BLEND_FACTOR_ONE;  rt.DestBlendAlpha = BLEND_FACTOR_INV_SRC_ALPHA; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
 		ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = False;
 		ci.PSODesc.Name = "World (blend)";
-		device->CreateGraphicsPipelineState(ci, &wp.psoBlend);
+		CreateGraphicsPipelineStateCached(ci, &wp.psoBlend);
 		if (wp.psoBlend) setStatics(wp.psoBlend);
 	}
 	// 3) Additive — src*a + dst, depth write off.
@@ -375,7 +376,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		rt.SrcBlend = BLEND_FACTOR_SRC_ALPHA; rt.DestBlend = BLEND_FACTOR_ONE; rt.BlendOp = BLEND_OPERATION_ADD;
 		rt.SrcBlendAlpha = BLEND_FACTOR_ONE;  rt.DestBlendAlpha = BLEND_FACTOR_ONE; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
 		ci.PSODesc.Name = "World (add)";
-		device->CreateGraphicsPipelineState(ci, &wp.psoAdd);
+		CreateGraphicsPipelineStateCached(ci, &wp.psoAdd);
 		if (wp.psoAdd) setStatics(wp.psoAdd);
 	}
 	// 4) Wireframe — opaque state (blend off, depth write on) with line fill; the scene draw-mode
@@ -385,7 +386,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = True;
 		ci.GraphicsPipeline.RasterizerDesc.FillMode = FILL_MODE_WIREFRAME;
 		ci.PSODesc.Name = "World (wire)";
-		device->CreateGraphicsPipelineState(ci, &wp.psoWire);
+		CreateGraphicsPipelineStateCached(ci, &wp.psoWire);
 		if (wp.psoWire) setStatics(wp.psoWire);
 	}
 

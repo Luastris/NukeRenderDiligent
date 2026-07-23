@@ -11,6 +11,15 @@ void NukeDiligent::Impl::SetCameraViewProj(const NukeCameraDesc& cam, int w, int
 	float3 U = float3(cam.camUp[0], cam.camUp[1], cam.camUp[2]);
 	float3 R = normalize(cross(U, F)); U = cross(F, R);
 	curView = float4x4(R.x, U.x, F.x, 0.f, R.y, U.y, F.y, 0.f, R.z, U.z, F.z, 0.f, -dot(P, R), -dot(P, U), -dot(P, F), 1.f);
+	// Camera diagnostics (NUKE_TM_DIAG=1): what basis the renderer actually received.
+	static const bool diag = []{ const char* e = std::getenv("NUKE_TM_DIAG"); return e && *e == '1'; }();
+	if (diag)
+	{
+		static int n = 0;
+		if (n < 8) { ++n; std::cout << "[NukeDiligent]\tDIAG cam P(" << P.x << "," << P.y << "," << P.z
+		                            << ") F(" << F.x << "," << F.y << "," << F.z << ") vp " << w << "x" << h
+		                            << " ortho " << cam.ortho << " near " << cam.nearZ << " far " << cam.farZ << std::endl; }
+	}
 	// Projection: perspective, orthographic, or an element-wise blend of the two matrices (the
 	// standard perspective<->ortho tween — the engine animates cam.ortho for a smooth transition).
 	float4x4 persp = float4x4::Projection(cam.fov, aspect, cam.nearZ, cam.farZ, false);
@@ -209,6 +218,9 @@ void NukeDiligent::renderSelectionOutline(Mesh* mesh, const float pos[3], const 
 void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 {
 	MapHelper<FrameCBData> fb(context, worldFrameCB, MAP_WRITE, MAP_FLAG_DISCARD);
+	// A dead device (removal detected mid-frame) makes Map return null — writing through
+	// it turned a recoverable removal into an editor CRASH. Bail; render() suspends.
+	if (fb == nullptr) return;
 	memset(fb, 0, sizeof(FrameCBData));
 	fb->camPos[0] = P.x; fb->camPos[1] = P.y; fb->camPos[2] = P.z;
 	fb->ambient[0] = sky.ambient[0]; fb->ambient[1] = sky.ambient[1];
@@ -350,8 +362,8 @@ void NukeDiligent::Impl::CreateDebugResources()
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]	debug-line shaders missing" << endl; return; }
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	RefCntAutoPtr<IShader> v, p;
-	sci.Desc = {"Debug VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); device->CreateShader(sci, &v);
-	sci.Desc = {"Debug PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &p);
+	sci.Desc = {"Debug VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &v);
+	sci.Desc = {"Debug PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &p);
 	if (!v || !p) return;
 
 	BufferDesc cbd; cbd.Name = "DebugCB"; cbd.Size = sizeof(float4x4);
@@ -378,7 +390,7 @@ void NukeDiligent::Impl::CreateDebugResources()
 		};
 		gp.InputLayout.LayoutElements = layout; gp.InputLayout.NumElements = 2;
 		ci.pVS = v; ci.pPS = p;
-		device->CreateGraphicsPipelineState(ci, &pso);
+		CreateGraphicsPipelineStateCached(ci, &pso);
 		if (pso)
 		{
 			if (auto* sv = pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "DebugCB")) sv->Set(debugCB);
@@ -453,8 +465,8 @@ void NukeDiligent::Impl::DrawDepthDebugLines()
 		if (vsSrc.empty() || psSrc.empty()) return;
 		ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 		RefCntAutoPtr<IShader> v, p;
-		sci.Desc = {"Debug VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); device->CreateShader(sci, &v);
-		sci.Desc = {"Debug PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); device->CreateShader(sci, &p);
+		sci.Desc = {"Debug VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); CreateShaderCached(sci, &v);
+		sci.Desc = {"Debug PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); CreateShaderCached(sci, &p);
 		if (!v || !p) return;
 		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Debug Lines PSO (depth)";
 		auto& gp = ci.GraphicsPipeline;
@@ -471,7 +483,7 @@ void NukeDiligent::Impl::DrawDepthDebugLines()
 		};
 		gp.InputLayout.LayoutElements = layout; gp.InputLayout.NumElements = 2;
 		ci.pVS = v; ci.pPS = p;
-		device->CreateGraphicsPipelineState(ci, &debugDepthPSO);
+		CreateGraphicsPipelineStateCached(ci, &debugDepthPSO);
 		if (!debugDepthPSO) return;
 		if (auto* sv = debugDepthPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "DebugCB")) sv->Set(debugCB);
 		debugDepthPSO->CreateShaderResourceBinding(&debugDepthSRB, true);
@@ -511,6 +523,7 @@ void NukeDiligent::endCamera()
 {
 	m_impl->DrawDepthDebugLines();   // depth-tested gizmos: against this camera's still-bound MS depth
 	m_impl->FlushSprites();     // draw any pending sprite batch WHILE the (MS) camera targets are still bound
+	m_impl->FlushSpritesLit();  // ...and the pending lit batch (tilemap normal-mapped runs)
 	m_impl->FlushScreenPre();   // WithWorld screen-space canvas sprites: into the scene, before post
 	// 1) Resolve the multisampled HDR color into the single-sample HDR texture (post-pass input).
 	if (m_impl->curMSAA && m_impl->curResolveSrc && m_impl->curResolveDst)

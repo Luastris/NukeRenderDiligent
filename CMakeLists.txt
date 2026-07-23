@@ -31,7 +31,7 @@ if(_nuke_atl_dirs)
 endif()
 set(DILIGENT_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(DILIGENT_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
-set(DILIGENT_NO_VULKAN     ON  CACHE BOOL "" FORCE)
+set(DILIGENT_NO_VULKAN     OFF CACHE BOOL "" FORCE)   # Vulkan backend (task #138): editor default; DX stays for the runtime
 set(DILIGENT_NO_OPENGL     ON  CACHE BOOL "" FORCE)
 set(DILIGENT_NO_WEBGPU     ON  CACHE BOOL "" FORCE)
 set(DILIGENT_NO_ARCHIVER   ON  CACHE BOOL "" FORCE)
@@ -78,6 +78,7 @@ target_link_directories(NukeRenderDiligent PRIVATE
 target_link_libraries(NukeRenderDiligent PRIVATE
     Diligent-GraphicsEngineD3D11-static
     Diligent-GraphicsEngineD3D12-static
+    Diligent-GraphicsEngineVk-static
     Diligent-GraphicsTools
     Diligent-Common
     Diligent-GraphicsAccessories
@@ -102,9 +103,10 @@ add_custom_command(TARGET NukeRenderDiligent POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${VCPKG_INSTALLED}/$<$<CONFIG:Debug>:debug/>bin/glfw3.dll" "${EDITOR_DIR}/"
     # DXC (dxcompiler.dll + dxil.dll): Diligent LoadLibrary's dxcompiler.dll by bare name at
-    # runtime to compile SM6.5 shaders (RayTracingAccelerationStructure etc). It is NOT a system
-    # DLL and NOT on the default search path, so it must sit next to the exe. Vendored (deps/dxc)
-    # so shipped builds are self-sufficient — same DLL for Debug/Release (config-agnostic tool).
+    # runtime to compile SM6.x shaders (RT etc). It is NOT a system DLL and NOT on the default
+    # search path, so it must sit next to the exe. Vendored (deps/dxc) from the OFFICIAL DXC
+    # release: ONE compiler for both backends — DXIL for D3D12 (dxil.dll = matching signer)
+    # and SPIR-V for Vulkan (EngineVkCreateInfo::pDxCompilerPath points at this same DLL).
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/deps/dxc/dxcompiler.dll" "${EDITOR_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

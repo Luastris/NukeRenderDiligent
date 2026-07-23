@@ -238,7 +238,12 @@ void NukeDiligent::bindRenderTarget(uint64_t id)
 	if (id == 0) { m_impl->uiRTV = nullptr; m_impl->uiTW = m_impl->uiTH = 0; return; }
 	auto it = m_impl->rts.find(id);
 	if (it == m_impl->rts.end()) { m_impl->uiRTV = nullptr; m_impl->uiTW = m_impl->uiTH = 0; return; }
-	m_impl->uiRTV = it->second.rtv; m_impl->uiTW = (Uint32)it->second.w; m_impl->uiTH = (Uint32)it->second.h;
+	// Runtime UI composites over the DISPLAYED image = the LDR post output (rt.srv shows it),
+	// written by the camera's post pass before the GUI flushes. The HDR color target (rt.rtv,
+	// RGBA16F) would mismatch the UI PSO's RGBA8 format — D3D12 silently discards every draw
+	// (invisible HUD + a per-draw validation warning).
+	m_impl->uiRTV = it->second.postRTV ? it->second.postRTV : it->second.rtv;
+	m_impl->uiTW = (Uint32)it->second.w; m_impl->uiTH = (Uint32)it->second.h;
 }
 void NukeDiligent::invalidateTexture(Texture* t)   // re-uploaded on next GetTexSRV
 {
@@ -339,4 +344,71 @@ uint64_t NukeDiligent::getRenderTargetTexture(uint64_t id)
 {
 	auto it = m_impl->rts.find(id);
 	return (it == m_impl->rts.end()) ? 0 : reinterpret_cast<uint64_t>(it->second.srv);
+}
+
+// Staging readback of a target (screenshot / pixel verification — see irender.h). Copies the
+// LDR image (backbuffer or the RT's post output) into a fresh staging texture, idles the GPU
+// and maps it. Handles the two LDR layouts we ever produce (RGBA8/BGRA8, incl. sRGB views).
+bool NukeDiligent::captureTarget(uint64_t rtId, int& w, int& h, std::vector<uint8_t>& rgba)
+{
+	if (!m_impl->device || !m_impl->context) return false;
+	ITexture* src = nullptr;
+	if (rtId == 0)
+	{
+		if (!m_impl->swapChain) return false;
+		ITextureView* bb = m_impl->swapChain->GetCurrentBackBufferRTV();
+		if (!bb) return false;
+		src = bb->GetTexture();
+	}
+	else
+	{
+		auto it = m_impl->rts.find(rtId);
+		if (it == m_impl->rts.end() || !it->second.post) return false;
+		src = it->second.post;
+	}
+	if (!src) return false;
+
+	const TextureDesc& sd = src->GetDesc();
+	const TEXTURE_FORMAT fmt = sd.Format;
+	const bool isRGBA = fmt == TEX_FORMAT_RGBA8_UNORM || fmt == TEX_FORMAT_RGBA8_UNORM_SRGB;
+	const bool isBGRA = fmt == TEX_FORMAT_BGRA8_UNORM || fmt == TEX_FORMAT_BGRA8_UNORM_SRGB;
+	if (!isRGBA && !isBGRA) return false;   // LDR 8-bit only — HDR targets are not "what's shown"
+
+	TextureDesc st;
+	st.Name = "capture staging"; st.Type = RESOURCE_DIM_TEX_2D;
+	st.Width = sd.Width; st.Height = sd.Height; st.Format = fmt;
+	st.MipLevels = 1; st.Usage = USAGE_STAGING; st.CPUAccessFlags = CPU_ACCESS_READ;
+	st.BindFlags = BIND_NONE;
+	RefCntAutoPtr<ITexture> staging;
+	m_impl->device->CreateTexture(st, nullptr, &staging);
+	if (!staging) return false;
+
+	CopyTextureAttribs cp(src, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
+	                      staging, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	m_impl->context->CopyTexture(cp);
+	m_impl->context->Flush();
+	m_impl->device->IdleGPU();   // the copy must be complete before the map
+
+	MappedTextureSubresource m;
+	m_impl->context->MapTextureSubresource(staging, 0, 0, MAP_READ, MAP_FLAG_NONE, nullptr, m);
+	if (!m.pData) return false;
+	w = (int)sd.Width; h = (int)sd.Height;
+	rgba.resize((size_t)w * h * 4);
+	const uint8_t* srcRow = (const uint8_t*)m.pData;
+	for (int y = 0; y < h; ++y, srcRow += m.Stride)
+	{
+		uint8_t* dst = rgba.data() + (size_t)y * w * 4;
+		if (isRGBA)
+			std::memcpy(dst, srcRow, (size_t)w * 4);
+		else
+			for (int x = 0; x < w; ++x)   // BGRA -> RGBA
+			{
+				dst[x * 4 + 0] = srcRow[x * 4 + 2];
+				dst[x * 4 + 1] = srcRow[x * 4 + 1];
+				dst[x * 4 + 2] = srcRow[x * 4 + 0];
+				dst[x * 4 + 3] = srcRow[x * 4 + 3];
+			}
+	}
+	m_impl->context->UnmapTextureSubresource(staging, 0, 0);
+	return true;
 }

@@ -8,8 +8,8 @@ void NukeDiligent::Impl::CreateSkyResources()
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tsky shaders missing" << endl; return; }
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	RefCntAutoPtr<IShader> v, p;
-	sci.Desc = {"Sky VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); device->CreateShader(sci, &v);
-	sci.Desc = {"Sky PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &p);
+	sci.Desc = {"Sky VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &v);
+	sci.Desc = {"Sky PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &p);
 	if (!v || !p) return;
 
 	BufferDesc cbd; cbd.Name = "SkyCB"; cbd.Size = sizeof(float4x4) + sizeof(float) * 4 * 9;   // InvVP + 9 float4
@@ -41,7 +41,7 @@ void NukeDiligent::Impl::CreateSkyResources()
 	};
 	ci.PSODesc.ResourceLayout.ImmutableSamplers = simm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 2;
 	ci.pVS = v; ci.pPS = p;
-	device->CreateGraphicsPipelineState(ci, &skyPSO);
+	CreateGraphicsPipelineStateCached(ci, &skyPSO);
 	if (skyPSO)
 	{
 		if (auto* sv = skyPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL, "SkyCB")) sv->Set(skyCB);

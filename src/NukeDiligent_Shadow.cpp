@@ -68,8 +68,8 @@ void NukeDiligent::Impl::CreateShadowResources()
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tshadow shaders missing" << endl; return; }
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	RefCntAutoPtr<IShader> vsh, psh;
-	sci.Desc = {"Shadow VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); device->CreateShader(sci, &vsh);
-	sci.Desc = {"Shadow PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &psh);
+	sci.Desc = {"Shadow VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &vsh);
+	sci.Desc = {"Shadow PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &psh);
 	if (!vsh || !psh) return;
 
 	GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Shadow PSO";
@@ -95,7 +95,7 @@ void NukeDiligent::Impl::CreateShadowResources()
 	ImmutableSamplerDesc imm[] = {{SHADER_TYPE_PIXEL, "g_Tex", samp}};
 	ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
 	ci.pVS = vsh; ci.pPS = psh;
-	device->CreateGraphicsPipelineState(ci, &shadowPSO);
+	CreateGraphicsPipelineStateCached(ci, &shadowPSO);
 	if (shadowPSO)
 	{
 		// Bind the per-draw cbuffers. Try static (on the PSO) and mutable (on the SRB) — whichever the

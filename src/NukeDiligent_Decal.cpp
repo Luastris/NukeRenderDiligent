@@ -23,8 +23,8 @@ void NukeDiligent::Impl::CreateDecalResources()
 
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	RefCntAutoPtr<IShader> v, p;
-	sci.Desc = {"Decal VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); device->CreateShader(sci, &v);
-	sci.Desc = {"Decal PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); device->CreateShader(sci, &p);
+	sci.Desc = {"Decal VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &v);
+	sci.Desc = {"Decal PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &p);
 	if (!v || !p) return;
 
 	BufferDesc cbd; cbd.Name = "DecalCB"; cbd.Size = sizeof(DecalCBData);
@@ -80,7 +80,7 @@ void NukeDiligent::Impl::CreateDecalResources()
 		ci.PSODesc.ResourceLayout.Variables            = vars; ci.PSODesc.ResourceLayout.NumVariables         = 2;
 		ci.PSODesc.ResourceLayout.ImmutableSamplers    = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 2;
 		ci.PSODesc.ResourceLayout.DefaultVariableType  = SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
-		device->CreateGraphicsPipelineState(ci, &pso);
+		CreateGraphicsPipelineStateCached(ci, &pso);
 		if (pso)
 		{
 			if (auto* sv = pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "DecalCB")) sv->Set(decalCB);

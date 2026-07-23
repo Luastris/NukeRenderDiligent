@@ -4,13 +4,33 @@
 #include "SwapChainD3D11.h"
 #include <config.h>              // nuke::WindowMode (window display mode)
 #include <d3d12.h>
+#include <dxgidebug.h>           // IDXGIInfoQueue: DXGI's OWN error queue (swapchain/present faults)
 #include <dcomp.h>               // DirectComposition (per-pixel window transparency)
 #include <cstdlib>               // std::getenv (NUKE_GPU_VALIDATION opt-in)
+#include <boost/filesystem.hpp>
+#include <boost/filesystem/fstream.hpp>   // shader/PSO cache file IO
+#include <iterator>              // istreambuf_iterator (cache load)
 
 // NUKE PATCH global (DEFINED in the vendored SwapChainD3DBase.cpp so the Diligent DLLs resolve
 // it too): true => the PRIMARY swap chain is created for DirectComposition (premultiplied
 // alpha) instead of the HWND. Set only around the transparent window's swap-chain creation.
 extern "C" bool g_NukeCompositionSwapChain;
+
+#include "DebugOutput.h"   // Diligent::SetDebugMessageCallback
+
+// Diligent's DEFAULT debug output writes to the console from whatever thread logs — the
+// async shader-compile workers included. Concurrent fwrite on one stream trips the debug
+// CRT ("Inconsistent Stream Count"). Route every Diligent message through one mutex.
+static void NukeDiligentLogCallback(Diligent::DEBUG_MESSAGE_SEVERITY sev, const Diligent::Char* msg,
+                                    const char* /*func*/, const char* /*file*/, int /*line*/)
+{
+	static std::mutex logMutex;
+	std::lock_guard<std::mutex> lk(logMutex);
+	const char* tag = sev == Diligent::DEBUG_MESSAGE_SEVERITY_FATAL_ERROR ? "FATAL"
+	                : sev == Diligent::DEBUG_MESSAGE_SEVERITY_ERROR       ? "ERROR"
+	                : sev == Diligent::DEBUG_MESSAGE_SEVERITY_WARNING     ? "Warning" : "Info";
+	std::cout << "Diligent Engine: " << tag << ": " << (msg ? msg : "") << std::endl;
+}
 
 // The D3D12 debug layer reports the ACTUAL invalid operation (what the "Failed to close
 // the command list" / device-removed asserts are symptoms of) — but only into the
@@ -102,6 +122,44 @@ static void DrainD3D12DebugMessages(Diligent::IRenderDevice* dev, bool useD3D12)
 			std::cout << "[D3D12] " << m->pDescription << std::endl;
 	}
 	seen = n;
+
+	// DXGI keeps its OWN info queue — swapchain/present errors land THERE, never in the
+	// D3D12 device queue. The "silent" ACCESS_DENIED removals were DXGI naming the guilty
+	// call into a queue nobody read.
+#ifdef _WIN32
+	// DXGI_DEBUG_ALL without dxguid.lib (same GUID, local definition).
+	static const GUID kDxgiDebugAll = { 0xe48ae283, 0xda80, 0x490b, { 0x87, 0xe6, 0x43, 0xe9, 0xa9, 0xcf, 0xda, 0x08 } };
+	static IDXGIInfoQueue* dxgiIq = nullptr;
+	static bool dxgiTried = false;
+	if (!dxgiTried)
+	{
+		dxgiTried = true;
+		if (HMODULE dbg = LoadLibraryA("dxgidebug.dll"))
+		{
+			typedef HRESULT(WINAPI* PFN)(UINT, REFIID, void**);
+			if (PFN get = (PFN)GetProcAddress(dbg, "DXGIGetDebugInterface1"))
+				get(0, __uuidof(IDXGIInfoQueue), (void**)&dxgiIq);
+		}
+	}
+	if (dxgiIq)
+	{
+		const UINT64 dn = dxgiIq->GetNumStoredMessages(kDxgiDebugAll);
+		static UINT64 dseen = 0;
+		if (dn < dseen) dseen = 0;
+		for (UINT64 i = dseen; i < dn; ++i)
+		{
+			SIZE_T len = 0;
+			dxgiIq->GetMessage(kDxgiDebugAll, i, nullptr, &len);
+			if (!len) continue;
+			std::vector<char> buf(len);
+			DXGI_INFO_QUEUE_MESSAGE* m = reinterpret_cast<DXGI_INFO_QUEUE_MESSAGE*>(buf.data());
+			if (SUCCEEDED(dxgiIq->GetMessage(kDxgiDebugAll, i, m, &len))
+			    && m->Severity <= DXGI_INFO_QUEUE_MESSAGE_SEVERITY_WARNING && m->pDescription)
+				std::cout << "[DXGI] " << m->pDescription << std::endl;
+		}
+		dseen = dn;
+	}
+#endif
 }
 
 bool NukeDiligent::Impl::DeviceRemoved()
@@ -232,6 +290,8 @@ int NukeDiligent::init(const WindowDesc& desc)
 {
 	int w = desc.w, h = desc.h;
 	cout << "[NukeDiligent]\tinit(" << w << ", " << h << ")" << endl;
+	// Serialize Diligent's log output (async shader-compile workers log concurrently).
+	Diligent::SetDebugMessageCallback(&NukeDiligentLogCallback);
 	if (w <= 0 || h <= 0) { cout << "[NukeDiligent]\tbad size, using 1280x720" << endl; w = 1280; h = 720; }
 
 	glfwSetErrorCallback(glfw_error);
@@ -292,11 +352,13 @@ int NukeDiligent::init(const WindowDesc& desc)
 		glfwSetWindowOpacity(m_window, desc.opacity);
 	glfwShowWindow(m_window);
 
-	m_impl->useD3D12 = (desc.backend == 1);
+	m_impl->useD3D12  = (desc.backend == 1);
+	m_impl->useVulkan = (desc.backend == 2);
 	// Per-pixel transparency: the PRIMARY swap chain is built for DirectComposition (see the
-	// vendored SwapChainD3DBase.hpp patch). Set the flag around creation only; reset after so
-	// secondary (UI viewport) swap chains stay ordinary opaque HWND chains.
-	g_NukeCompositionSwapChain = desc.transparent;
+	// vendored SwapChainD3DBase.hpp patch). D3D backends only — Vulkan has no DComp path.
+	// Set the flag around creation only; reset after so secondary (UI viewport) swap chains
+	// stay ordinary opaque HWND chains.
+	g_NukeCompositionSwapChain = desc.transparent && !m_impl->useVulkan;
 	Win32NativeWindow Window{ hWnd };
 	SwapChainDesc SCDesc;
 	// Match the World PSO + offscreen render targets (RGBA8_UNORM). Diligent defaults the
@@ -360,6 +422,40 @@ int NukeDiligent::init(const WindowDesc& desc)
 		pFactory->CreateSwapChainD3D12(m_impl->device, m_impl->context, SCDesc,
 		                               FullScreenModeDesc{}, Window, &m_impl->swapChain);
 	}
+	else if (m_impl->useVulkan)
+	{
+		// VULKAN (task #138): same Diligent API surface, no DXGI anywhere — swap chains,
+		// resizes and presents go through the Vulkan WSI, which is the stack every other
+		// engine runs multi-window on. Shaders stay HLSL: Diligent compiles them to
+		// SPIR-V with the vendored glslang (DXC is only used by the D3D12 RT path).
+		auto* pFactory = GetEngineFactoryVk(); engFactory = pFactory;
+		EngineVkCreateInfo EngineCI;
+#ifdef _DEBUG
+		const char* vkValEnv = std::getenv("NUKE_GPU_VALIDATION");
+		if (desc.gpuValidation || (vkValEnv && vkValEnv[0] && vkValEnv[0] != '0'))
+		{
+			EngineCI.SetValidationLevel(VALIDATION_LEVEL_1);
+			cout << "[NukeDiligent]\tVulkan validation layers ENABLED (gpuValidation)" << endl;
+		}
+#endif
+		// Editor-class dynamic budgets, mirroring the D3D12 branch: the UI + preview worlds
+		// + host windows burn through per-frame dynamic memory faster than the defaults.
+		EngineCI.DynamicHeapSize = 32u << 20;
+		// BACKGROUND shader compilation: cache-miss shaders compile on a worker pool in
+		// parallel instead of serializing the boot (glslang is the slow part on Vulkan).
+		EngineCI.Features.AsyncShaderCompilation = DEVICE_FEATURE_STATE_OPTIONAL;
+		// Hardware ray tracing (VK_KHR_ray_tracing_pipeline / ray_query): request it —
+		// unlike D3D12, Vulkan device features must be opted into at creation.
+		EngineCI.Features.RayTracing = DEVICE_FEATURE_STATE_OPTIONAL;
+		// RT shaders are SM6.x HLSL and need DXC (glslang can't parse them). ONE vendored
+		// dxcompiler.dll (the official release) serves both backends — it emits DXIL for
+		// D3D12 and SPIR-V for Vulkan; point Diligent at it instead of its default
+		// "spv_dxcompiler.dll" name so we don't ship the compiler twice.
+		EngineCI.pDxCompilerPath = "dxcompiler.dll";
+		pFactory->CreateDeviceAndContextsVk(EngineCI, &m_impl->device, &m_impl->context);
+		if (!m_impl->device) { cout << "[NukeDiligent]\tVulkan device creation failed" << endl; return 1; }
+		pFactory->CreateSwapChainVk(m_impl->device, m_impl->context, SCDesc, Window, &m_impl->swapChain);
+	}
 	else
 	{
 		auto* pFactory = GetEngineFactoryD3D11(); engFactory = pFactory;
@@ -375,7 +471,9 @@ int NukeDiligent::init(const WindowDesc& desc)
 
 	// Transparent window: bind the composition swap chain into a DirectComposition visual on
 	// the HWND so its per-pixel alpha shows the desktop (the swap chain alone doesn't compose).
-	if (desc.transparent)
+	if (desc.transparent && m_impl->useVulkan)
+		cout << "[NukeDiligent]\twindow transparency is D3D-only (DirectComposition) — opaque on Vulkan" << endl;
+	if (desc.transparent && !m_impl->useVulkan)
 	{
 		IDXGISwapChain* dxgiSC = nullptr;
 		if (m_impl->useD3D12)
@@ -419,14 +517,19 @@ int NukeDiligent::init(const WindowDesc& desc)
 	}
 	// Shader #include resolver (+ RT shader loader): resolves "rt_common.hlsl" etc. from the shaders directory.
 	if (engFactory) engFactory->CreateDefaultShaderSourceStreamFactory("shaders", &m_impl->shaderFactory);
-	// Ray tracing needs the D3D12 backend AND a capable GPU/driver (RTX / DXR1.1).
-	m_impl->rtSupported = m_impl->useD3D12 && m_impl->device &&
+	// Ray tracing: D3D12 (DXR) or Vulkan (VK_KHR_ray_tracing) + a capable GPU/driver.
+	// The whole RT path is Diligent-API (BLAS/TLAS/SBT); shaders compile through DXC —
+	// DXIL on D3D12, SPIR-V on Vulkan (Diligent picks the target per backend).
+	m_impl->rtSupported = (m_impl->useD3D12 || m_impl->useVulkan) && m_impl->device &&
 	                      (m_impl->device->GetAdapterInfo().RayTracing.CapFlags & RAY_TRACING_CAP_FLAG_STANDALONE_SHADERS) != 0;
-	cout << "[NukeDiligent]\tbackend=" << (m_impl->useD3D12 ? "D3D12" : "D3D11")
+	cout << "[NukeDiligent]\tbackend=" << (m_impl->useD3D12 ? "D3D12" : m_impl->useVulkan ? "Vulkan" : "D3D11")
 	     << " rayTracing=" << (m_impl->rtSupported ? "yes" : "no") << endl;
-	if (m_impl->rtSupported) m_impl->EnsureRTFallback();   // g_TLAS must have a valid bind before any draw
+	// NOTE: the RT fallback TLAS is built at the TOP OF THE FIRST FRAME, not here — on
+	// Vulkan an acceleration-structure build before the frame loop starts deadlocks in
+	// the upload path (a fence with no submission to signal it). See render().
 
-	if (m_impl->hdrOutput) m_impl->SetupHDROutput();   // set the HDR10 colour space if the monitor is in HDR mode
+	if (m_impl->hdrOutput && !m_impl->useVulkan)
+		m_impl->SetupHDROutput();   // HDR10 colour space via DXGI — D3D backends only for now
 
 	const SwapChainDesc& scd = m_impl->swapChain->GetDesc();
 	m_impl->CreateUIPipeline(scd.ColorBufferFormat, scd.DepthBufferFormat);
@@ -477,6 +580,9 @@ int NukeDiligent::render()
 	// Secondary-window swap chains: apply queued creations/resizes NOW, before anything is
 	// recorded — doing it mid-frame under load intermittently wedged the queue.
 	m_impl->ApplyPendingViewportOps();
+	// RT fallback TLAS on the FIRST frame (idempotent): building it at init deadlocks
+	// Vulkan's upload path (no frame in flight to signal the wait fence).
+	if (m_impl->rtSupported && !m_impl->fallbackTLAS) m_impl->EnsureRTFallback();
 
 	// Frame stats: latch the completed frame's counters for getFrameStats, start fresh.
 	m_impl->statDrawsOut = m_impl->statDraws;
@@ -559,6 +665,22 @@ int NukeDiligent::render()
 
 	if (m_impl->DeviceRemoved()) return 1;   // device lost this frame: skip present, keep the app alive
 	m_impl->swapChain->Present(m_impl->vsync ? 1 : 0);   // SyncInterval 1 = vsync, 0 = uncapped
+	// Secondary windows present AFTER the main chain: their draw commands were recorded in
+	// the frame body; presenting them mid-frame (Present flushes) split the stream between
+	// an RT write and its sampling and tripped the debug layer into removing the device.
+	// VULKAN native viewports: present the per-window swapchains after the main present.
+	for (void* h : m_impl->vpPresentQueue)
+	{
+		auto it = m_impl->uiVpSC.find(h);
+		if (it == m_impl->uiVpSC.end() || !it->second) continue;
+		it->second->Present(0);
+	}
+	m_impl->vpPresentQueue.clear();
+	// D3D detached windows get their pixels via GDI from the offscreen RTs rendered
+	// during the frame (NO secondary swap chains — see uiViewportRender/BlitHostWindows).
+	// After the main Present keeps the readback maps off the frame's critical path.
+	m_impl->BlitHostWindows();
+	m_impl->PollShaderSaves();   // persist finished background compiles into the disk cache
 	return 1;
 }
 
@@ -581,6 +703,97 @@ void NukeDiligent::loop()
 void NukeDiligent::requestClose()
 {
 	if (m_window) glfwSetWindowShouldClose(m_window, GLFW_TRUE);
+}
+
+// OUR shader-bytecode cache (Vulkan): key the FULL compile inputs, store the SPIR-V.
+// A hit creates the shader from ByteCode — glslang never runs for it.
+void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader** pp)
+{
+	if (!useVulkan || !ci.Source)   // only source-based shaders on the slow-compile backend
+	{
+		device->CreateShader(ci, pp);
+		return;
+	}
+	// FNV-1a over everything that affects codegen.
+	auto fnv = [](uint64_t h, const void* data, size_t n)
+	{
+		const unsigned char* p = (const unsigned char*)data;
+		for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+		return h;
+	};
+	uint64_t h = 1469598103934665603ull;
+	const size_t srcLen = ci.SourceLength ? ci.SourceLength : strlen(ci.Source);
+	h = fnv(h, ci.Source, srcLen);
+	if (ci.EntryPoint) h = fnv(h, ci.EntryPoint, strlen(ci.EntryPoint));
+	h = fnv(h, &ci.Desc.ShaderType, sizeof(ci.Desc.ShaderType));
+	h = fnv(h, &ci.Desc.UseCombinedTextureSamplers, sizeof(bool));
+	h = fnv(h, &ci.CompileFlags, sizeof(ci.CompileFlags));
+	h = fnv(h, &ci.HLSLVersion, sizeof(ci.HLSLVersion));
+	for (Uint32 i = 0; i < ci.Macros.Count; ++i)
+	{
+		if (ci.Macros[i].Name)       h = fnv(h, ci.Macros[i].Name, strlen(ci.Macros[i].Name));
+		if (ci.Macros[i].Definition) h = fnv(h, ci.Macros[i].Definition, strlen(ci.Macros[i].Definition));
+	}
+
+	namespace bfs = boost::filesystem;
+	char hex[24]; snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
+	const bfs::path dir("config/shadercache_vk");
+	const bfs::path file = dir / (std::string(hex) + ".spv");
+
+	boost::system::error_code ec;
+	if (bfs::exists(file, ec))
+	{
+		bfs::ifstream f(file, std::ios::binary);
+		std::vector<char> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+		if (!bytes.empty())
+		{
+			ShaderCreateInfo c2 = ci;
+			c2.Source = nullptr; c2.SourceLength = 0; c2.FilePath = nullptr;
+			c2.ByteCode = bytes.data();
+			c2.ByteCodeSize = bytes.size();
+			device->CreateShader(c2, pp);
+			if (*pp) return;   // corrupt/stale bytecode falls through to a fresh compile
+			cout << "[NukeDiligent]\tshader cache entry rejected, recompiling (" << hex << ")" << endl;
+		}
+	}
+
+	// Cache miss: compile in the BACKGROUND (worker pool) when the device supports it —
+	// the batch of shaders created around this one compiles in parallel; the PSO helper
+	// waits for readiness, so nothing downstream ever sees a half-compiled shader.
+	ShaderCreateInfo cc = ci;
+	if (device->GetDeviceInfo().Features.AsyncShaderCompilation)
+		cc.CompileFlags |= SHADER_COMPILE_FLAG_ASYNCHRONOUS;
+	device->CreateShader(cc, pp);
+	if (*pp)
+		pendingShaderSaves.emplace_back(RefCntAutoPtr<IShader>(*pp), file.string());
+}
+
+// Write finished cache-miss compiles to disk (called once per frame — the bytecode of an
+// async shader only exists after its worker finishes).
+void NukeDiligent::Impl::PollShaderSaves()
+{
+	if (pendingShaderSaves.empty()) return;
+	namespace bfs = boost::filesystem;
+	for (size_t i = 0; i < pendingShaderSaves.size(); )
+	{
+		IShader* s = pendingShaderSaves[i].first;
+		const SHADER_STATUS st = s->GetStatus(false);
+		if (st == SHADER_STATUS_COMPILING || st == SHADER_STATUS_UNINITIALIZED) { ++i; continue; }
+		if (st == SHADER_STATUS_READY)
+		{
+			const void* bc = nullptr; Uint64 n = 0;
+			s->GetBytecode(&bc, n);
+			if (bc && n)
+			{
+				boost::system::error_code ec;
+				const bfs::path file(pendingShaderSaves[i].second);
+				bfs::create_directories(file.parent_path(), ec);
+				bfs::ofstream f(file, std::ios::binary | std::ios::trunc);
+				if (f) f.write((const char*)bc, (std::streamsize)n);
+			}
+		}
+		pendingShaderSaves.erase(pendingShaderSaves.begin() + i);
+	}
 }
 
 void NukeDiligent::deinit()

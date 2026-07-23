@@ -87,8 +87,8 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	if (vsSrc.empty() || psSrc.empty()) return false;
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	RefCntAutoPtr<IShader> vs, ps;
-	sci.Desc = {"GBuffer VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); device->CreateShader(sci, &vs);
-	sci.Desc = {"GBuffer PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); device->CreateShader(sci, &ps);
+	sci.Desc = {"GBuffer VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); CreateShaderCached(sci, &vs);
+	sci.Desc = {"GBuffer PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); CreateShaderCached(sci, &ps);
 	if (!vs || !ps) return false;
 
 	GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "GBuffer PSO";
@@ -116,7 +116,7 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	};
 	ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 2;
 	ci.pVS = vs; ci.pPS = ps;
-	device->CreateGraphicsPipelineState(ci, &gbufPSO);
+	CreateGraphicsPipelineStateCached(ci, &gbufPSO);
 	if (!gbufPSO) { cout << "[NukeDiligent]\tgbuffer PSO build failed" << endl; return false; }
 	if (auto* c = gbufPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))    c->Set(worldCB);
 	if (auto* m = gbufPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB")) m->Set(worldMatCB);
