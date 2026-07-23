@@ -820,7 +820,13 @@ void NukeDiligent::deinit()
 
 void NukeDiligent::update() {}
 
-char* NukeDiligent::getEngine()  { return (char*)"Diligent - "; }
+char* NukeDiligent::getEngine()
+{
+	// Shown in the editor status bar: renderer + the ACTIVE backend.
+	if (m_impl->useVulkan) return (char*)"Diligent - Vulkan";
+	if (m_impl->useD3D12)  return (char*)"Diligent - D3D12";
+	return (char*)"Diligent - D3D11";
+}
 char* NukeDiligent::getVersion() { return (char*)"0.1.0"; }
 
 void NukeDiligent::setOnGUI(bst::function<void(void)> cb)    { m_impl->onGUI.push_back(cb); }
