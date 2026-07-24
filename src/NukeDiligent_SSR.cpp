@@ -123,6 +123,41 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	gbufPSO->CreateShaderResourceBinding(&gbufSRB, true);
 	gbufMRVar  = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
 	gbufNrmVar = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
+
+	// INSTANCED twin (7.1): per-instance world rows; the CB then carries the current and
+	// previous camera view*proj only (gbuffer.vs.hlsl NUKE_INSTANCED — camera-only velocity).
+	gbufPSOInst.Release(); gbufSRBInst.Release(); gbufMRVarInst = nullptr; gbufNrmVarInst = nullptr;
+	{
+		const std::string vsI = "#define NUKE_INSTANCED 1\n" + vsSrc;
+		const std::string psI = "#define NUKE_INSTANCED 1\n" + psSrc;
+		RefCntAutoPtr<IShader> vsi, psi;
+		sci.Desc = {"GBuffer VS (inst)", SHADER_TYPE_VERTEX, true}; sci.Source = vsI.c_str(); CreateShaderCached(sci, &vsi);
+		sci.Desc = {"GBuffer PS (inst)", SHADER_TYPE_PIXEL, true};  sci.Source = psI.c_str(); CreateShaderCached(sci, &psi);
+		if (vsi && psi)
+		{
+			LayoutElement layoutI[] = {
+				{0, 0, 3, VT_FLOAT32}, {1, 1, 3, VT_FLOAT32}, {2, 2, 2, VT_FLOAT32},
+				{3, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+				{4, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+				{5, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+				{6, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+				{7, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+			};
+			gp.InputLayout.LayoutElements = layoutI;
+			gp.InputLayout.NumElements    = 8;
+			ci.PSODesc.Name = "GBuffer PSO (inst)";
+			ci.pVS = vsi; ci.pPS = psi;
+			CreateGraphicsPipelineStateCached(ci, &gbufPSOInst);
+			if (gbufPSOInst)
+			{
+				if (auto* c = gbufPSOInst->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))    c->Set(worldCB);
+				if (auto* m = gbufPSOInst->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB")) m->Set(worldMatCB);
+				gbufPSOInst->CreateShaderResourceBinding(&gbufSRBInst, true);
+				gbufMRVarInst  = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
+				gbufNrmVarInst = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
+			}
+		}
+	}
 	return true;
 }
 
@@ -284,6 +319,60 @@ void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float po
 	ctx->SetPipelineState(m_impl->gbufPSO);
 	ctx->CommitShaderResources(m_impl->gbufSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{ (Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES };
+	ctx->Draw(da);
+}
+
+// Instanced g-buffer draw (7.1): [first, first+count) of `instBuf` into the prepass. The CB
+// carries the CURRENT and PREVIOUS camera view*proj only — instance velocity is camera-only
+// (static instances get exact motion vectors; per-instance previous transforms are not stored).
+void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count)
+{
+	if (!m_impl->gbufActive || !m_impl->gbufPSOInst || count <= 0) return;
+	auto bit = m_impl->instBufs.find(instBuf);
+	if (bit == m_impl->instBufs.end() || !bit->second.buf) return;
+	if (first < 0 || first + count > bit->second.count) return;
+	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
+	if (!gp) return;
+	++m_impl->statDraws;
+	m_impl->statTris += mesh ? (mesh->numVerts / 3) * count : 0;
+	Impl::MeshGPU& g = *gp;
+
+	float4x4 vp = m_impl->curView * m_impl->curProj;   // prepass is UNjittered
+	Impl::TAAState& tst = m_impl->taaStates[m_impl->curTarget];
+	float4x4 prevVP = tst.valid ? (tst.prevView * tst.prevProj) : vp;
+	struct CBData { float4x4 wvp; float4x4 world; float4x4 prevWVP; };
+	{
+		MapHelper<CBData> cb(m_impl->context, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (cb == nullptr) return;
+		cb->wvp = vp; cb->world = float4x4::Identity(); cb->prevWVP = prevVP;
+	}
+
+	float metallic = 0.0f, roughness = 0.6f; ITextureView* mrsrv = nullptr; ITextureView* nsrv = nullptr;
+	if (mat) { metallic = mat->metallic; roughness = mat->roughness;
+	           if (mat->mr) mrsrv = m_impl->GetTexSRV(mat->mr); if (mat->norm) nsrv = m_impl->GetTexSRV(mat->norm); }
+	{
+		MapHelper<Uint8> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (mb == nullptr) return;
+		Uint8* p = mb; memset(p, 0, Impl::kMatCBBytes);
+		float nrmY = nsrv ? ((mat && mat->norm && !mat->norm->invertGreen) ? -1.0f : 1.0f) : 0.0f;
+		float prm[4]  = { 0, nrmY, metallic, roughness };
+		memcpy(p + 16, prm, sizeof(float) * 4);
+		float prm2[4] = { mrsrv ? 1.0f : 0.0f, 0, 0, 1.0f };
+		memcpy(p + 32, prm2, sizeof(float) * 4);
+	}
+	if (m_impl->gbufMRVarInst)
+		m_impl->gbufMRVarInst->Set(mrsrv ? mrsrv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	if (m_impl->gbufNrmVarInst)
+		m_impl->gbufNrmVarInst->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+
+	IDeviceContext* ctx = m_impl->context;
+	IBuffer* vbs[] = { g.pos, g.nrm, g.uv, bit->second.buf }; Uint64 offs[] = { 0, 0, 0, 0 };
+	ctx->SetVertexBuffers(0, 4, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	ctx->SetPipelineState(m_impl->gbufPSOInst);
+	ctx->CommitShaderResources(m_impl->gbufSRBInst, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{ (Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES };
+	da.NumInstances          = (Uint32)count;
+	da.FirstInstanceLocation = (Uint32)first;
 	ctx->Draw(da);
 }
 

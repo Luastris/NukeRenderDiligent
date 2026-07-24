@@ -51,6 +51,13 @@ public:
 	void getCursorPos(double& x, double& y) override;
 	void setCursorMode(int mode) override;
 	int  getCursorMode() override;
+	// GPU instancing (7.1)
+	uint64_t createInstanceBuffer() override;
+	void     updateInstanceBuffer(uint64_t id, const NukeInstanceData* data, int count) override;
+	void     destroyInstanceBuffer(uint64_t id) override;
+	void renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count) override;
+	void renderShadowInstanced(Mesh* mesh, uint64_t instBuf, int first, int count, Material* mat) override;
+	void renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count) override;
 	bool isMouseButtonDown(int button) override;
 	void bindRenderTarget(uint64_t rtId) override;
 	void invalidateTexture(Texture* t) override;

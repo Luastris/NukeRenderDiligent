@@ -401,6 +401,92 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.cubeVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ShadowCube");
 	wp.probeVar  = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Probe");
 	wp.tlasVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_TLAS");
+
+	// --- INSTANCED variants (7.1): only for shaders that OPT IN by handling NUKE_INSTANCED. ---
+	// Same vs/ps sources compiled with the define prepended; the input layout gains 5 per-
+	// instance float4 attributes (world rows + tint + custom) in buffer slot 3. Rebuilt with
+	// the base variants on every MSAA/HDR flip (this function IS the rebuild path).
+	wp.psoInst.Release(); wp.psoInstBlend.Release(); wp.psoInstAdd.Release(); wp.psoInstWire.Release(); wp.srbInst.Release();
+	wp.texVarI = wp.normVarI = wp.mrVarI = wp.aoVarI = wp.emVarI = wp.specVarI = nullptr;
+	wp.shadowVarI = wp.cubeVarI = wp.probeVarI = wp.tlasVarI = nullptr;
+	if (vsSrc.find("NUKE_INSTANCED") != std::string::npos && psSrc.find("NUKE_INSTANCED") != std::string::npos)
+	{
+		const std::string vsI = "#define NUKE_INSTANCED 1\n" + vsSrc;
+		const std::string psI = "#define NUKE_INSTANCED 1\n" + psSrc;
+		RefCntAutoPtr<IShader> vsi, psi;
+		sci.Desc = {dbg, SHADER_TYPE_VERTEX, true}; sci.Source = vsI.c_str(); CreateShaderCached(sci, &vsi);
+		sci.Desc = {dbg, SHADER_TYPE_PIXEL, true};  sci.Source = psI.c_str(); CreateShaderCached(sci, &psi);
+		if (vsi && psi)
+		{
+			LayoutElement layoutI[] = {
+				{0, 0, 3, VT_FLOAT32},   // position
+				{1, 1, 3, VT_FLOAT32},   // normal
+				{2, 2, 2, VT_FLOAT32},   // uv
+				{3, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},   // world row 0
+				{4, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},   // world row 1
+				{5, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},   // world row 2
+				{6, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},   // tint
+				{7, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},   // custom
+			};
+			gp.InputLayout.LayoutElements = layoutI;
+			gp.InputLayout.NumElements    = 8;
+			ci.pVS = vsi; ci.pPS = psi;
+
+			// 1) Opaque — reset the state the wireframe variant left behind.
+			ci.GraphicsPipeline.BlendDesc.RenderTargets[0] = RenderTargetBlendDesc{};
+			ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = True;
+			ci.GraphicsPipeline.RasterizerDesc.FillMode = FILL_MODE_SOLID;
+			ci.PSODesc.Name = "World (inst)";
+			CreateGraphicsPipelineStateCached(ci, &wp.psoInst);
+			if (wp.psoInst)
+			{
+				setStatics(wp.psoInst);
+				// 2) Transparent.
+				{
+					auto& rt = ci.GraphicsPipeline.BlendDesc.RenderTargets[0];
+					rt.BlendEnable = True;
+					rt.SrcBlend = BLEND_FACTOR_SRC_ALPHA; rt.DestBlend = BLEND_FACTOR_INV_SRC_ALPHA; rt.BlendOp = BLEND_OPERATION_ADD;
+					rt.SrcBlendAlpha = BLEND_FACTOR_ONE;  rt.DestBlendAlpha = BLEND_FACTOR_INV_SRC_ALPHA; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
+					ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = False;
+					ci.PSODesc.Name = "World (inst blend)";
+					CreateGraphicsPipelineStateCached(ci, &wp.psoInstBlend);
+					if (wp.psoInstBlend) setStatics(wp.psoInstBlend);
+				}
+				// 3) Additive.
+				{
+					auto& rt = ci.GraphicsPipeline.BlendDesc.RenderTargets[0];
+					rt.BlendEnable = True;
+					rt.SrcBlend = BLEND_FACTOR_SRC_ALPHA; rt.DestBlend = BLEND_FACTOR_ONE; rt.BlendOp = BLEND_OPERATION_ADD;
+					rt.SrcBlendAlpha = BLEND_FACTOR_ONE;  rt.DestBlendAlpha = BLEND_FACTOR_ONE; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
+					ci.PSODesc.Name = "World (inst add)";
+					CreateGraphicsPipelineStateCached(ci, &wp.psoInstAdd);
+					if (wp.psoInstAdd) setStatics(wp.psoInstAdd);
+				}
+				// 4) Wireframe.
+				{
+					ci.GraphicsPipeline.BlendDesc.RenderTargets[0] = RenderTargetBlendDesc{};
+					ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = True;
+					ci.GraphicsPipeline.RasterizerDesc.FillMode = FILL_MODE_WIREFRAME;
+					ci.PSODesc.Name = "World (inst wire)";
+					CreateGraphicsPipelineStateCached(ci, &wp.psoInstWire);
+					if (wp.psoInstWire) setStatics(wp.psoInstWire);
+				}
+				wp.psoInst->CreateShaderResourceBinding(&wp.srbInst, true);
+				wp.texVarI  = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
+				wp.normVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
+				wp.mrVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
+				wp.aoVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Occlusion");
+				wp.emVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Emissive");
+				wp.specVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Spec");
+				wp.shadowVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Shadow");
+				wp.cubeVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_ShadowCube");
+				wp.probeVarI  = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Probe");
+				wp.tlasVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_TLAS");
+			}
+			else
+				cout << "[NukeDiligent]\tinstanced PSO build failed for shader '" << dbg << "'" << endl;
+		}
+	}
 	return true;
 }
 

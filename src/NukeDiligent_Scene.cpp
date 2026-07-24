@@ -626,3 +626,155 @@ void NukeDiligent::getViewProj(float* view16, float* proj16)
 	if (view16) memcpy(view16, m_impl->curView.Data(), 16 * sizeof(float));
 	if (proj16) memcpy(proj16, m_impl->curProj.Data(), 16 * sizeof(float));
 }
+
+// ---- GPU instancing (7.1) --------------------------------------------------------------
+
+uint64_t NukeDiligent::createInstanceBuffer()
+{
+	uint64_t id = m_impl->nextInstBuf++;
+	m_impl->instBufs[id] = Impl::InstBuf{};
+	return id;
+}
+
+void NukeDiligent::updateInstanceBuffer(uint64_t id, const NukeInstanceData* data, int count)
+{
+	auto it = m_impl->instBufs.find(id);
+	if (it == m_impl->instBufs.end() || !data || count <= 0) { if (it != m_impl->instBufs.end()) it->second.count = 0; return; }
+	Impl::InstBuf& ib = it->second;
+	if (!ib.buf || ib.capacity < count)
+	{
+		m_impl->Trash(ib.buf);   // GPU lifetime rule: never inline-release a live buffer
+		ib.buf.Release();
+		while (ib.capacity < count) ib.capacity = ib.capacity ? ib.capacity * 2 : 64;
+		BufferDesc bd; bd.Name = "Instance VB"; bd.BindFlags = BIND_VERTEX_BUFFER;
+		bd.Usage = USAGE_DYNAMIC; bd.CPUAccessFlags = CPU_ACCESS_WRITE;
+		bd.Size = (Uint64)ib.capacity * sizeof(NukeInstanceData);
+		m_impl->device->CreateBuffer(bd, nullptr, &ib.buf);
+		if (!ib.buf) { ib.capacity = 0; ib.count = 0; return; }
+	}
+	{
+		MapHelper<NukeInstanceData> mv(m_impl->context, ib.buf, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (mv == nullptr) return;   // dead device — render() suspends
+		memcpy(mv, data, (size_t)count * sizeof(NukeInstanceData));
+	}
+	ib.count = count;
+}
+
+void NukeDiligent::destroyInstanceBuffer(uint64_t id)
+{
+	auto it = m_impl->instBufs.find(id);
+	if (it == m_impl->instBufs.end()) return;
+	m_impl->Trash(it->second.buf);   // 4-frame park — GPU may still be reading it
+	m_impl->instBufs.erase(it);
+}
+
+// One mesh+material, [first, first+count) instances of `instBuf`, ONE draw. Identical material
+// path to renderObject, but the world transform comes from the per-instance attributes: the CB
+// carries VIEW*PROJ in wvp and identity in world (see world.vs.hlsl NUKE_INSTANCED).
+void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count)
+{
+	if (m_impl->worldPipes.empty() || count <= 0) return;
+	auto bit = m_impl->instBufs.find(instBuf);
+	if (bit == m_impl->instBufs.end() || !bit->second.buf) return;
+	if (first < 0 || first + count > bit->second.count) return;
+	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
+	if (!gp) return;
+	++m_impl->statDraws;
+	m_impl->statTris += mesh ? (mesh->numVerts / 3) * count : 0;
+	Impl::MeshGPU& g = *gp;
+
+	struct CBData { float4x4 wvp; float4x4 world; };
+	{
+		MapHelper<CBData> cb(m_impl->context, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (cb == nullptr) return;
+		cb->wvp = m_impl->curView * m_impl->curProj;   // instance rows ARE the world transform
+		cb->world = float4x4::Identity();
+	}
+
+	float col[4] = { 1, 1, 1, 1 };
+	float metallic = 0.0f, roughness = 0.6f;
+	float emissive[3] = { 0, 0, 0 }, emissiveI = 0.0f;
+	float specF = 1.0f;
+	ITextureView* srv = nullptr; ITextureView* nsrv = nullptr;
+	ITextureView* mrsrv = nullptr; ITextureView* aosrv = nullptr; ITextureView* emsrv = nullptr; ITextureView* specsrv = nullptr;
+	if (mat)
+	{
+		col[0] = (float)mat->color.r; col[1] = (float)mat->color.g; col[2] = (float)mat->color.b; col[3] = (float)mat->color.a;
+		metallic = mat->metallic; roughness = mat->roughness; specF = mat->specular;
+		emissive[0] = (float)mat->emissive.r; emissive[1] = (float)mat->emissive.g; emissive[2] = (float)mat->emissive.b;
+		emissiveI = mat->emissiveIntensity;
+		if (mat->diff) srv   = m_impl->GetTexSRV(mat->diff);
+		if (mat->norm) nsrv  = m_impl->GetTexSRV(mat->norm);
+		if (mat->mr)   mrsrv = m_impl->GetTexSRV(mat->mr);
+		if (mat->ao)   aosrv = m_impl->GetTexSRV(mat->ao);
+		if (mat->em)   emsrv = m_impl->GetTexSRV(mat->em);
+		if (mat->spec) specsrv = m_impl->GetTexSRV(mat->spec);
+	}
+	// Pipeline for this material's shader; a shader WITHOUT an instanced variant falls back to
+	// the default world shader's instanced pipeline (standard PBR shading, logged once).
+	uint64_t h = (mat && mat->shader && mat->shader->rendererHandle) ? mat->shader->rendererHandle
+	                                                                  : m_impl->defaultWorldHandle;
+	auto pit = m_impl->worldPipes.find(h);
+	if (pit == m_impl->worldPipes.end()) pit = m_impl->worldPipes.find(m_impl->defaultWorldHandle);
+	if (pit == m_impl->worldPipes.end()) return;
+	if (!pit->second.psoInst)
+	{
+		if (!m_impl->warnedNoInstPipe)
+		{
+			m_impl->warnedNoInstPipe = true;
+			cout << "[NukeDiligent]\tmaterial shader has no instanced variant (handle NUKE_INSTANCED in its source) — default world shading used" << endl;
+		}
+		pit = m_impl->worldPipes.find(m_impl->defaultWorldHandle);
+		if (pit == m_impl->worldPipes.end() || !pit->second.psoInst) return;
+	}
+	Impl::WorldPipe& wp = pit->second;
+
+	{
+		MapHelper<Uint8> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (mb == nullptr) return;
+		Uint8* p = mb;
+		memset(p, 0, Impl::kMatCBBytes);
+		memcpy(p + 0, col, sizeof(float) * 4);
+		float nrmY = nsrv ? ((mat && mat->norm && !mat->norm->invertGreen) ? -1.0f : 1.0f) : 0.0f;
+		float prm[4] = { srv ? 1.0f : 0.0f, nrmY, metallic, roughness };
+		memcpy(p + 16, prm, sizeof(float) * 4);
+		float prm2[4] = { mrsrv ? 1.0f : 0.0f, aosrv ? 1.0f : 0.0f, emsrv ? 1.0f : 0.0f, specF };
+		memcpy(p + 32, prm2, sizeof(float) * 4);
+		float emv[4] = { emissive[0], emissive[1], emissive[2], emissiveI };
+		memcpy(p + 48, emv, sizeof(float) * 4);
+		if (mat && mat->shader)
+			for (const nuke::ShaderProp& sp : mat->shader->props)
+			{
+				auto pv = mat->props.find(sp.name);
+				const float* v = (pv != mat->props.end()) ? pv->second.data() : sp.def;
+				uint32_t bytes = (uint32_t)sp.components * sizeof(float);
+				if (sp.offset + bytes <= Impl::kMatCBBytes) memcpy(p + sp.offset, v, bytes);
+			}
+	}
+
+	ITextureView* whiteSRV = m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+	if (wp.texVarI)  wp.texVarI->Set(srv ? srv : whiteSRV);
+	if (wp.normVarI) wp.normVarI->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	if (wp.mrVarI)   wp.mrVarI->Set(mrsrv ? mrsrv : whiteSRV);
+	if (wp.aoVarI)   wp.aoVarI->Set(aosrv ? aosrv : whiteSRV);
+	if (wp.emVarI)   wp.emVarI->Set(emsrv ? emsrv : whiteSRV);
+	if (wp.specVarI) wp.specVarI->Set(specsrv ? specsrv : whiteSRV);
+	if (wp.shadowVarI) wp.shadowVarI->Set(m_impl->shadowSRV ? m_impl->shadowSRV : whiteSRV);
+	if (wp.cubeVarI && m_impl->shadowCubeSRV) wp.cubeVarI->Set(m_impl->shadowCubeSRV);
+	if (wp.probeVarI) wp.probeVarI->Set((m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV);
+	if (wp.tlasVarI)  wp.tlasVarI->Set((m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr());
+
+	IDeviceContext* ctx = m_impl->context;
+	IBuffer* vbs[]  = { g.pos, g.nrm, g.uv, bit->second.buf };
+	Uint64   offs[] = { 0, 0, 0, 0 };
+	ctx->SetVertexBuffers(0, 4, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	IPipelineState* pso = wp.psoInst;
+	if (m_impl->wireframe && wp.psoInstWire) pso = wp.psoInstWire;
+	else if (mat) { if (mat->blendMode == 1 && wp.psoInstBlend) pso = wp.psoInstBlend; else if (mat->blendMode == 2 && wp.psoInstAdd) pso = wp.psoInstAdd; }
+	ctx->SetPipelineState(pso);
+	ctx->CommitShaderResources(wp.srbInst, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
+	da.NumInstances          = (Uint32)count;
+	da.FirstInstanceLocation = (Uint32)first;
+	ctx->Draw(da);
+}

@@ -107,6 +107,42 @@ void NukeDiligent::Impl::CreateShadowResources()
 		if (auto* v = shadowSRB->GetVariableByName(SHADER_TYPE_PIXEL,  "ShadowPSCB")) v->Set(shadowPSCB);
 		shadowPsTexVar = shadowSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 	}
+
+	// INSTANCED twin (7.1): same depth state/CBs, per-instance world rows in buffer slot 3;
+	// the CB then carries the light's view*proj only (shadow.vs.hlsl NUKE_INSTANCED).
+	shadowPSOInst.Release(); shadowSRBInst.Release(); shadowPsTexVarInst = nullptr;
+	{
+		const std::string vsI = "#define NUKE_INSTANCED 1\n" + vs;
+		const std::string psI = "#define NUKE_INSTANCED 1\n" + ps;
+		RefCntAutoPtr<IShader> vsiI, psiI;
+		sci.Desc = {"Shadow VS (inst)", SHADER_TYPE_VERTEX, true}; sci.Source = vsI.c_str(); CreateShaderCached(sci, &vsiI);
+		sci.Desc = {"Shadow PS (inst)", SHADER_TYPE_PIXEL, true};  sci.Source = psI.c_str(); CreateShaderCached(sci, &psiI);
+		if (vsiI && psiI)
+		{
+			LayoutElement layoutI[] = {
+				{0, 0, 3, VT_FLOAT32}, {1, 1, 3, VT_FLOAT32}, {2, 2, 2, VT_FLOAT32},
+				{3, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+				{4, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+				{5, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+				{6, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+				{7, 3, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, LAYOUT_ELEMENT_AUTO_STRIDE, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+			};
+			ci.GraphicsPipeline.InputLayout.LayoutElements = layoutI;
+			ci.GraphicsPipeline.InputLayout.NumElements    = 8;
+			ci.PSODesc.Name = "Shadow PSO (inst)";
+			ci.pVS = vsiI; ci.pPS = psiI;
+			CreateGraphicsPipelineStateCached(ci, &shadowPSOInst);
+			if (shadowPSOInst)
+			{
+				if (auto* v = shadowPSOInst->GetStaticVariableByName(SHADER_TYPE_VERTEX, "ShadowVSCB")) v->Set(shadowVSCB);
+				if (auto* v = shadowPSOInst->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "ShadowPSCB")) v->Set(shadowPSCB);
+				shadowPSOInst->CreateShaderResourceBinding(&shadowSRBInst, true);
+				if (auto* v = shadowSRBInst->GetVariableByName(SHADER_TYPE_VERTEX, "ShadowVSCB")) v->Set(shadowVSCB);
+				if (auto* v = shadowSRBInst->GetVariableByName(SHADER_TYPE_PIXEL,  "ShadowPSCB")) v->Set(shadowPSCB);
+				shadowPsTexVarInst = shadowSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
+			}
+		}
+	}
 	cout << "[NukeDiligent]\tshadow map " << shadowRes << "x" << shadowRes << (shadowPSO ? " ready" : " FAILED") << endl;
 }
 
@@ -238,6 +274,46 @@ void NukeDiligent::renderShadowObject(Mesh* mesh, const float pos[3], const floa
 	ctx->SetPipelineState(m_impl->shadowPSO);
 	ctx->CommitShaderResources(m_impl->shadowSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
+	ctx->Draw(da);
+}
+
+// Instanced shadow draw (7.1): the [first, first+count) range of `instBuf` into the current
+// shadow slice — the CB carries the LIGHT's view*proj only (instance rows supply the world).
+void NukeDiligent::renderShadowInstanced(Mesh* mesh, uint64_t instBuf, int first, int count, Material* mat)
+{
+	if (!m_impl->shadowPSOInst || count <= 0) return;
+	auto bit = m_impl->instBufs.find(instBuf);
+	if (bit == m_impl->instBufs.end() || !bit->second.buf) return;
+	if (first < 0 || first + count > bit->second.count) return;
+	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh); if (!gp) return;
+	++m_impl->statDraws;
+	m_impl->statTris += mesh ? (mesh->numVerts / 3) * count : 0;
+	Impl::MeshGPU& g = *gp;
+
+	ITextureView* base = (mat && mat->diff) ? m_impl->GetTexSRV(mat->diff) : nullptr;
+	{
+		MapHelper<float4x4> cb(m_impl->context, m_impl->shadowVSCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (cb == nullptr) return;
+		*cb = m_impl->curShadowVP;
+	}
+	{
+		MapHelper<float> cb(m_impl->context, m_impl->shadowPSCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (cb == nullptr) return;
+		cb[0] = mat ? (float)mat->color.a : 1.0f;
+		cb[1] = base ? 1.0f : 0.0f; cb[2] = 0.f; cb[3] = 0.f;
+	}
+	if (m_impl->shadowPsTexVarInst)
+		m_impl->shadowPsTexVarInst->Set(base ? base : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+
+	IDeviceContext* ctx = m_impl->context;
+	IBuffer* vbs[]  = { g.pos, g.nrm, g.uv, bit->second.buf };
+	Uint64   offs[] = { 0, 0, 0, 0 };
+	ctx->SetVertexBuffers(0, 4, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	ctx->SetPipelineState(m_impl->shadowPSOInst);
+	ctx->CommitShaderResources(m_impl->shadowSRBInst, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
+	da.NumInstances          = (Uint32)count;
+	da.FirstInstanceLocation = (Uint32)first;
 	ctx->Draw(da);
 }
 

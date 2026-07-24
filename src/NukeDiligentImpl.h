@@ -407,10 +407,33 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
 		IShaderResourceVariable*              probeVar  = nullptr;// PS "g_Probe" (reflection cubemap, dynamic)
 		IShaderResourceVariable*              tlasVar   = nullptr;// PS "g_TLAS" (ray-tracing accel struct, RT builds only)
+		// INSTANCED variants (7.1): built only when the shader source handles NUKE_INSTANCED
+		// (the built-in world shader does; custom shaders opt in). Same blend variants; the
+		// instanced SRB has its OWN variable set (a different compiled shader pair).
+		RefCntAutoPtr<IPipelineState>         psoInst, psoInstBlend, psoInstAdd, psoInstWire;
+		RefCntAutoPtr<IShaderResourceBinding> srbInst;
+		IShaderResourceVariable *texVarI = nullptr, *normVarI = nullptr, *mrVarI = nullptr, *aoVarI = nullptr,
+		                        *emVarI = nullptr, *specVarI = nullptr, *shadowVarI = nullptr, *cubeVarI = nullptr,
+		                        *probeVarI = nullptr, *tlasVarI = nullptr;
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on an MSAA change)
 	};
 	std::unordered_map<uint64_t, WorldPipe> worldPipes;   // shader handle -> pipeline
 	uint64_t                              defaultWorldHandle = 0;   // builtin "world" pipeline
+
+	// --- GPU instancing (7.1) -----------------------------------------------------------
+	// Persistent instance buffers (engine handle -> dynamic VB of NukeInstanceData records).
+	struct InstBuf { RefCntAutoPtr<IBuffer> buf; int capacity = 0; int count = 0; };
+	std::unordered_map<uint64_t, InstBuf> instBufs;
+	uint64_t nextInstBuf = 1;
+	// Instanced twins of the shadow / g-buffer pipelines (same CBs, instanced input layout).
+	RefCntAutoPtr<IPipelineState>         shadowPSOInst;
+	RefCntAutoPtr<IShaderResourceBinding> shadowSRBInst;
+	IShaderResourceVariable*              shadowPsTexVarInst = nullptr;
+	RefCntAutoPtr<IPipelineState>         gbufPSOInst;
+	RefCntAutoPtr<IShaderResourceBinding> gbufSRBInst;
+	IShaderResourceVariable*              gbufMRVarInst = nullptr;
+	IShaderResourceVariable*              gbufNrmVarInst = nullptr;
+	bool warnedNoInstPipe = false;   // one-shot log: material shader without an instanced variant
 	uint64_t                              nextShaderHandle   = 1;   // handles handed to the engine
 	RefCntAutoPtr<IBuffer>                worldCB;     // VS: WVP + World   (shared)
 	RefCntAutoPtr<IBuffer>                worldMatCB;  // PS: color + params + custom shader props (shared)
