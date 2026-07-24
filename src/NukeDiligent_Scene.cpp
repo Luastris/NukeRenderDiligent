@@ -211,6 +211,11 @@ void NukeDiligent::renderSelectionOutline(Mesh* mesh, const float pos[3], const 
 		DrawAttribs fs{3, DRAW_FLAG_VERIFY_STATES};
 		ctx->Draw(fs);
 	}
+
+	// RESTORE the camera targets WITH depth: endCamera's gizmo/sprite flushes run after us
+	// and expect the camera depth bound — leaving the depth-less edge binding made every
+	// later draw warn (PSO wants D32, bound DSV = UNKNOWN) and skip depth testing.
+	ctx->SetRenderTargets(1, &m_impl->curRTV, m_impl->curDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 }
 
 // Fill the world FrameCB (camera pos, ambient, lights, shadow maps/params, sky IBL, reflection probe).
@@ -290,7 +295,8 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 		m_impl->curPostDst = rt.postRTV;
 	}
 	if (!rtv) return;
-	m_impl->curRTV = rtv; m_impl->curRTW = w; m_impl->curRTH = h;   // for the selection-outline pass
+	m_impl->curRTV = rtv; m_impl->curDSV = dsv;                     // for the selection-outline pass (restore)
+	m_impl->curRTW = w; m_impl->curRTH = h;
 	m_impl->cameraPassActive = true;   // sprites may draw from here until endCamera completes
 
 	IDeviceContext* ctx = m_impl->context;

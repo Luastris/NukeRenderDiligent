@@ -88,7 +88,7 @@ void NukeDiligent::beginCubeFace(uint64_t cube, int face, const float pos[3], fl
 	ITextureView* rtv = ms ? c.msColor->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET) : c.faceRTV[face].RawPtr();
 	ITextureView* dsv = ms ? c.msDepth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL) : c.dsv.RawPtr();
 	if (!rtv || !dsv) return;
-	m_impl->curRTV = rtv; m_impl->curRTW = c.res; m_impl->curRTH = c.res;
+	m_impl->curRTV = rtv; m_impl->curDSV = dsv; m_impl->curRTW = c.res; m_impl->curRTH = c.res;
 
 	IDeviceContext* ctx = m_impl->context;
 	ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);

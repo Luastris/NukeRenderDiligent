@@ -49,6 +49,8 @@ public:
 	                      bool normalFlipY) override;
 	bool captureTarget(uint64_t rtId, int& w, int& h, std::vector<uint8_t>& rgba) override;
 	void getCursorPos(double& x, double& y) override;
+	void setCursorMode(int mode) override;
+	int  getCursorMode() override;
 	bool isMouseButtonDown(int button) override;
 	void bindRenderTarget(uint64_t rtId) override;
 	void invalidateTexture(Texture* t) override;
@@ -113,7 +115,6 @@ public:
 	void keyboard(int key, int scancode, int action, int mods) override;
 	void mouseMove(double xpos, double ypos) override;
 	void mouseClick(int button, int action, int mods) override;
-	void setCursorMode(int mode) override;
 	void rawMouse(double xpos, double ypos) override;
 	void mouseEnterLeave(int entered) override;
 
@@ -138,6 +139,7 @@ private:
 	struct Impl;          // PImpl: keeps Diligent types out of this header
 	Impl*       m_impl   = nullptr;
 	GLFWwindow* m_window = nullptr;
+	int         m_cursorMode = 0;   // 0 Normal / 1 Hidden / 2 Locked / 3 Confined
 	// Windowed placement remembered when going fullscreen, so returning to windowed restores
 	// a sane position/size (glfwSetWindowMonitor to NULL needs an explicit rect). -1 = unset.
 	int m_winX = -1, m_winY = -1, m_winW = 0, m_winH = 0;

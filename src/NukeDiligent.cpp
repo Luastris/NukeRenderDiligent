@@ -837,7 +837,6 @@ void NukeDiligent::setOnClose(bst::function<void()> cb)      { m_impl->onClose.p
 void NukeDiligent::keyboard(int, int, int, int) {}
 void NukeDiligent::mouseMove(double, double) {}
 void NukeDiligent::mouseClick(int, int, int) {}
-void NukeDiligent::setCursorMode(int) {}
 void NukeDiligent::rawMouse(double, double) {}
 void NukeDiligent::mouseEnterLeave(int) {}
 void NukeDiligent::setWindowTitle(const char* title) { if (m_window && title) glfwSetWindowTitle(m_window, title); }
@@ -890,6 +889,28 @@ void NukeDiligent::applyWindow(const WindowDesc& d)
 	     << " decorated=" << d.decorated << " opacity=" << d.opacity << endl;
 }
 void NukeDiligent::getCursorPos(double& x, double& y) { x = y = 0; if (m_window) glfwGetCursorPos(m_window, &x, &y); }
+
+void NukeDiligent::setCursorMode(int mode)
+{
+	if (!m_window) return;
+	int glfwMode = GLFW_CURSOR_NORMAL;
+	switch (mode)
+	{
+		case 1: glfwMode = GLFW_CURSOR_HIDDEN;   break;   // invisible, free
+		case 2: glfwMode = GLFW_CURSOR_DISABLED; break;   // invisible + centered, raw deltas
+#ifdef GLFW_CURSOR_CAPTURED
+		case 3: glfwMode = GLFW_CURSOR_CAPTURED; break;   // visible, clamped to the window
+#endif
+		default: break;
+	}
+	glfwSetInputMode(m_window, GLFW_CURSOR, glfwMode);
+	// Locked mode: raw motion kills the OS cursor acceleration on the deltas (when the
+	// platform supports it) — the standard FPS-camera configuration.
+	if (glfwRawMouseMotionSupported())
+		glfwSetInputMode(m_window, GLFW_RAW_MOUSE_MOTION, mode == 2 ? GLFW_TRUE : GLFW_FALSE);
+	m_cursorMode = mode;
+}
+int NukeDiligent::getCursorMode() { return m_cursorMode; }
 bool NukeDiligent::isMouseButtonDown(int b) { return m_window && glfwGetMouseButton(m_window, b) == GLFW_PRESS; }
 
 // Desktop/Explorer file-drop -> editor import. One renderer instance, so a file-static callback is fine.

@@ -586,6 +586,9 @@ struct NukeDiligent::Impl
 	int                                   outlineMaskW = 0, outlineMaskH = 0;
 	RefCntAutoPtr<IBuffer>                outlineEdgeCB;      // texel size + thickness
 	ITextureView*                         curRTV = nullptr;   // current camera color target (outline rebind)
+	ITextureView*                         curDSV = nullptr;   // ...and its depth: passes that bind their own
+	                                                          // targets (outline) must RESTORE both — later
+	                                                          // draws (gizmos/sprites) expect the camera depth
 	int                                   curRTW = 0, curRTH = 0;
 	ITextureView*                         uiRTV = nullptr;    // explicit 2D target (bindRenderTarget); null = backbuffer
 	Uint32                                uiTW = 0, uiTH = 0; // its size (0 = use swapchain)
