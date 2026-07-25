@@ -260,6 +260,8 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 	fb->probeParams[0] = probeIntensity; fb->probeParams[1] = probeMaxMip; fb->probeParams[2] = 0; fb->probeParams[3] = 0;
 	const bool box = probe && (probeBoxHalf[0] > 0.f || probeBoxHalf[1] > 0.f || probeBoxHalf[2] > 0.f);
 	fb->probeBox[0] = probeBoxHalf[0]; fb->probeBox[1] = probeBoxHalf[1]; fb->probeBox[2] = probeBoxHalf[2]; fb->probeBox[3] = box ? 1.0f : 0.0f;
+	memcpy(fb->wind,  windDirStrength, sizeof(fb->wind));    // 7.2: g_Wind (dir.xyz, gusted strength)
+	memcpy(fb->wind2, windParams,      sizeof(fb->wind2));   //      g_Wind2 (turbAmount, 1/turbScale, time, gustFreq)
 }
 
 void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
@@ -312,6 +314,7 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	ctx->SetViewports(1, &vp, w, h);
 
 	m_impl->SetCameraViewProj(cam, w, h);   // curView/curProj/curCamPos (shared with the SSR gbuffer prepass)
+	m_impl->curNear = cam.nearZ; m_impl->curFar = cam.farZ;   // soft-particle depth linearization
 	m_impl->curProjNoJitter = m_impl->curProj;   // unjittered — TAA reprojection + the depth prepass use this
 	if (m_impl->curTAA && w > 0 && h > 0)        // TAA: jitter the COLOUR projection sub-pixel (Halton); depth stays clean
 	{
@@ -625,6 +628,13 @@ void NukeDiligent::getViewProj(float* view16, float* proj16)
 {
 	if (view16) memcpy(view16, m_impl->curView.Data(), 16 * sizeof(float));
 	if (proj16) memcpy(proj16, m_impl->curProj.Data(), 16 * sizeof(float));
+}
+
+// Wind push (7.2): World::Render forwards the CURRENT animated global once per frame.
+void NukeDiligent::setWind(const float dirStrength[4], const float params[4])
+{
+	memcpy(m_impl->windDirStrength, dirStrength, sizeof(m_impl->windDirStrength));
+	memcpy(m_impl->windParams, params, sizeof(m_impl->windParams));
 }
 
 // ---- GPU instancing (7.1) --------------------------------------------------------------

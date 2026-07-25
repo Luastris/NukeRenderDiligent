@@ -447,7 +447,10 @@ struct NukeDiligent::Impl
 	struct FrameCBData { float camPos[4]; float ambient[4]; float lightCount[4]; GPULight lights[kMaxLights];
 	                     float shadowVP[16 * 4]; float shadowParams[4];        // 4 = SHADOW_SLOTS
 	                     float skyTop[4]; float skyHorizon[4]; float skyGround[4]; float skyParams[4];      // IBL
-	                     float probePos[4]; float probeParams[4]; float probeBox[4]; };   // probe: pos.xyz+active, intensity+maxMip, boxHalf.xyz+valid
+	                     float probePos[4]; float probeParams[4]; float probeBox[4];    // probe: pos.xyz+active, intensity+maxMip, boxHalf.xyz+valid
+	                     float wind[4]; float wind2[4]; };   // 7.2: dir.xyz+gusted strength; turbAmount, 1/turbScale, time, gustFreq
+	float windDirStrength[4] = { 1, 0, 0, 0 };   // setWind (World::Render pushes per frame)
+	float windParams[4]      = { 0, 0, 0, 0 };
 	void WriteFrameCB(const Diligent::float3& P);   // fill worldFrameCB (lights/shadows/sky/probe) — shared by camera + cube-face passes
 	float                                 curCamPos[3] = {0, 0, 0};  // set in beginCamera (PBR view dir)
 	uint64_t                              curTarget = 0;             // RT id bound by beginCamera (feedback guard)
@@ -519,6 +522,10 @@ struct NukeDiligent::Impl
 	// pre-sorted back-to-front, so consecutive same-texture sprites merge). Flushed on texture
 	// change and at endCamera (before the MSAA resolve).
 	Texture*                              spriteBatchTex = nullptr;
+	bool                                  spriteBatchOpen = false;   // batch live (tex may legally be null -> white 1x1)
+	float                                 spriteSoftDist = 0.f;      // soft-particle fade distance for the CURRENT run (0 = off)
+	IShaderResourceVariable*              spriteDepthVar = nullptr;  // PS "g_SceneDepth" (prepass depth; white when absent)
+	float                                 curNear = 0.1f, curFar = 1000.f;   // camera planes (soft-particle linearization)
 	std::vector<float>                    spriteBatchVerts;
 	void CreateSpriteResources();
 	void FlushSprites();

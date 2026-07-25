@@ -58,6 +58,8 @@ public:
 	void renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count) override;
 	void renderShadowInstanced(Mesh* mesh, uint64_t instBuf, int first, int count, Material* mat) override;
 	void renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count) override;
+	void setWind(const float dirStrength[4], const float params[4]) override;   // 7.2
+	void setSpriteSoftDepth(float dist) override;                               // 7.3 soft particles
 	bool isMouseButtonDown(int button) override;
 	void bindRenderTarget(uint64_t rtId) override;
 	void invalidateTexture(Texture* t) override;
