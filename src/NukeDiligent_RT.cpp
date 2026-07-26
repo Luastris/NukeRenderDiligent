@@ -328,8 +328,8 @@ void NukeDiligent::Impl::BendRTMeshes()
 		{
 			MapHelper<float> pc(context, bendCSParamsCB, MAP_WRITE, MAP_FLAG_DISCARD);
 			if (pc == nullptr) continue;
-			*((Uint32*)&pc[0]) = (Uint32)gp->numVerts;   // g_VertCount (uint in the CB)
-			pc[1] = pc[2] = pc[3] = 0.0f;                // g_AtomOffset (layers live near identity)
+			pc[0] = pc[1] = pc[2] = 0.0f;                // g_AtomOffset (layers live near identity)
+			*((Uint32*)&pc[3]) = (Uint32)gp->numVerts;   // g_VertCount (std140: uint in the float3's tail)
 		}
 		auto set = [&](const char* n, IDeviceObject* o)
 		{ if (auto* v = bendCSSRB->GetVariableByName(SHADER_TYPE_COMPUTE, n)) v->Set(o); };

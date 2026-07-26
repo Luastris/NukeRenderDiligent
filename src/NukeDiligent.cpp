@@ -653,13 +653,10 @@ int NukeDiligent::render()
 		}
 		m_impl->pendingSamples = -1; m_impl->pendingHDR = -1;
 	}
-	// New frame: drop last frame's debug/gizmo lines (emission happens in onRender below).
-	// The depth batch is normally consumed per camera; clearing covers a pass that never ran.
-	{
-		std::lock_guard<std::mutex> lock(m_impl->debugMutex);
-		m_impl->debugVerts.clear();
-		m_impl->debugVertsDepth.clear();
-	}
+	// (Debug/gizmo lines are NOT cleared here: the buffer is reset right after the world
+	// passes below. Lines emitted during onRender draw THIS frame; lines emitted later —
+	// the editor UI's foliage brush ring lives in the viewport ImGui code — survive into
+	// the NEXT frame's camera passes. A frame-start clear silently discarded those.)
 	// Deferred shadow-resolution change (rebuilds the shadow maps; never mid-frame).
 	if (m_impl->pendingShadowRes > 0)
 	{
@@ -686,6 +683,15 @@ int NukeDiligent::render()
 	// 1) World passes. onRender drives World::Render, which calls beginCamera (binds +
 	//    clears the target) and renderObject — to off-screen RTs and/or the backbuffer.
 	for (auto& cb : m_impl->onRender) cb();
+
+	// Debug/gizmo lines were consumed by the camera passes above — reset the buffers NOW so
+	// anything emitted from here on (editor UI overlays, e.g. the foliage brush ring) carries
+	// over and draws in the NEXT frame's passes instead of being dropped.
+	{
+		std::lock_guard<std::mutex> lock(m_impl->debugMutex);
+		m_impl->debugVerts.clear();
+		m_impl->debugVertsDepth.clear();
+	}
 
 	// 2) UI pass: rebind the backbuffer WITHOUT clearing (so a world rendered straight to
 	//    it survives) and draw the UI on top.
