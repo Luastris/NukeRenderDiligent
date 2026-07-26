@@ -75,6 +75,8 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 		MapHelper<CBData> cb(m_impl->context, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		cb->wvp = wvp; cb->world = world;
 	}
+	m_impl->instWorldCBPass = 0;          // worldCB now holds THIS object's matrices, not the instanced VP
+	m_impl->lastInstBind.pso = nullptr;   // and the pipeline/vertex-buffer state is about to change
 
 	// Material: base color + PBR maps/params (fallbacks when none).
 	float col[4] = { 1, 1, 1, 1 };
@@ -104,10 +106,20 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	if (pit == m_impl->worldPipes.end()) return;
 	Impl::WorldPipe& wp = pit->second;
 
-	// Material constant buffer: standard color @0 + params @16, then the shader's custom props at
-	// their engine-parsed offsets (Shader::props). The renderer consumes the schema the engine
-	// parsed from the shader source — it never reads shader files itself.
+	// Per-draw flags + material CB: content is a pure function of the MATERIAL — consecutive
+	// draws with the same one within a pass re-upload byte-identical bytes, so both maps are
+	// gated on the material actually changing (dynamic rings recycle per frame -> pass-scoped).
+	if (m_impl->matCBFor != mat || m_impl->matCBPass != m_impl->passSerial)
 	{
+		m_impl->matCBFor = mat; m_impl->matCBPass = m_impl->passSerial;
+		if (m_impl->drawFlagsCB)
+		{
+			MapHelper<float> fc(m_impl->context, m_impl->drawFlagsCB, MAP_WRITE, MAP_FLAG_DISCARD);
+			if (fc != nullptr) { fc[0] = (mat && !mat->receiveShadows) ? 0.0f : 1.0f; fc[1] = fc[2] = fc[3] = 0.0f; }
+		}
+		// Material constant buffer: standard color @0 + params @16, then the shader's custom props at
+		// their engine-parsed offsets (Shader::props). The renderer consumes the schema the engine
+		// parsed from the shader source — it never reads shader files itself.
 		MapHelper<Uint8> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		Uint8* p = mb;
 		memset(p, 0, Impl::kMatCBBytes);
@@ -132,19 +144,22 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 			}
 	}
 
-	if (wp.texVar)
-		wp.texVar->Set(srv ? srv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	// Dynamic-var binds gated on the pointer actually changing (Diligent rewrites the
+	// descriptor cache on every Set() of a DYNAMIC var — no internal same-object skip).
+	auto bindIf = [](IShaderResourceVariable* v, IDeviceObject* o, IDeviceObject*& cached)
+	{ if (v && o && o != cached) { v->Set(o); cached = o; } };
 	ITextureView* whiteSRV = m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
-	if (wp.normVar)
-		wp.normVar->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
-	if (wp.mrVar) wp.mrVar->Set(mrsrv ? mrsrv : whiteSRV);
-	if (wp.aoVar) wp.aoVar->Set(aosrv ? aosrv : whiteSRV);
-	if (wp.emVar) wp.emVar->Set(emsrv ? emsrv : whiteSRV);
-	if (wp.specVar) wp.specVar->Set(specsrv ? specsrv : whiteSRV);
-	if (wp.shadowVar) wp.shadowVar->Set(m_impl->shadowSRV ? m_impl->shadowSRV : whiteSRV);
-	if (wp.cubeVar && m_impl->shadowCubeSRV) wp.cubeVar->Set(m_impl->shadowCubeSRV);
-	if (wp.probeVar) wp.probeVar->Set((m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV);
-	if (wp.tlasVar)  wp.tlasVar->Set((m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr());
+	bindIf(wp.texVar,  srv  ? srv  : whiteSRV, wp.lastBind[0]);
+	bindIf(wp.normVar, nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE), wp.lastBind[1]);
+	bindIf(wp.mrVar,   mrsrv   ? mrsrv   : whiteSRV, wp.lastBind[2]);
+	bindIf(wp.aoVar,   aosrv   ? aosrv   : whiteSRV, wp.lastBind[3]);
+	bindIf(wp.emVar,   emsrv   ? emsrv   : whiteSRV, wp.lastBind[4]);
+	bindIf(wp.specVar, specsrv ? specsrv : whiteSRV, wp.lastBind[5]);
+	bindIf(wp.shadowVar, m_impl->shadowSRV ? (IDeviceObject*)m_impl->shadowSRV : (IDeviceObject*)whiteSRV, wp.lastBind[6]);
+	bindIf(wp.cubeVar,   m_impl->shadowCubeSRV, wp.lastBind[7]);
+	bindIf(wp.probeVar,  (m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV, wp.lastBind[8]);
+	bindIf(wp.tlasVar,   (m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr(), wp.lastBind[9]);
+	bindIf(wp.rtInstVar, (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV), wp.lastBind[10]);
 
 	IDeviceContext* ctx = m_impl->context;
 	IBuffer* vbs[]    = { g.pos, g.nrm, g.uv };
@@ -237,7 +252,13 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 		NukeLight sun; sun.type = 0; sun.dir[0] = -0.4f; sun.dir[1] = -0.85f; sun.dir[2] = -0.35f;
 		sun.color[0] = sun.color[1] = sun.color[2] = 1.0f; sun.intensity = 3.0f; src.push_back(sun);
 	}
-	int n = (int)src.size(); if (n > kMaxLights) n = kMaxLights;
+	int n = (int)src.size();
+	if (n > kMaxLights)
+	{
+		static bool warned = false;
+		if (!warned) { warned = true; cout << "[NukeDiligent]\tlight budget exceeded (" << n << " > " << kMaxLights << ") — extras dropped" << endl; }
+		n = kMaxLights;
+	}
 	fb->lightCount[0] = (float)n;
 	for (int k = 0; k < n; ++k)
 	{
@@ -249,9 +270,21 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 	}
 	for (int s = 0; s < SHADOW_SLOTS; ++s) memcpy(fb->shadowVP + s * 16, &slotVP[s], sizeof(float) * 16);
 	fb->shadowParams[0] = (float)numShadowSlots;
-	fb->shadowParams[1] = shadowNormalBias;
+	// SHADOW BIAS CALIBRATION — clamped to WORLD scale, or a large Shadow Distance silently
+	// eats every short-range shadow: an NDC bias of 0.0015 equals 18 cm of caster-receiver
+	// separation at distance 60 and 1.5 m at 500 — grass could never shadow grass, only tall
+	// objects survived. Effective depth bias is CAPPED at ~3 cm world equivalent (a finer
+	// user value wins — it tightens contact further); the normal-offset floor is half a
+	// shadow texel clamped to [0.5, 3] cm (kills blade acne, keeps 5 cm+ casters shadowing).
+	{
+		const float depthRange = 2.0f * (shadowDistance > 0.5f ? shadowDistance : 0.5f);
+		const float ndcCap     = 0.03f / depthRange;
+		fb->shadowParams[3] = shadowDepthBias < ndcCap ? shadowDepthBias : ndcCap;
+		float nof = 0.5f * shadowDistance / (float)shadowRes;
+		nof = nof < 0.005f ? 0.005f : (nof > 0.03f ? 0.03f : nof);
+		fb->shadowParams[1] = (shadowNormalBias > nof) ? shadowNormalBias : nof;
+	}
 	fb->shadowParams[2] = (1.0f / (float)shadowRes) * shadowSoftness;
-	fb->shadowParams[3] = shadowDepthBias;
 	for (int k = 0; k < 3; ++k) { fb->skyTop[k] = sky.top[k]; fb->skyHorizon[k] = sky.horizon[k]; fb->skyGround[k] = sky.ground[k]; }
 	fb->skyParams[0] = sky.skyIntensity; fb->skyParams[1] = (sky.mode == 1) ? 1.0f : 0.0f;
 	fb->skyParams[2] = hdr ? 0.0f : 1.0f; fb->skyParams[3] = sky.whitePoint;   // .w = SDR tonemap white point (world.ps HDR-off path)
@@ -266,6 +299,7 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 
 void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 {
+	++m_impl->passSerial;   // invalidate the per-draw redundancy gates (shared CBs re-map per pass)
 	m_impl->curTarget = cam.target;   // feedback guard: GetTexSRV won't sample the RT we draw into
 	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
 	m_impl->curPostSrc = nullptr; m_impl->curPostDst = nullptr;
@@ -635,6 +669,49 @@ void NukeDiligent::setWind(const float dirStrength[4], const float params[4])
 {
 	memcpy(m_impl->windDirStrength, dirStrength, sizeof(m_impl->windDirStrength));
 	memcpy(m_impl->windParams, params, sizeof(m_impl->windParams));
+	m_impl->UpdateBendCB();   // wind + pushers land in the instanced-VS BendCB once per frame
+}
+
+// Foliage interaction (7.4): world positions that part the blades this frame. Stored here;
+// the CB write rides the per-frame setWind that follows.
+void NukeDiligent::setBendPushers(const float* xyzr, int count)
+{
+	m_impl->bendPusherCount = (!xyzr || count <= 0) ? 0 : (count > 8 ? 8 : count);
+	if (m_impl->bendPusherCount > 0)
+		memcpy(m_impl->bendPushers, xyzr, (size_t)m_impl->bendPusherCount * 4 * sizeof(float));
+}
+
+// Foliage bend volumes (7.4): wind zones / force fields / weather as analytic volumes
+// (12 floats each — see irender.h). Stored here; written with the per-frame setWind.
+void NukeDiligent::setBendVolumes(const float* vols, int count)
+{
+	m_impl->bendVolumeCount = (!vols || count <= 0) ? 0 : (count > 16 ? 16 : count);
+	if (m_impl->bendVolumeCount > 0)
+		memcpy(m_impl->bendVolumes, vols, (size_t)m_impl->bendVolumeCount * 12 * sizeof(float));
+}
+
+// BendCB layout (must match the instanced vertex shaders): g_WindV (dir.xyz, gusted
+// strength), g_WindT (x = wind time, y = pusher count, z = volume count), g_WindP
+// (turbAmount, 1/turbScale — world turbulence for the shader's spatial noise), g_Push[8]
+// (xyz, radius), g_Vol[48] (16 volumes x 3 float4).
+void NukeDiligent::Impl::UpdateBendCB()
+{
+	if (!bendCB || !context) return;
+	struct BendData { float windV[4]; float windT[4]; float windP[4]; float push[8][4]; float vol[16][12]; };
+	MapHelper<BendData> cb(context, bendCB, MAP_WRITE, MAP_FLAG_DISCARD);
+	if (cb == nullptr) return;
+	memcpy(cb->windV, windDirStrength, sizeof(cb->windV));
+	cb->windT[0] = windParams[2];                    // wind clock (g_Wind2.z convention)
+	cb->windT[1] = (float)bendPusherCount;
+	cb->windT[2] = (float)bendVolumeCount;
+	cb->windT[3] = 0.f;
+	memcpy(cb->windP, windParams, sizeof(cb->windP));   // (turbAmount, 1/turbScale, time, gustFreq)
+	memset(cb->push, 0, sizeof(cb->push));
+	for (int i = 0; i < bendPusherCount; ++i)
+		memcpy(cb->push[i], bendPushers[i], sizeof(float) * 4);
+	memset(cb->vol, 0, sizeof(cb->vol));
+	for (int i = 0; i < bendVolumeCount; ++i)
+		memcpy(cb->vol[i], bendVolumes[i], sizeof(float) * 12);
 }
 
 // ---- GPU instancing (7.1) --------------------------------------------------------------
@@ -656,17 +733,19 @@ void NukeDiligent::updateInstanceBuffer(uint64_t id, const NukeInstanceData* dat
 		m_impl->Trash(ib.buf);   // GPU lifetime rule: never inline-release a live buffer
 		ib.buf.Release();
 		while (ib.capacity < count) ib.capacity = ib.capacity ? ib.capacity * 2 : 64;
+		// USAGE_DEFAULT + UpdateBuffer, NOT dynamic: instance sets can be BIG and persistent
+		// (a foliage layer is easily megabytes). Vulkan dynamic buffers live in the per-frame
+		// dynamic heap — one large scatter upload exhausted it ("Space in dynamic heap is
+		// exhausted" + draws over the never-mapped buffer). Default-heap uploads go through
+		// the staging path and have no such budget.
 		BufferDesc bd; bd.Name = "Instance VB"; bd.BindFlags = BIND_VERTEX_BUFFER;
-		bd.Usage = USAGE_DYNAMIC; bd.CPUAccessFlags = CPU_ACCESS_WRITE;
+		bd.Usage = USAGE_DEFAULT;
 		bd.Size = (Uint64)ib.capacity * sizeof(NukeInstanceData);
 		m_impl->device->CreateBuffer(bd, nullptr, &ib.buf);
 		if (!ib.buf) { ib.capacity = 0; ib.count = 0; return; }
 	}
-	{
-		MapHelper<NukeInstanceData> mv(m_impl->context, ib.buf, MAP_WRITE, MAP_FLAG_DISCARD);
-		if (mv == nullptr) return;   // dead device — render() suspends
-		memcpy(mv, data, (size_t)count * sizeof(NukeInstanceData));
-	}
+	m_impl->context->UpdateBuffer(ib.buf, 0, (Uint64)count * sizeof(NukeInstanceData), data,
+	                              RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	ib.count = count;
 }
 
@@ -693,12 +772,16 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	m_impl->statTris += mesh ? (mesh->numVerts / 3) * count : 0;
 	Impl::MeshGPU& g = *gp;
 
-	struct CBData { float4x4 wvp; float4x4 world; };
+	// worldCB for instanced draws = VP only (identity world) — identical for EVERY instanced
+	// draw of the pass; mapped once per pass and whenever a non-instanced draw overwrote it.
+	if (m_impl->instWorldCBPass != m_impl->passSerial)
 	{
+		struct CBData { float4x4 wvp; float4x4 world; };
 		MapHelper<CBData> cb(m_impl->context, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		if (cb == nullptr) return;
 		cb->wvp = m_impl->curView * m_impl->curProj;   // instance rows ARE the world transform
 		cb->world = float4x4::Identity();
+		m_impl->instWorldCBPass = m_impl->passSerial;
 	}
 
 	float col[4] = { 1, 1, 1, 1 };
@@ -739,7 +822,15 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	}
 	Impl::WorldPipe& wp = pit->second;
 
+	// Per-draw flags + material CB — gated on the material changing (see renderObject).
+	if (m_impl->matCBFor != mat || m_impl->matCBPass != m_impl->passSerial)
 	{
+		m_impl->matCBFor = mat; m_impl->matCBPass = m_impl->passSerial;
+		if (m_impl->drawFlagsCB)
+		{
+			MapHelper<float> fc(m_impl->context, m_impl->drawFlagsCB, MAP_WRITE, MAP_FLAG_DISCARD);
+			if (fc != nullptr) { fc[0] = (mat && !mat->receiveShadows) ? 0.0f : 1.0f; fc[1] = fc[2] = fc[3] = 0.0f; }
+		}
 		MapHelper<Uint8> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		if (mb == nullptr) return;
 		Uint8* p = mb;
@@ -762,26 +853,36 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 			}
 	}
 
+	auto bindIf = [](IShaderResourceVariable* v, IDeviceObject* o, IDeviceObject*& cached)
+	{ if (v && o && o != cached) { v->Set(o); cached = o; } };
 	ITextureView* whiteSRV = m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
-	if (wp.texVarI)  wp.texVarI->Set(srv ? srv : whiteSRV);
-	if (wp.normVarI) wp.normVarI->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
-	if (wp.mrVarI)   wp.mrVarI->Set(mrsrv ? mrsrv : whiteSRV);
-	if (wp.aoVarI)   wp.aoVarI->Set(aosrv ? aosrv : whiteSRV);
-	if (wp.emVarI)   wp.emVarI->Set(emsrv ? emsrv : whiteSRV);
-	if (wp.specVarI) wp.specVarI->Set(specsrv ? specsrv : whiteSRV);
-	if (wp.shadowVarI) wp.shadowVarI->Set(m_impl->shadowSRV ? m_impl->shadowSRV : whiteSRV);
-	if (wp.cubeVarI && m_impl->shadowCubeSRV) wp.cubeVarI->Set(m_impl->shadowCubeSRV);
-	if (wp.probeVarI) wp.probeVarI->Set((m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV);
-	if (wp.tlasVarI)  wp.tlasVarI->Set((m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr());
+	bindIf(wp.texVarI,  srv  ? srv  : whiteSRV, wp.lastBindI[0]);
+	bindIf(wp.normVarI, nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE), wp.lastBindI[1]);
+	bindIf(wp.mrVarI,   mrsrv   ? mrsrv   : whiteSRV, wp.lastBindI[2]);
+	bindIf(wp.aoVarI,   aosrv   ? aosrv   : whiteSRV, wp.lastBindI[3]);
+	bindIf(wp.emVarI,   emsrv   ? emsrv   : whiteSRV, wp.lastBindI[4]);
+	bindIf(wp.specVarI, specsrv ? specsrv : whiteSRV, wp.lastBindI[5]);
+	bindIf(wp.shadowVarI, m_impl->shadowSRV ? (IDeviceObject*)m_impl->shadowSRV : (IDeviceObject*)whiteSRV, wp.lastBindI[6]);
+	bindIf(wp.cubeVarI,   m_impl->shadowCubeSRV, wp.lastBindI[7]);
+	bindIf(wp.probeVarI,  (m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV, wp.lastBindI[8]);
+	bindIf(wp.tlasVarI,   (m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr(), wp.lastBindI[9]);
+	bindIf(wp.rtInstVarI, (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV), wp.lastBindI[10]);
 
 	IDeviceContext* ctx = m_impl->context;
-	IBuffer* vbs[]  = { g.pos, g.nrm, g.uv, bit->second.buf };
-	Uint64   offs[] = { 0, 0, 0, 0 };
-	ctx->SetVertexBuffers(0, 4, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	IPipelineState* pso = wp.psoInst;
 	if (m_impl->wireframe && wp.psoInstWire) pso = wp.psoInstWire;
 	else if (mat) { if (mat->blendMode == 1 && wp.psoInstBlend) pso = wp.psoInstBlend; else if (mat->blendMode == 2 && wp.psoInstAdd) pso = wp.psoInstAdd; }
-	ctx->SetPipelineState(pso);
+	// Consecutive chunks of the same set draw with identical vertex buffers + PSO — bind once.
+	// Any non-instanced scene draw (renderObject, sprites, decals) resets lastInstBind.
+	if (m_impl->lastInstBind.mesh != (const void*)gp || m_impl->lastInstBind.buf != instBuf ||
+	    m_impl->lastInstBind.pso != (void*)pso || m_impl->lastInstBind.pass != m_impl->passSerial)
+	{
+		IBuffer* vbs[]  = { g.pos, g.nrm, g.uv, bit->second.buf };
+		Uint64   offs[] = { 0, 0, 0, 0 };
+		ctx->SetVertexBuffers(0, 4, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+		ctx->SetPipelineState(pso);
+		m_impl->lastInstBind = { gp, instBuf, (void*)pso, m_impl->passSerial };
+	}
 	ctx->CommitShaderResources(wp.srbInst, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
 	da.NumInstances          = (Uint32)count;

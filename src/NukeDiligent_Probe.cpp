@@ -64,6 +64,7 @@ uint64_t NukeDiligent::createReflectionCube(int resolution)
 
 void NukeDiligent::beginCubeFace(uint64_t cube, int face, const float pos[3], float nearZ, float farZ)
 {
+	++m_impl->passSerial;   // invalidate the per-draw redundancy gates (shared CBs re-map per pass)
 	auto it = m_impl->cubes.find(cube);
 	if (it == m_impl->cubes.end() || face < 0 || face > 5) return;
 	Impl::CubeRT& c = it->second;

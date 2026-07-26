@@ -122,7 +122,14 @@ struct NukeDiligent::Impl
 	                                                       // clears to alpha 0 and the final pass outputs
 	                                                       // PREMULTIPLIED alpha so the desktop shows through.
 	bool                          rtSupported = false; // device reports ray-tracing capability (D3D12 + RT-capable GPU)
-	RefCntAutoPtr<IShaderSourceInputStreamFactory> shaderFactory;   // resolves #include + loads RT shaders from the shaders dir
+	// #include resolver (+ RT shader loading): a MEMORY factory over the sources the ENGINE
+	// pushed through setShaderSource — disk files in dev, game.nupak entries in a packaged
+	// dist — so includes ("nukebend.hlsl", "rt_common.hlsl") resolve identically everywhere.
+	// The renderer does NO file IO for shader sources.
+	RefCntAutoPtr<IShaderSourceInputStreamFactory> shaderFactory;
+	void RebuildShaderFactory();   // rebuild shaderFactory from shaderSrc (called on every push)
+	std::vector<Mesh*> rtDynMeshes;   // Mesh::rtDynamic instances added this frame -> per-frame BLAS rebuild
+	void RebuildDynamicBLAS();        // rebuild their cached BLASes over the updated vertex buffers
 
 	std::vector<boost::function<void(void)>> onGUI;
 	std::vector<boost::function<void(void)>> onRender;
@@ -305,8 +312,17 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<ITopLevelAS>         tlas;                  // scene TLAS (rebuilt per frame)
 	RefCntAutoPtr<IBuffer>             tlasScratch, tlasInstanceBuf;
 	Uint32                             tlasMaxInstances = 0;
+	// Foliage RT bend (bend.cs): bends the merged chunk meshes with the shared NukeBend and
+	// rebuilds their BLAS every frame — RT shadows/reflections of vegetation SWAY.
+	RefCntAutoPtr<IPipelineState>         bendCSPSO;
+	RefCntAutoPtr<IShaderResourceBinding> bendCSSRB;
+	RefCntAutoPtr<IBuffer>                bendCSParamsCB;
+	std::vector<Mesh*>                    rtBendMeshes;          // bend meshes seen this frame (cleared in beginRTScene)
+	bool                                  blasBentThisFrame = false;
+	void BendRTMeshes();
 	size_t                             lastTlasSig = 0;        // topology signature (count + BLAS set) -> refit when unchanged
 	uint32_t                           tlasFrameCtr = 0;       // periodic full rebuild counter (refit hygiene)
+	uint64_t                           lastRTFullSig = 0;      // full scene hash (BLASes+transforms+masks+data) -> SKIP build when identical
 	std::vector<TLASBuildInstanceData> rtInstances;           // accumulated between beginRTScene/buildRTScene
 	std::vector<std::string>           rtInstanceNames;        // stable storage backing TLASBuildInstanceData::InstanceName
 	bool                               rtSceneReady = false;   // a valid TLAS is built for the current frame
@@ -319,11 +335,17 @@ struct NukeDiligent::Impl
 	// Normals of every referenced mesh are concatenated into one raw buffer; each instance stores its byte offset.
 	// matByteOffset = this instance's MatCB block in g_MatBytes (auto-gen hit shaders load their params from it).
 	// Mirrors HLSL RTInstanceData (rt_common.hlsl) byte-for-byte. 16-byte aligned rows for StructuredBuffer.
+	// MIRRORED byte-for-byte in rt_common.hlsl (RTInstanceData) AND world.ps.hlsl (RTInstInfo,
+	// shadow candidate loop) — change all three together.
 	struct RTInstanceData {
 		uint32_t nrmOffset, uvOffset, posOffset, matByteOffset;
 		uint32_t texIndex, nrmTexIndex, mrTexIndex, aoTexIndex;
 		uint32_t emTexIndex, specTexIndex; float specularFactor; uint32_t nrmFlipG;   // 1 = flip green (OpenGL)
 		float albedoMetal[4]; float emissiveRough[4];
+		// Dynamic sprite meshes (particles): byte offset into the per-frame color pool
+		// (g_DynCol; 0xFFFFFFFF = none), the shadow-ray footprint (0 quad/1 disc/2 strip)
+		// and the instance alpha multiplier for shadow candidates.
+		uint32_t colOffset; uint32_t shadowShape; float shadowAlpha; uint32_t pad0;
 	};
 	std::unordered_map<Mesh*, uint32_t> meshNrmByteOffset;     // mesh -> byte offset of its normals in rtNrmBuf
 	std::unordered_map<Mesh*, uint32_t> meshUVByteOffset;      // mesh -> byte offset of its uvs in rtUVBuf
@@ -334,6 +356,11 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>              rtUVBuf;      IBufferView* rtUVSRV   = nullptr;   // ByteAddressBuffer (all uvs)
 	RefCntAutoPtr<IBuffer>              rtPosBuf;     IBufferView* rtPosSRV  = nullptr;   // ByteAddressBuffer (all positions)
 	RefCntAutoPtr<IBuffer>              rtInstBuf;    IBufferView* rtInstSRV = nullptr;   // StructuredBuffer<RTInstanceData>
+	// Per-frame color pool for dynamic sprite meshes (particle gradients/fade): rebuilt every
+	// frame from Mesh::rtColorArray of the instances added (RAW buffer, grows as needed).
+	std::vector<float>                  rtDynColCPU;
+	RefCntAutoPtr<IBuffer>              rtDynColBuf;  IBufferView* rtDynColSRV = nullptr;
+	Uint64                              rtDynColCap = 0;
 	std::vector<RTInstanceData>         rtInstData;            // parallel to rtInstances, rebuilt per frame
 	uint32_t                            rtInstCapacity = 0;
 	static const uint32_t               kMaxMatTex = 256;      // bindless material maps (albedo/normal/MR/AO/emissive/spec)
@@ -407,6 +434,7 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
 		IShaderResourceVariable*              probeVar  = nullptr;// PS "g_Probe" (reflection cubemap, dynamic)
 		IShaderResourceVariable*              tlasVar   = nullptr;// PS "g_TLAS" (ray-tracing accel struct, RT builds only)
+		IShaderResourceVariable*              rtInstVar = nullptr;// PS "g_RTInst" (per-instance RT data: shadow footprints)
 		// INSTANCED variants (7.1): built only when the shader source handles NUKE_INSTANCED
 		// (the built-in world shader does; custom shaders opt in). Same blend variants; the
 		// instanced SRB has its OWN variable set (a different compiled shader pair).
@@ -414,11 +442,27 @@ struct NukeDiligent::Impl
 		RefCntAutoPtr<IShaderResourceBinding> srbInst;
 		IShaderResourceVariable *texVarI = nullptr, *normVarI = nullptr, *mrVarI = nullptr, *aoVarI = nullptr,
 		                        *emVarI = nullptr, *specVarI = nullptr, *shadowVarI = nullptr, *cubeVarI = nullptr,
-		                        *probeVarI = nullptr, *tlasVarI = nullptr;
+		                        *probeVarI = nullptr, *tlasVarI = nullptr, *rtInstVarI = nullptr;
+		// Redundancy gates (perf): the object each DYNAMIC variable currently holds. Diligent
+		// rewrites the descriptor cache on EVERY Set() of a dynamic var (no same-object skip),
+		// so the draw path only calls Set() when the pointer actually changes. Cleared when
+		// the SRBs are (re)created. [0..10] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst.
+		IDeviceObject* lastBind[11]  = {};
+		IDeviceObject* lastBindI[11] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on an MSAA change)
 	};
 	std::unordered_map<uint64_t, WorldPipe> worldPipes;   // shader handle -> pipeline
 	uint64_t                              defaultWorldHandle = 0;   // builtin "world" pipeline
+
+	// --- Per-draw redundancy gates (perf). Shared dynamic CBs (worldCB/worldMatCB/drawFlagsCB)
+	// only re-map when their content actually changes WITHIN a pass; every pass begin bumps
+	// passSerial, which invalidates all gates (dynamic rings recycle per frame, and other
+	// passes — g-buffer prepass — write their own content into the same buffers).
+	uint32_t        passSerial = 1;                 // bumped in beginCamera/beginCubeFace/beginGBufferPass/beginShadowPass
+	const Material* matCBFor   = nullptr;           // material whose bytes sit in worldMatCB + drawFlagsCB
+	uint32_t        matCBPass  = 0;                 // ...valid while == passSerial
+	uint32_t        instWorldCBPass = 0;            // pass in which worldCB holds the instanced VP (identity world)
+	struct { const void* mesh = nullptr; uint64_t buf = 0; void* pso = nullptr; uint32_t pass = 0; } lastInstBind;
 
 	// --- GPU instancing (7.1) -----------------------------------------------------------
 	// Persistent instance buffers (engine handle -> dynamic VB of NukeInstanceData records).
@@ -438,11 +482,12 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>                worldCB;     // VS: WVP + World   (shared)
 	RefCntAutoPtr<IBuffer>                worldMatCB;  // PS: color + params + custom shader props (shared)
 	static const uint32_t                 kMatCBBytes = 256;   // MatCB capacity (color/params + props)
+	Diligent::RefCntAutoPtr<Diligent::IBuffer> drawFlagsCB;    // per-draw flags (x = receiveShadows)
 	RefCntAutoPtr<ITexture>               whiteTex;    // 1x1 fallback when a material has no texture
 	RefCntAutoPtr<ITexture>               flatNormTex; // 1x1 (0.5,0.5,1) flat normal fallback
 	RefCntAutoPtr<IBuffer>                worldFrameCB;// PS b1: camera pos + ambient + light array (shared)
 	// PBR lighting buffer layout (matches FrameCB in world.ps.hlsl). Each float4 = 16 bytes.
-	static const int                      kMaxLights = 16;
+	static const int                      kMaxLights = 256;
 	struct GPULight { float posType[4]; float dirRange[4]; float colorIntensity[4]; float spot[4]; };
 	struct FrameCBData { float camPos[4]; float ambient[4]; float lightCount[4]; GPULight lights[kMaxLights];
 	                     float shadowVP[16 * 4]; float shadowParams[4];        // 4 = SHADOW_SLOTS
@@ -451,6 +496,16 @@ struct NukeDiligent::Impl
 	                     float wind[4]; float wind2[4]; };   // 7.2: dir.xyz+gusted strength; turbAmount, 1/turbScale, time, gustFreq
 	float windDirStrength[4] = { 1, 0, 0, 0 };   // setWind (World::Render pushes per frame)
 	float windParams[4]      = { 0, 0, 0, 0 };
+	// Foliage bend (7.4): the VS-side BendCB — wind + up to 8 "pushers" (characters/bodies
+	// that part the blades). Written once per frame from setWind (pushers arrive just before
+	// via setBendPushers); bound as a STATIC var on every INSTANCED pipeline whose vertex
+	// shader declares cbuffer BendCB (world/gbuffer/shadow instanced variants).
+	RefCntAutoPtr<IBuffer> bendCB;
+	float bendPushers[8][4] = {};
+	int   bendPusherCount = 0;
+	float bendVolumes[16][12] = {};   // (pos,r)(dir,strength)(mode,falloff,seed,0) per volume
+	int   bendVolumeCount = 0;
+	void  UpdateBendCB();
 	void WriteFrameCB(const Diligent::float3& P);   // fill worldFrameCB (lights/shadows/sky/probe) — shared by camera + cube-face passes
 	float                                 curCamPos[3] = {0, 0, 0};  // set in beginCamera (PBR view dir)
 	uint64_t                              curTarget = 0;             // RT id bound by beginCamera (feedback guard)
@@ -596,7 +651,10 @@ struct NukeDiligent::Impl
 	uint64_t MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg);
 	bool     BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg);
 	void     RebuildForMSAA();   // rebuild all sample-count-dependent pipelines + targets after `samples` changes
-	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; int version = 0; };
+	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; int version = 0;
+	                 // RT wind bend (foliage merged chunks, Mesh::rtBendArray): NukeBend compute
+	                 // inputs + the BENT position buffer the BLAS builds over (refit per frame).
+	                 RefCntAutoPtr<IBuffer> bendSrc, bendData, bendPivot, posBent, blasScratch; };
 	std::unordered_map<Mesh*, MeshGPU>          meshCache;
 	MeshGPU* GetMeshGPU(Mesh* mesh);   // get-or-build the GPU vertex buffers (pos/nrm/uv) for a mesh;
 	                                   // re-uploads in place when Mesh::version changed (skinned/procedural)

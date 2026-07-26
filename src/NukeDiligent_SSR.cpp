@@ -86,6 +86,7 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	std::string vsSrc = shaderSource("gbuffer.vs"), psSrc = shaderSource("gbuffer.ps");   // velocity-aware VS (motion vectors)
 	if (vsSrc.empty() || psSrc.empty()) return false;
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	sci.pShaderSourceStreamFactory = shaderFactory;   // resolves #include "nukebend.hlsl"
 	RefCntAutoPtr<IShader> vs, ps;
 	sci.Desc = {"GBuffer VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); CreateShaderCached(sci, &vs);
 	sci.Desc = {"GBuffer PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); CreateShaderCached(sci, &ps);
@@ -152,7 +153,10 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 			{
 				if (auto* c = gbufPSOInst->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))    c->Set(worldCB);
 				if (auto* m = gbufPSOInst->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB")) m->Set(worldMatCB);
+				if (auto* b = gbufPSOInst->GetStaticVariableByName(SHADER_TYPE_VERTEX, "BendCB")) b->Set(bendCB);   // depth/velocity must bend like the lit pass (7.4)
 				gbufPSOInst->CreateShaderResourceBinding(&gbufSRBInst, true);
+				// VULKAN: cbuffers may reflect MUTABLE — bind BendCB via the SRB too (7.4)
+				if (auto* b = gbufSRBInst->GetVariableByName(SHADER_TYPE_VERTEX, "BendCB")) b->Set(bendCB);
 				gbufMRVarInst  = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
 				gbufNrmVarInst = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
 			}
@@ -249,6 +253,7 @@ void NukeDiligent::Impl::RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* ds
 // --- SSR G-buffer prepass (single-sample): normal/roughness/metalness + depth, before the colour pass --------
 void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 {
+	++m_impl->passSerial;   // invalidate the per-draw redundancy gates (this pass maps the shared CBs itself)
 	m_impl->gbufActive = false;
 	if (!m_impl->gbufPSO) return;
 	int w = 0, h = 0;

@@ -9,6 +9,8 @@
 #include <cstdlib>               // std::getenv (NUKE_GPU_VALIDATION opt-in)
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>   // shader/PSO cache file IO
+#include <boost/dll/runtime_symbol_info.hpp>   // program_location: cache dir is exe-relative
+#include "ShaderSourceFactoryUtils.h"   // memory #include resolver over pushed shader sources
 #include <iterator>              // istreambuf_iterator (cache load)
 
 // NUKE PATCH global (DEFINED in the vendored SwapChainD3DBase.cpp so the Diligent DLLs resolve
@@ -283,7 +285,32 @@ NukeDiligent::~NukeDiligent() { delete m_impl; }
 
 void NukeDiligent::setShaderSource(const char* name, const char* source)
 {
-	if (name && source) m_impl->shaderSrc[name] = source;
+	if (!name || !source) return;
+	m_impl->shaderSrc[name] = source;
+	m_impl->RebuildShaderFactory();   // includes must resolve from the pushed set (pak or disk)
+}
+
+// The shader #include resolver over the PUSHED sources — the ONE existing pattern: the engine
+// pushes every shaders/*.hlsl through setShaderSource (loose files in dev, game.nupak entries
+// in a packaged dist), the renderer touches no disk. Every entry resolves both as "<name>" and
+// "<name>.hlsl" (sources are pushed by stem; includes are written as "nukebend.hlsl"/
+// "rt_common.hlsl").
+void NukeDiligent::Impl::RebuildShaderFactory()
+{
+	std::vector<MemoryShaderSourceFileInfo> files;
+	std::vector<std::string> hlslNames;                  // backing storage for "<name>.hlsl"
+	files.reserve(shaderSrc.size() * 2);
+	hlslNames.reserve(shaderSrc.size());                 // no realloc: c_str()s must stay valid
+	for (auto& kv : shaderSrc)
+	{
+		if (kv.second.empty()) continue;
+		files.emplace_back(kv.first.c_str(), kv.second.c_str(), (Uint32)kv.second.size());
+		hlslNames.push_back(kv.first + ".hlsl");
+		files.emplace_back(hlslNames.back().c_str(), kv.second.c_str(), (Uint32)kv.second.size());
+	}
+	MemoryShaderSourceFactoryCreateInfo mci{ files.data(), (Uint32)files.size(), True /*CopySources*/ };
+	shaderFactory.Release();
+	CreateMemoryShaderSourceFactory(mci, &shaderFactory);
 }
 
 int NukeDiligent::init(const WindowDesc& desc)
@@ -515,15 +542,17 @@ int NukeDiligent::init(const WindowDesc& desc)
 		else
 			cout << "[NukeDiligent]\tDComp device creation failed — window opaque" << endl;
 	}
-	// Shader #include resolver (+ RT shader loader): resolves "rt_common.hlsl" etc. from the shaders directory.
-	if (engFactory) engFactory->CreateDefaultShaderSourceStreamFactory("shaders", &m_impl->shaderFactory);
+	// Shader #include resolver: a MEMORY factory over the sources the engine pushed through
+	// setShaderSource (see RebuildShaderFactory) — the renderer does NO file IO for sources.
+	m_impl->RebuildShaderFactory();
 	// Ray tracing: D3D12 (DXR) or Vulkan (VK_KHR_ray_tracing) + a capable GPU/driver.
 	// The whole RT path is Diligent-API (BLAS/TLAS/SBT); shaders compile through DXC —
 	// DXIL on D3D12, SPIR-V on Vulkan (Diligent picks the target per backend).
-	m_impl->rtSupported = (m_impl->useD3D12 || m_impl->useVulkan) && m_impl->device &&
+	m_impl->rtSupported = desc.rayTracing &&   // config kill switch: window.rayTracing=false forces the raster path
+	                      (m_impl->useD3D12 || m_impl->useVulkan) && m_impl->device &&
 	                      (m_impl->device->GetAdapterInfo().RayTracing.CapFlags & RAY_TRACING_CAP_FLAG_STANDALONE_SHADERS) != 0;
 	cout << "[NukeDiligent]\tbackend=" << (m_impl->useD3D12 ? "D3D12" : m_impl->useVulkan ? "Vulkan" : "D3D11")
-	     << " rayTracing=" << (m_impl->rtSupported ? "yes" : "no") << endl;
+	     << " rayTracing=" << (m_impl->rtSupported ? "yes" : (desc.rayTracing ? "no" : "off (config)")) << endl;
 	// NOTE: the RT fallback TLAS is built at the TOP OF THE FIRST FRAME, not here — on
 	// Vulkan an acceleration-structure build before the frame loop starts deadlocks in
 	// the upload path (a fence with no submission to signal it). See render().
@@ -737,7 +766,13 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 
 	namespace bfs = boost::filesystem;
 	char hex[24]; snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
-	const bfs::path dir("config/shadercache_vk");
+	// Cache next to the EXECUTABLE, not the CWD — a shortcut-launched game has an arbitrary
+	// working directory and would otherwise recompile every shader on every run (and litter
+	// config/ folders wherever it was started from).
+	boost::system::error_code dec;
+	bfs::path cacheRoot = boost::dll::program_location(dec).parent_path();
+	if (dec || cacheRoot.empty()) cacheRoot = ".";
+	const bfs::path dir = cacheRoot / "config" / "shadercache_vk";
 	const bfs::path file = dir / (std::string(hex) + ".spv");
 
 	boost::system::error_code ec;

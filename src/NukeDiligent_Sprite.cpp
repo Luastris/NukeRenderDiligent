@@ -151,6 +151,7 @@ void NukeDiligent::Impl::CreateSpriteResources()
 void NukeDiligent::drawSprite(Texture* tex, const float center[3], const float right[3], const float up[3],
                               const float uv[4], const float tint[4])
 {
+	m_impl->lastInstBind.pso = nullptr;   // sprite pipeline replaces the instanced VB/PSO state
 	if (!m_impl->spritePSO || !tex) return;
 	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw (see Impl flag)
 	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();   // kind switch: keep paint order
@@ -187,6 +188,7 @@ void NukeDiligent::setSpriteSoftDepth(float dist)
 // one memcpy instead of thousands of drawSprite calls. Same per-texture run semantics.
 void NukeDiligent::drawSpriteRun(Texture* tex, const float* verts, int vertCount)
 {
+	m_impl->lastInstBind.pso = nullptr;   // sprite pipeline replaces the instanced VB/PSO state
 	// tex == null is LEGAL here (7.3 VFX: untextured particles draw as tinted white quads).
 	if (!m_impl->spritePSO || !verts || vertCount <= 0) return;
 	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw
@@ -203,6 +205,7 @@ void NukeDiligent::drawSpriteRun(Texture* tex, const float* verts, int vertCount
 void NukeDiligent::drawSpriteRunLit(Texture* tex, Texture* normal, const float* verts, int vertCount,
                                     bool normalFlipY)
 {
+	m_impl->lastInstBind.pso = nullptr;   // sprite pipeline replaces the instanced VB/PSO state
 	if (!m_impl->spriteLitPSO || !normal) { drawSpriteRun(tex, verts, vertCount); return; }
 	if (!tex || !verts || vertCount <= 0) return;
 	if (!m_impl->cameraPassActive) return;

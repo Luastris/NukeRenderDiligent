@@ -109,16 +109,19 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
 	BufferDesc sbd; sbd.Name = "BLAS scratch"; sbd.Usage = USAGE_DEFAULT; sbd.BindFlags = BIND_RAY_TRACING;
 	sbd.Size = blas->GetScratchBufferSizes().Build;
 	device->CreateBuffer(sbd, nullptr, &scratch);
+	if (gp->posBent || mesh->rtDynamic) gp->blasScratch = scratch;   // per-frame BLAS rebuilds keep the scratch
 
 	BLASBuildTriangleData td;
 	td.GeometryName         = "geo";
-	td.pVertexBuffer        = gp->pos;
+	td.pVertexBuffer        = gp->posBent ? gp->posBent : gp->pos;   // bend meshes trace the BENT positions
 	td.VertexStride         = 3 * sizeof(float);
 	td.VertexCount          = (Uint32)gp->numVerts;
 	td.VertexValueType      = VT_FLOAT32;
 	td.VertexComponentCount = 3;
 	td.PrimitiveCount       = (Uint32)(gp->numVerts / 3);
-	td.Flags                = RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+	// Alpha-tested geometry (particle quads) is NON-OPAQUE: rays run the any-hit alpha test /
+	// the shadow queries' candidate loops instead of committing on the raw triangle.
+	td.Flags                = mesh->rtAlphaTested ? RAYTRACING_GEOMETRY_FLAG_NONE : RAYTRACING_GEOMETRY_FLAG_OPAQUE;
 
 	BuildBLASAttribs ba;
 	ba.pBLAS                  = blas;
@@ -174,6 +177,9 @@ void NukeDiligent::beginRTScene()
 	if (!m_impl->rtSupported) return;
 	m_impl->EnsureRTFallback();
 	m_impl->rtInstances.clear();
+	m_impl->rtBendMeshes.clear();
+	m_impl->rtDynMeshes.clear();
+	m_impl->rtDynColCPU.clear();
 	m_impl->rtInstanceNames.clear();
 	m_impl->rtInstData.clear();
 	m_impl->rtInstShaderGuid.clear();
@@ -181,10 +187,15 @@ void NukeDiligent::beginRTScene()
 	m_impl->rtSceneReady = false;
 }
 
-void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections)
+void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections, bool castShadows)
 {
 	if (!m_impl->rtSupported) return;
 	IBottomLevelAS* blas = m_impl->GetMeshBLAS(mesh);
+	if (Impl::MeshGPU* gpb = m_impl->GetMeshGPU(mesh))
+	{
+		if (gpb->posBent) m_impl->rtBendMeshes.push_back(mesh);   // NukeBend + BLAS refit this frame
+		if (mesh->rtDynamic) m_impl->rtDynMeshes.push_back(mesh); // engine rewrote the verts -> BLAS rebuild
+	}
 	if (!blas || !mesh->normalArray || mesh->numVerts < 3) return;
 
 	// Register this mesh's normals + uvs + positions in the concatenated buffers (once per unique mesh).
@@ -232,7 +243,10 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 
 	TLASBuildInstanceData inst;
 	inst.pBLAS    = blas;
-	inst.Mask     = inReflections ? 0xFF : (Uint8)0xFE;   // clear reflect-vis bit (0x01) -> invisible to reflection rays, still casts shadows
+	// TLAS visibility bits: 0x01 = reflection rays (RT_REFLECT_MASK), 0x02 = direct shadow rays
+	// (world.ps RTShadow traces with mask 0x02 — Cast Shadows OFF makes the instance transparent
+	// to sunlight). Upper bits stay set for future ray kinds.
+	inst.Mask     = (Uint8)(0xFC | (inReflections ? 0x01 : 0x00) | (castShadows ? 0x02 : 0x00));
 	inst.Flags    = RAYTRACING_INSTANCE_NONE;
 	inst.CustomId = (Uint32)m_impl->rtInstances.size();   // -> g_Instances index (InstanceID() in the shader)
 	inst.ContributionToHitGroupIndex = TLAS_INSTANCE_OFFSET_AUTO;   // PER_TLAS binding: offset computed by Diligent
@@ -252,6 +266,19 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 	d.specularFactor = specF;
 	d.albedoMetal[0] = alb[0]; d.albedoMetal[1] = alb[1]; d.albedoMetal[2] = alb[2]; d.albedoMetal[3] = metal;
 	d.emissiveRough[0] = em[0] * emI; d.emissiveRough[1] = em[1] * emI; d.emissiveRough[2] = em[2] * emI; d.emissiveRough[3] = rough;
+	// Dynamic sprite meshes (particles): this frame's per-vertex colors go into the color
+	// pool (rebuilt every frame — beginRTScene clears it); shadow candidates get the quad
+	// footprint + the instance alpha (mat->color.a — the emitter's average alive alpha).
+	d.colOffset = 0xFFFFFFFFu;
+	if (mesh->rtColorArray && mesh->rtDynamic)
+	{
+		d.colOffset = (uint32_t)(m_impl->rtDynColCPU.size() * sizeof(float));
+		m_impl->rtDynColCPU.insert(m_impl->rtDynColCPU.end(), mesh->rtColorArray,
+		                           mesh->rtColorArray + (size_t)mesh->numVerts * 4);
+	}
+	d.shadowShape = (uint32_t)mesh->rtShadowShape;
+	d.shadowAlpha = alb[3];
+	d.pad0 = 0;
 
 	// MatCB block — same packing as the raster MatCB (NukeDiligent_Scene.cpp): standard fields + custom props.
 	d.matByteOffset = (uint32_t)m_impl->allMatCPU.size();
@@ -283,13 +310,130 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 	m_impl->rtInstances.push_back(inst);
 }
 
+// Foliage RT bend: run the shared NukeBend compute over every bend mesh seen this frame and
+// REBUILD its BLAS over the bent positions — ray-traced shadows/reflections of vegetation
+// sway exactly like the raster blades (same include, same BendCB, zero drift).
+void NukeDiligent::Impl::BendRTMeshes()
+{
+	blasBentThisFrame = false;
+	if (!bendCSPSO || !bendCSSRB || rtBendMeshes.empty()) return;
+	std::sort(rtBendMeshes.begin(), rtBendMeshes.end());
+	rtBendMeshes.erase(std::unique(rtBendMeshes.begin(), rtBendMeshes.end()), rtBendMeshes.end());
+	for (Mesh* m : rtBendMeshes)
+	{
+		MeshGPU* gp = GetMeshGPU(m);
+		if (!gp || !gp->posBent || !gp->bendSrc || !gp->bendData || !gp->bendPivot) continue;
+		auto bit = blasCache.find(m);
+		if (bit == blasCache.end() || !bit->second || !gp->blasScratch) continue;
+		{
+			MapHelper<float> pc(context, bendCSParamsCB, MAP_WRITE, MAP_FLAG_DISCARD);
+			if (pc == nullptr) continue;
+			*((Uint32*)&pc[0]) = (Uint32)gp->numVerts;   // g_VertCount (uint in the CB)
+			pc[1] = pc[2] = pc[3] = 0.0f;                // g_AtomOffset (layers live near identity)
+		}
+		auto set = [&](const char* n, IDeviceObject* o)
+		{ if (auto* v = bendCSSRB->GetVariableByName(SHADER_TYPE_COMPUTE, n)) v->Set(o); };
+		set("g_SrcPos",    gp->bendSrc->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
+		set("g_BendData",  gp->bendData->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
+		set("g_BendPivot", gp->bendPivot->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
+		set("g_DstPos",    gp->posBent->GetDefaultView(BUFFER_VIEW_UNORDERED_ACCESS));
+		context->SetPipelineState(bendCSPSO);
+		context->CommitShaderResources(bendCSSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DispatchComputeAttribs da(((Uint32)gp->numVerts + 63) / 64, 1, 1);
+		context->DispatchCompute(da);
+
+		BLASBuildTriangleData td;
+		td.GeometryName         = "geo";
+		td.pVertexBuffer        = gp->posBent;
+		td.VertexStride         = 3 * sizeof(float);
+		td.VertexCount          = (Uint32)gp->numVerts;
+		td.VertexValueType      = VT_FLOAT32;
+		td.VertexComponentCount = 3;
+		td.PrimitiveCount       = (Uint32)(gp->numVerts / 3);
+		td.Flags                = RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+		BuildBLASAttribs ba;
+		ba.pBLAS                  = bit->second;
+		ba.pTriangleData          = &td;
+		ba.TriangleDataCount      = 1;
+		ba.pScratchBuffer         = gp->blasScratch;
+		ba.BLASTransitionMode     = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ba.GeometryTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ba.ScratchBufferTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		context->BuildBLAS(ba);
+		blasBentThisFrame = true;
+	}
+}
+
+// DYNAMIC meshes (particle quads): the engine rewrote the vertex data this frame (version
+// bump -> GetMeshGPU updated the pos buffer in place) — rebuild each mesh's CACHED BLAS over
+// the new positions. Shares blasBentThisFrame so the TLAS refits and the static skip stands
+// down (only sets it, never clears — BendRTMeshes owns the reset).
+void NukeDiligent::Impl::RebuildDynamicBLAS()
+{
+	if (rtDynMeshes.empty()) return;
+	std::sort(rtDynMeshes.begin(), rtDynMeshes.end());
+	rtDynMeshes.erase(std::unique(rtDynMeshes.begin(), rtDynMeshes.end()), rtDynMeshes.end());
+	for (Mesh* m : rtDynMeshes)
+	{
+		MeshGPU* gp = GetMeshGPU(m);
+		auto bit = blasCache.find(m);
+		if (!gp || !gp->pos || bit == blasCache.end() || !bit->second || !gp->blasScratch) continue;
+		BLASBuildTriangleData td;
+		td.GeometryName         = "geo";
+		td.pVertexBuffer        = gp->pos;
+		td.VertexStride         = 3 * sizeof(float);
+		td.VertexCount          = (Uint32)gp->numVerts;
+		td.VertexValueType      = VT_FLOAT32;
+		td.VertexComponentCount = 3;
+		td.PrimitiveCount       = (Uint32)(gp->numVerts / 3);
+		td.Flags                = m->rtAlphaTested ? RAYTRACING_GEOMETRY_FLAG_NONE : RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+		BuildBLASAttribs ba;
+		ba.pBLAS                  = bit->second;
+		ba.pTriangleData          = &td;
+		ba.TriangleDataCount      = 1;
+		ba.pScratchBuffer         = gp->blasScratch;
+		ba.BLASTransitionMode     = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ba.GeometryTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ba.ScratchBufferTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		context->BuildBLAS(ba);
+		blasBentThisFrame = true;
+		static bool logged = false;
+		if (!logged) { logged = true; cout << "[NukeDiligent]\tdynamic BLAS rebuild active (particles)" << endl; }
+	}
+}
+
 void NukeDiligent::buildRTScene()
 {
 	auto* d = m_impl;
 	if (!d->rtSupported || d->rtInstances.empty()) { d->rtSceneReady = false; return; }
+	d->BendRTMeshes();         // sway the foliage BLASes BEFORE the TLAS build/refit
+	d->RebuildDynamicBLAS();   // particle quad BLASes follow this frame's vertex data
 	const Uint32 count = (Uint32)d->rtInstances.size();
 	// Fix up InstanceName pointers (the names vector may have reallocated during accumulation).
 	for (Uint32 i = 0; i < count; ++i) d->rtInstances[i].InstanceName = d->rtInstanceNames[i].c_str();
+
+	// FULL static skip: a byte-identical scene (same BLAS set, transforms, masks, per-instance
+	// data and material blocks) needs NOTHING — keep last frame's TLAS/buffers untouched. This
+	// makes a static world's per-frame RT cost the rays only, not a rebuild.
+	{
+		auto fnv = [](uint64_t h, const void* p, size_t n)
+		{ const unsigned char* b = (const unsigned char*)p; for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; } return h; };
+		uint64_t full = 1469598103934665603ull;
+		for (Uint32 i = 0; i < count; ++i)
+		{
+			const auto& ins = d->rtInstances[i];
+			full = fnv(full, &ins.pBLAS, sizeof(ins.pBLAS));
+			full = fnv(full, &ins.Mask, sizeof(ins.Mask));
+			full = fnv(full, &ins.CustomId, sizeof(ins.CustomId));
+			full = fnv(full, &ins.Transform, sizeof(ins.Transform));
+		}
+		if (!d->rtInstData.empty()) full = fnv(full, d->rtInstData.data(), d->rtInstData.size() * sizeof(Impl::RTInstanceData));
+		if (!d->allMatCPU.empty())  full = fnv(full, d->allMatCPU.data(), d->allMatCPU.size());
+		const bool unchanged = full == d->lastRTFullSig && d->rtSceneReady && d->tlas && !d->allNrmDirty &&
+		                       !d->blasBentThisFrame;   // bent BLAS -> the TLAS must refit over it
+		d->lastRTFullSig = full;
+		if (unchanged) return;
+	}
 
 	bool recreated = false;
 	if (!d->tlas || d->tlasMaxInstances < count)   // (re)create when capacity grows
@@ -398,6 +542,25 @@ void NukeDiligent::buildRTScene()
 			d->context->UpdateBuffer(d->rtMatBuf, 0, (Uint64)d->allMatCPU.size(), d->allMatCPU.data(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	}
 
+	// Per-frame color pool (dynamic sprite meshes: particle gradients/fade) — RAW buffer,
+	// rebuilt every frame the particles move (their BLAS rebuild already disables the
+	// static skip, so this upload always runs together with fresh instance data).
+	if (!d->rtDynColCPU.empty())
+	{
+		const Uint64 need = (Uint64)d->rtDynColCPU.size() * sizeof(float);
+		if (!d->rtDynColBuf || d->rtDynColCap < need)
+		{
+			d->Trash(d->rtDynColBuf);
+			d->rtDynColBuf.Release(); d->rtDynColSRV = nullptr; d->rtDynColCap = need;
+			BufferDesc bd; bd.Name = "RT DynColors"; bd.Usage = USAGE_DEFAULT; bd.BindFlags = BIND_SHADER_RESOURCE;
+			bd.Mode = BUFFER_MODE_RAW; bd.Size = need;
+			d->device->CreateBuffer(bd, nullptr, &d->rtDynColBuf);
+			if (d->rtDynColBuf) d->rtDynColSRV = d->rtDynColBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE);
+		}
+		if (d->rtDynColBuf)
+			d->context->UpdateBuffer(d->rtDynColBuf, 0, need, d->rtDynColCPU.data(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	}
+
 	d->rtSceneReady = true;
 }
 
@@ -424,10 +587,13 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 		if (!out) cout << "[NukeDiligent]\tRT shader build failed: " << file << endl;
 		return (bool)out;
 	};
-	RefCntAutoPtr<IShader> rg, rm, rch;
+	RefCntAutoPtr<IShader> rg, rm, rch, rah;
 	if (!mk("rt_rgen.hlsl",  SHADER_TYPE_RAY_GEN,         "RT RayGen",     rg))  return false;
 	if (!mk("rt_rmiss.hlsl", SHADER_TYPE_RAY_MISS,        "RT Miss",       rm))  return false;
 	if (!mk("rt_rchit.hlsl", SHADER_TYPE_RAY_CLOSEST_HIT, "RT ClosestHit", rch)) return false;
+	// Any-hit alpha test — shared by EVERY hit group; runs only for non-opaque geometry
+	// (Mesh::rtAlphaTested particle quads), so opaque hits pay nothing.
+	if (!mk("rt_ahit.hlsl",  SHADER_TYPE_RAY_ANY_HIT,     "RT AnyHit",     rah)) return false;
 
 	// Auto-generate a closest-hit per material shader that ships a "<name>.surf.hlsl" (codegen from its schema).
 	auto mkSrc = [&](const std::string& src, const char* dbg, RefCntAutoPtr<IShader>& out)
@@ -458,8 +624,8 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 	ci.PSODesc.PipelineType = PIPELINE_TYPE_RAY_TRACING;
 	RayTracingGeneralShaderGroup gen[2] = { {"Main", rg}, {"Miss", rm} };
 	std::vector<RayTracingTriangleHitShaderGroup> hit;
-	hit.push_back({hitNames[0].c_str(), rch});                                   // default: standard PBR
-	for (size_t i = 0; i < customChits.size(); ++i) hit.push_back({hitNames[i + 1].c_str(), customChits[i]});
+	hit.push_back({hitNames[0].c_str(), rch, rah});                              // default: standard PBR + alpha any-hit
+	for (size_t i = 0; i < customChits.size(); ++i) hit.push_back({hitNames[i + 1].c_str(), customChits[i], rah});
 	ci.pGeneralShaders = gen; ci.GeneralShaderCount = 2;
 	ci.pTriangleHitShaders = hit.data(); ci.TriangleHitShaderCount = (Uint32)hit.size();
 	ci.RayTracingPipeline.MaxRecursionDepth = 8;       // primary + bounces; the configured depth caps actual recursion
@@ -483,7 +649,7 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 
 	device->CreateRayTracingPipelineState(ci, &rtPSO);
 	if (!rtPSO) { cout << "[NukeDiligent]\tRT pipeline PSO build failed" << endl; return false; }
-	for (SHADER_TYPE t : {SHADER_TYPE_RAY_GEN, SHADER_TYPE_RAY_MISS, SHADER_TYPE_RAY_CLOSEST_HIT})
+	for (SHADER_TYPE t : {SHADER_TYPE_RAY_GEN, SHADER_TYPE_RAY_MISS, SHADER_TYPE_RAY_CLOSEST_HIT, SHADER_TYPE_RAY_ANY_HIT})
 	{
 		if (auto* v = rtPSO->GetStaticVariableByName(t, "RTRefCB")) v->Set(rtRefCB);
 		if (auto* v = rtPSO->GetStaticVariableByName(t, "FrameCB")) v->Set(worldFrameCB);
@@ -571,6 +737,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_GEN, n))         v->Set(o);
 		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_MISS, n))        v->Set(o);
 		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_CLOSEST_HIT, n)) v->Set(o);
+		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_ANY_HIT, n))     v->Set(o);   // alpha-test any-hit
 	};
 	setv("g_TLAS",     (IDeviceObject*)tlas.RawPtr());
 	setv("g_Output",   rtOutTex->GetDefaultView(TEXTURE_VIEW_UNORDERED_ACCESS));
@@ -583,6 +750,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	setv("g_AllPos",   rtPosSRV ? rtPosSRV : rtNrmSRV);
 	setv("g_Instances",rtInstSRV);
 	setv("g_MatBytes", rtMatSRV ? rtMatSRV : rtInstSRV);   // per-instance MatCB blocks (auto-gen chits); rtInstSRV = valid non-null fallback
+	setv("g_DynCol",   rtDynColSRV ? rtDynColSRV : rtNrmSRV);   // per-frame particle colors (fallback = any valid RAW SRV)
 	{   // bindless albedo array (re-resolve each frame -> animated textures update)
 		ITextureView* white = whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 		IDeviceObject* arr[Impl::kMaxMatTex];
@@ -592,6 +760,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 			else arr[k] = white;
 		}
 		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_CLOSEST_HIT, "g_MatTex")) v->SetArray(arr, 0, kMaxMatTex);
+		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_ANY_HIT,     "g_MatTex")) v->SetArray(arr, 0, kMaxMatTex);
 	}
 
 	// The TLAS is rebuilt every frame -> refresh the SBT's per-instance hit-group mapping each frame. Each

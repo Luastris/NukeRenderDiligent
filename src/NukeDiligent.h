@@ -60,6 +60,8 @@ public:
 	void renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count) override;
 	void setWind(const float dirStrength[4], const float params[4]) override;   // 7.2
 	void setSpriteSoftDepth(float dist) override;                               // 7.3 soft particles
+	void setBendPushers(const float* xyzr, int count) override;                 // 7.4 foliage interaction
+	void setBendVolumes(const float* vols, int count) override;                 // 7.4 zones/fields bend
 	bool isMouseButtonDown(int button) override;
 	void bindRenderTarget(uint64_t rtId) override;
 	void invalidateTexture(Texture* t) override;
@@ -85,7 +87,7 @@ public:
 	void endGBufferPass() override;
 	bool rtAvailable() override;
 	void beginRTScene() override;
-	void addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections = true) override;
+	void addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections = true, bool castShadows = true) override;
 	void setCameraTAA(bool enabled) override;
 	void requestClose() override;
 	void drawDebugLine(const float a[3], const float b[3], const float color[4]) override;

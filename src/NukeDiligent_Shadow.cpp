@@ -67,6 +67,7 @@ void NukeDiligent::Impl::CreateShadowResources()
 	std::string vs = shaderSource("shadow.vs"), ps = shaderSource("shadow.ps");
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tshadow shaders missing" << endl; return; }
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	sci.pShaderSourceStreamFactory = shaderFactory;   // resolves #include "nukebend.hlsl"
 	RefCntAutoPtr<IShader> vsh, psh;
 	sci.Desc = {"Shadow VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &vsh);
 	sci.Desc = {"Shadow PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &psh);
@@ -136,14 +137,19 @@ void NukeDiligent::Impl::CreateShadowResources()
 			{
 				if (auto* v = shadowPSOInst->GetStaticVariableByName(SHADER_TYPE_VERTEX, "ShadowVSCB")) v->Set(shadowVSCB);
 				if (auto* v = shadowPSOInst->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "ShadowPSCB")) v->Set(shadowPSCB);
+				if (auto* v = shadowPSOInst->GetStaticVariableByName(SHADER_TYPE_VERTEX, "BendCB"))     v->Set(bendCB);   // foliage bend follows into shadows (7.4)
 				shadowPSOInst->CreateShaderResourceBinding(&shadowSRBInst, true);
 				if (auto* v = shadowSRBInst->GetVariableByName(SHADER_TYPE_VERTEX, "ShadowVSCB")) v->Set(shadowVSCB);
 				if (auto* v = shadowSRBInst->GetVariableByName(SHADER_TYPE_PIXEL,  "ShadowPSCB")) v->Set(shadowPSCB);
+				// VULKAN: cbuffers may reflect MUTABLE, not static — an unbound BendCB left the
+				// whole descriptor set invalid and instanced shadows silently vanished on Vk.
+				if (auto* v = shadowSRBInst->GetVariableByName(SHADER_TYPE_VERTEX, "BendCB"))     v->Set(bendCB);
 				shadowPsTexVarInst = shadowSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 			}
 		}
 	}
-	cout << "[NukeDiligent]\tshadow map " << shadowRes << "x" << shadowRes << (shadowPSO ? " ready" : " FAILED") << endl;
+	cout << "[NukeDiligent]\tshadow map " << shadowRes << "x" << shadowRes << (shadowPSO ? " ready" : " FAILED")
+	     << (shadowPSOInst ? " +inst" : " NO-INST") << endl;
 }
 
 void NukeDiligent::setLights(const NukeLight* lights, int count)
@@ -220,6 +226,7 @@ int NukeDiligent::shadowPassCount() { return m_impl->numShadowSlots + m_impl->nu
 
 void NukeDiligent::beginShadowPass(int pass)
 {
+	++m_impl->passSerial;   // invalidate the per-draw redundancy gates (shared CBs re-map per pass)
 	if (pass < 0 || pass >= m_impl->numShadowSlots + m_impl->numCubes * 6) return;
 	IDeviceContext* ctx = m_impl->context;
 	ITextureView* dsv; int res;

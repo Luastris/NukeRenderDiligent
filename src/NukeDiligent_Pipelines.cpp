@@ -106,6 +106,66 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	fcbd.BindFlags = BIND_UNIFORM_BUFFER; fcbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(fcbd, nullptr, &worldFrameCB);
 
+	// Foliage bend CB (7.4): wind + pushers + analytic volumes for the INSTANCED vertex
+	// shaders (g_WindV, g_WindT, g_WindP, g_Push[8], g_Vol[48] = 59 float4s). Written once
+	// per frame in setWind.
+	BufferDesc bcbd;
+	bcbd.Name = "Bend CB"; bcbd.Size = sizeof(float) * 4 * 59; bcbd.Usage = USAGE_DYNAMIC;
+	bcbd.BindFlags = BIND_UNIFORM_BUFFER; bcbd.CPUAccessFlags = CPU_ACCESS_WRITE;
+	device->CreateBuffer(bcbd, nullptr, &bendCB);
+
+	// Per-draw flags CB (x = receiveShadows): its OWN tiny cbuffer, NOT a MatCB slot — custom
+	// shaders parse their MatCB layout for prop offsets, so growing the shared header would
+	// silently corrupt every user shader's first prop. Written per draw in renderObject[Instanced].
+	BufferDesc dfbd;
+	dfbd.Name = "DrawFlags CB"; dfbd.Size = sizeof(float) * 4; dfbd.Usage = USAGE_DYNAMIC;
+	dfbd.BindFlags = BIND_UNIFORM_BUFFER; dfbd.CPUAccessFlags = CPU_ACCESS_WRITE;
+	device->CreateBuffer(dfbd, nullptr, &drawFlagsCB);
+
+	// Foliage RT bend compute (bend.cs): shares nukebend.hlsl with the raster VS shaders and
+	// BendCB with setWind — bends the merged foliage chunk meshes so their BLAS (and thus RT
+	// shadows/reflections) sways with the wind. RT-only; skipped when unsupported.
+	if (rtSupported)
+	{
+		std::string cs = shaderSource("bend.cs");
+		if (!cs.empty())
+		{
+			ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+			sci.pShaderSourceStreamFactory = shaderFactory;   // resolves #include "nukebend.hlsl"
+			sci.Desc = {"Foliage Bend CS", SHADER_TYPE_COMPUTE, true};
+			sci.Source = cs.c_str();
+			RefCntAutoPtr<IShader> csh; CreateShaderCached(sci, &csh);
+			if (csh)
+			{
+				BufferDesc cpb; cpb.Name = "BendCS Params"; cpb.Size = sizeof(float) * 4;
+				cpb.Usage = USAGE_DYNAMIC; cpb.BindFlags = BIND_UNIFORM_BUFFER; cpb.CPUAccessFlags = CPU_ACCESS_WRITE;
+				device->CreateBuffer(cpb, nullptr, &bendCSParamsCB);
+				ComputePipelineStateCreateInfo cci; cci.PSODesc.Name = "Foliage Bend PSO";
+				ShaderResourceVariableDesc cvars[] = {
+					{SHADER_TYPE_COMPUTE, "g_SrcPos",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_BendData",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_BendPivot", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_DstPos",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+				};
+				cci.PSODesc.ResourceLayout.Variables = cvars; cci.PSODesc.ResourceLayout.NumVariables = 4;
+				cci.pCS = csh;
+				device->CreateComputePipelineState(cci, &bendCSPSO);
+				if (bendCSPSO)
+				{
+					if (auto* v = bendCSPSO->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "BendCB"))       v->Set(bendCB);
+					if (auto* v = bendCSPSO->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "BendCSParams")) v->Set(bendCSParamsCB);
+					bendCSPSO->CreateShaderResourceBinding(&bendCSSRB, true);
+					if (bendCSSRB)
+					{
+						if (auto* v = bendCSSRB->GetVariableByName(SHADER_TYPE_COMPUTE, "BendCB"))       v->Set(bendCB);
+						if (auto* v = bendCSSRB->GetVariableByName(SHADER_TYPE_COMPUTE, "BendCSParams")) v->Set(bendCSParamsCB);
+					}
+				}
+				cout << "[NukeDiligent]	foliage bend CS " << (bendCSPSO && bendCSSRB ? "ready" : "FAILED") << endl;
+			}
+		}
+	}
+
 	// 1x1 white fallback texture (bound when a material has no texture).
 	uint32_t white = 0xFFFFFFFFu;
 	TextureDesc wd; wd.Type = RESOURCE_DIM_TEX_2D; wd.Width = 1; wd.Height = 1;
@@ -273,6 +333,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	if (vsSrc.empty() || psSrc.empty()) return false;
 	ShaderCreateInfo sci;
 	sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	sci.pShaderSourceStreamFactory = shaderFactory;   // resolves #include "nukebend.hlsl"
 	// Ray tracing: compile the world shaders via DXC at SM6.5 with RT_ENABLED so world.ps can use inline RayQuery
 	// (RT shadows). D3D11 / unsupported GPUs keep the default FXC SM5 path (shadow maps).
 	ShaderMacro rtMacro[] = {{"RT_ENABLED", "1"}};
@@ -318,11 +379,12 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		{SHADER_TYPE_PIXEL, "g_ShadowCube", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Probe",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // reflection probe cubemap
 		{SHADER_TYPE_PIXEL, "g_TLAS",       SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // RT scene (only present when rtSupported)
+		{SHADER_TYPE_PIXEL, "g_RTInst",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // per-instance RT data (shadow footprints)
 	};
 	ci.PSODesc.ResourceLayout.Variables    = vars;
-	// g_TLAS (last entry) only exists when rtSupported -> drop it from the list otherwise.
+	// The RT entries (last two) only exist when rtSupported -> drop them from the list otherwise.
 	const Uint32 kNumVars = (Uint32)(sizeof(vars) / sizeof(vars[0]));
-	ci.PSODesc.ResourceLayout.NumVariables = rtSupported ? kNumVars : kNumVars - 1;
+	ci.PSODesc.ResourceLayout.NumVariables = rtSupported ? kNumVars : kNumVars - 2;
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_WRAP; samp.AddressV = TEXTURE_ADDRESS_WRAP; samp.AddressW = TEXTURE_ADDRESS_WRAP;
 	// One immutable sampler per material-map texture. Combined-sampler mode is strict on D3D12: a texture X is
@@ -348,10 +410,13 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		if (auto* v = pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))      v->Set(worldCB);
 		if (auto* m = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB"))   m->Set(worldMatCB);
 		if (auto* f = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "FrameCB")) f->Set(worldFrameCB);
+		if (auto* b = pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "BendCB"))  b->Set(bendCB);   // instanced variants only (7.4)
+		if (auto* d = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "DrawFlagsCB")) d->Set(drawFlagsCB);   // receiveShadows etc.
 	};
 
 	// Release any previous objects first (rebuild path) — Diligent asserts on Create over a non-null ref.
 	wp.pso.Release(); wp.psoBlend.Release(); wp.psoAdd.Release(); wp.psoWire.Release(); wp.srb.Release();
+	memset(wp.lastBind, 0, sizeof(wp.lastBind)); memset(wp.lastBindI, 0, sizeof(wp.lastBindI));   // fresh SRBs hold nothing
 
 	// 1) Opaque — blend off, depth write on (base ci as configured above).
 	CreateGraphicsPipelineStateCached(ci, &wp.pso);
@@ -391,6 +456,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	}
 
 	wp.pso->CreateShaderResourceBinding(&wp.srb, true);
+	// VULKAN: cbuffers may reflect MUTABLE — bind through the SRB too (see BendCB note below).
+	if (auto* d = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "DrawFlagsCB")) d->Set(drawFlagsCB);
 	wp.texVar  = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 	wp.normVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
 	wp.mrVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
@@ -401,6 +468,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.cubeVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ShadowCube");
 	wp.probeVar  = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Probe");
 	wp.tlasVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_TLAS");
+	wp.rtInstVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_RTInst");
 
 	// --- INSTANCED variants (7.1): only for shaders that OPT IN by handling NUKE_INSTANCED. ---
 	// Same vs/ps sources compiled with the define prepended; the input layout gains 5 per-
@@ -472,6 +540,10 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 					if (wp.psoInstWire) setStatics(wp.psoInstWire);
 				}
 				wp.psoInst->CreateShaderResourceBinding(&wp.srbInst, true);
+				// VULKAN: cbuffers may reflect MUTABLE — bind BendCB through the SRB too (an
+				// unbound descriptor invalidates the whole set; grass ignored the wind on Vk).
+				if (auto* b = wp.srbInst->GetVariableByName(SHADER_TYPE_VERTEX, "BendCB")) b->Set(bendCB);
+				if (auto* d = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "DrawFlagsCB")) d->Set(drawFlagsCB);
 				wp.texVarI  = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 				wp.normVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
 				wp.mrVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
@@ -482,6 +554,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				wp.cubeVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_ShadowCube");
 				wp.probeVarI  = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Probe");
 				wp.tlasVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_TLAS");
+				wp.rtInstVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_RTInst");
 			}
 			else
 				cout << "[NukeDiligent]\tinstanced PSO build failed for shader '" << dbg << "'" << endl;

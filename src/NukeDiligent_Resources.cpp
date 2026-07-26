@@ -212,6 +212,27 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 		const float* uvSrc = mesh->uvArray;
 		if (!uvSrc) { zeroUV.assign((size_t)mesh->numVerts * 2, 0.0f); uvSrc = zeroUV.data(); }   // mesh has no UVs
 		bd.Size = sz2; bd.Name = "mesh uv"; BufferData udat{uvSrc, sz2}; device->CreateBuffer(bd, &udat, &g.uv);
+		// RT wind bend (Mesh::rtBendArray, foliage merged chunks): compute inputs + the BENT
+		// position buffer the BLAS builds over. A separate structured copy of the positions
+		// keeps the vertex buffer's bind flags untouched (VB+RT combo stays as-is).
+		if (rtSupported && mesh->rtBendArray && mesh->rtPivotArray)
+		{
+			const Uint64 sz4 = (Uint64)mesh->numVerts * 4 * sizeof(float);
+			BufferDesc sb; sb.Usage = USAGE_DEFAULT; sb.Mode = BUFFER_MODE_STRUCTURED;
+			sb.BindFlags = BIND_SHADER_RESOURCE; sb.ElementByteStride = sizeof(float);
+			sb.Size = sz3; sb.Name = "bend src";
+			BufferData sdat{mesh->vertexArray, sz3}; device->CreateBuffer(sb, &sdat, &g.bendSrc);
+			sb.ElementByteStride = sizeof(float) * 4;
+			sb.Size = sz4; sb.Name = "bend data";
+			BufferData bdat2{mesh->rtBendArray, sz4}; device->CreateBuffer(sb, &bdat2, &g.bendData);
+			sb.Name = "bend pivot";
+			BufferData pdat2{mesh->rtPivotArray, sz4}; device->CreateBuffer(sb, &pdat2, &g.bendPivot);
+			BufferDesc db; db.Usage = USAGE_DEFAULT; db.Mode = BUFFER_MODE_STRUCTURED;
+			db.BindFlags = BIND_UNORDERED_ACCESS | BIND_RAY_TRACING; db.ElementByteStride = sizeof(float);
+			db.Size = sz3; db.Name = "bend pos out";
+			BufferData ddat{mesh->vertexArray, sz3};   // starts unbent -> BLAS valid before the first dispatch
+			device->CreateBuffer(db, &ddat, &g.posBent);
+		}
 		it = meshCache.emplace(mesh, std::move(g)).first;
 	}
 	MeshGPU& g = it->second;
@@ -229,6 +250,14 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 		const Uint64 sz3 = (Uint64)mesh->numVerts * 3 * sizeof(float);
 		if (mesh->vertexArray) context->UpdateBuffer(g.pos, 0, sz3, mesh->vertexArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		if (mesh->normalArray) context->UpdateBuffer(g.nrm, 0, sz3, mesh->normalArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		if (g.bendSrc && mesh->vertexArray)
+		{
+			context->UpdateBuffer(g.bendSrc, 0, sz3, mesh->vertexArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			const Uint64 sz4 = (Uint64)mesh->numVerts * 4 * sizeof(float);
+			if (g.bendData && mesh->rtBendArray)   context->UpdateBuffer(g.bendData, 0, sz4, mesh->rtBendArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			if (g.bendPivot && mesh->rtPivotArray) context->UpdateBuffer(g.bendPivot, 0, sz4, mesh->rtPivotArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			if (g.posBent) context->UpdateBuffer(g.posBent, 0, sz3, mesh->vertexArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		}
 		g.version = mesh->version;
 	}
 	return &g;
@@ -267,6 +296,8 @@ void NukeDiligent::invalidateMesh(Mesh* m)
 	if (it != m_impl->meshCache.end())
 	{
 		m_impl->Trash(it->second.pos); m_impl->Trash(it->second.nrm); m_impl->Trash(it->second.uv);
+		m_impl->Trash(it->second.bendSrc); m_impl->Trash(it->second.bendData); m_impl->Trash(it->second.bendPivot);
+		m_impl->Trash(it->second.posBent); m_impl->Trash(it->second.blasScratch);
 		m_impl->meshCache.erase(it);
 	}
 	// The BLAS references the OLD pos buffer's GPU memory — after the buffers go, a cached BLAS would
