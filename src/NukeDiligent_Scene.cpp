@@ -1,5 +1,7 @@
 #include "NukeDiligentImpl.h"
+#include "../include/NukeDiligentNative.h"   // module pass hooks (camera begin / post point)
 
+namespace nukediligent { const WaterHooks& ActiveWaterHooks(); }
 
 // Camera basis -> curView/curProj/curCamPos. Shared by beginCamera and the SSR gbuffer prepass so both use the
 // exact same transform (left-handed look-at; same projection as beginCamera).
@@ -36,6 +38,10 @@ void NukeDiligent::Impl::SetCameraViewProj(const NukeCameraDesc& cam, int w, int
 					curProj.m[r][c] = persp.m[r][c] * (1.0f - cam.ortho) + orth.m[r][c] * cam.ortho;
 	}
 	curCamPos[0] = P.x; curCamPos[1] = P.y; curCamPos[2] = P.z;
+	curCamFwd[0] = F.x; curCamFwd[1] = F.y; curCamFwd[2] = F.z;
+	curCamEditor = cam.editorCamera != 0;   // module passes read this through the native hatch
+	// (The water module anchors its ripple window to GAME cameras itself, via the
+	// camera-begin hook + Frame.camIsEditor.)
 }
 
 // Target size for a camera (matches beginCamera): backbuffer (target 0) or the off-screen RT.
@@ -334,6 +340,10 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	m_impl->curRTV = rtv; m_impl->curDSV = dsv;                     // for the selection-outline pass (restore)
 	m_impl->curRTW = w; m_impl->curRTH = h;
 	m_impl->cameraPassActive = true;   // sprites may draw from here until endCamera completes
+	{   // module camera-begin hook (water resets its per-camera underwater candidate here)
+		const nukediligent::WaterHooks& wh = nukediligent::ActiveWaterHooks();
+		if (wh.onCameraBegin) wh.onCameraBegin(wh.user);
+	}
 
 	IDeviceContext* ctx = m_impl->context;
 	ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -577,13 +587,20 @@ void NukeDiligent::endCamera()
 		ra.Format = m_impl->SceneFmt();
 		m_impl->context->ResolveTextureSubresource(m_impl->curResolveSrc, m_impl->curResolveDst, ra);
 	}
-	// 2) Custom effect chain (HDR): ping-pong the resolved scene through each post pipeline.
+	// 1.5) Module post hook (the water module's underwater/wetness passes live behind it):
+	// after the resolve, BEFORE the user chain — the hook's output is scene content.
 	ITextureView* chainSrc = m_impl->curPostSrc;
-	if (!m_impl->postChain.empty() && m_impl->curPostSrc && m_impl->curRTW > 0 && m_impl->curRTH > 0)
+	{
+		const nukediligent::WaterHooks& wh = nukediligent::ActiveWaterHooks();
+		if (wh.onCameraPost && chainSrc)
+			if (ITextureView* replaced = wh.onCameraPost(wh.user, chainSrc))
+				chainSrc = replaced;
+	}
+	if (!m_impl->postChain.empty() && chainSrc && m_impl->curRTW > 0 && m_impl->curRTH > 0)
 	{
 		m_impl->EnsureScratch(m_impl->curRTW, m_impl->curRTH);
 		const int w = m_impl->curRTW, h = m_impl->curRTH;
-		ITextureView* srcSRV = m_impl->curPostSrc;
+		ITextureView* srcSRV = chainSrc;
 		int idx = 0;
 		for (auto& cs : m_impl->postChain)
 		{

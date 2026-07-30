@@ -66,13 +66,13 @@ std::string NukeDiligent::Impl::GenChitSource(const std::string& name, const std
 	  << "  IN.worldPos = WorldRayOrigin()+wdir*RayTCurrent(); IN.viewDir=-wdir;\n"
 	  << "  SurfaceOut O=(SurfaceOut)0; O.albedo=float3(1,1,1); O.roughness=1.0; O.alpha=1.0; O.unlit=false;\n"
 	  << "  Surface(IN,O);\n"
-	  << "  if (O.unlit){ p.color=O.emissive; return; }\n"
+	  << "  if (O.unlit){ float wT0=RTWaterTrans(WorldRayOrigin(),IN.worldPos); p.color=O.emissive*wT0+RTWaterLook(wdir)*(1.0-wT0); return; }\n"
 	  << "  float aoM=SampleAO(inst,IN.uv); float3 specM=SampleSpec(inst,IN.uv);\n"
 	  << "  float3 col = ShadeSurface(IN.worldPos,IN.worldNormal,IN.viewDir,O.albedo,O.metallic,O.roughness,O.emissive,aoM,specM);\n"
 	  << "  float3 R=reflect(wdir,IN.worldNormal); float3 env=ReflEnv(R,O.roughness), traced=env;\n"
 	  << "  if (p.depth<(uint)g_RTParams.z){ RayDesc ray; ray.Origin=IN.worldPos+IN.worldNormal*0.08+R*0.05; ray.Direction=R; ray.TMin=0.02; ray.TMax=(g_RTParams.y>0.5)?g_RTParams.y:1000.0; RTPayload p2; p2.color=0.0; p2.depth=p.depth+1; TraceRay(g_TLAS,RAY_FLAG_NONE,RT_REFLECT_MASK,0,1,0,ray,p2); traced=p2.color; }\n"
 	  << "  col += SpecFr(IN.worldNormal,IN.viewDir,O.roughness,O.albedo,O.metallic,specM)*lerp(traced,env,O.roughness);\n"
-	  << "  p.color=col;\n}\n";
+	  << "  float wT=RTWaterTrans(WorldRayOrigin(),IN.worldPos); p.color=col*wT+RTWaterLook(wdir)*(1.0-wT);\n}\n";   // water crossed by this segment (see rt_common)
 	return s.str();
 }
 
@@ -717,8 +717,8 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	EnsureRTOutput(w, h);
 	if (!rtOutTex) return;
 
-	{   // RTRefCB: clip->view + view->world + camera + (intensity, maxDist, maxDepth)
-		struct CB { float4x4 ip, iv; float4 cam; float4 prm; };
+	{   // RTRefCB: clip->view + view->world + camera + (intensity, maxDist, maxDepth) + water
+		struct CB { float4x4 ip, iv; float4 cam; float4 prm; float4 waterOcc; float4 waterCol; float4 waterAbs; };
 		MapHelper<CB> cb(context, rtRefCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		cb->ip  = curProjNoJitter.Inverse(); cb->iv = curView.Inverse();   // unjittered — matches the unjittered gbuffer depth (TAA jitter must not leak into RT reflections)
 		cb->cam = float4(curCamPos[0], curCamPos[1], curCamPos[2], 1.0f);
@@ -729,6 +729,13 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		maxDepth = (maxDepth < 1.0f) ? 1.0f : (maxDepth > 7.0f ? 7.0f : maxDepth);   // PSO MaxRecursionDepth = 8
 		if (roughCut < 0.05f) roughCut = 0.05f;
 		cb->prm = float4(intensity, maxDist, maxDepth, roughCut);
+		// Water occlusion for reflections: the gbuffer has no water — reflectors on the far
+		// side of the drawn body's level fade out instead of punching through the surface.
+		// The water module publishes its attenuation state through the native hatch
+		// (SetRTWaterState) — `on` already carries the this-frame freshness.
+		cb->waterOcc = float4(rtWaterOcc[0], rtWaterOcc[1], rtWaterOcc[2], 0.0f);
+		cb->waterCol = float4(rtWaterCol[0], rtWaterCol[1], rtWaterCol[2], 0.0f);
+		cb->waterAbs = float4(rtWaterAbs[0], rtWaterAbs[1], rtWaterAbs[2], rtWaterOcc[2]);
 	}
 
 	// Bind dynamic resources for every RT stage that references them (null lookups are harmless).

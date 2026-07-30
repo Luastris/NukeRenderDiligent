@@ -280,8 +280,14 @@ void NukeDiligent::setClipboardText(const char* text)
 	if (m_window && text) glfwSetClipboardString(m_window, text);
 }
 
-NukeDiligent::NukeDiligent() : m_impl(new Impl()) {}
-NukeDiligent::~NukeDiligent() { delete m_impl; }
+// The native escape hatch (NukeDiligentNative.h) reaches the ACTIVE renderer through this —
+// set for the instance's lifetime (one renderer object per process; a backend swap replaces
+// it and the pointer follows). Public static member: file-scope globals can't name the
+// private Impl type.
+NukeDiligent::Impl* NukeDiligent::nativeImpl = nullptr;
+
+NukeDiligent::NukeDiligent() : m_impl(new Impl()) { nativeImpl = m_impl; }
+NukeDiligent::~NukeDiligent() { if (nativeImpl == m_impl) nativeImpl = nullptr; delete m_impl; }
 
 void NukeDiligent::setShaderSource(const char* name, const char* source)
 {
@@ -301,12 +307,19 @@ void NukeDiligent::Impl::RebuildShaderFactory()
 	std::vector<std::string> hlslNames;                  // backing storage for "<name>.hlsl"
 	files.reserve(shaderSrc.size() * 2);
 	hlslNames.reserve(shaderSrc.size());                 // no realloc: c_str()s must stay valid
+	// Include epoch for the disk shader cache: the cache key hashes the TOP-LEVEL source only,
+	// so an edit to an INCLUDE (nukebend/water_common/rt_common — dot-less names; pass sources
+	// are "name.vs" etc.) silently served STALE bytecode. Fold every include's content into one
+	// hash that CreateShaderCached mixes into each key.
+	includeEpoch = 1469598103934665603ull;
 	for (auto& kv : shaderSrc)
 	{
 		if (kv.second.empty()) continue;
 		files.emplace_back(kv.first.c_str(), kv.second.c_str(), (Uint32)kv.second.size());
 		hlslNames.push_back(kv.first + ".hlsl");
 		files.emplace_back(hlslNames.back().c_str(), kv.second.c_str(), (Uint32)kv.second.size());
+		if (kv.first.find('.') == std::string::npos)
+			for (unsigned char ch : kv.second) { includeEpoch ^= ch; includeEpoch *= 1099511628211ull; }
 	}
 	MemoryShaderSourceFactoryCreateInfo mci{ files.data(), (Uint32)files.size(), True /*CopySources*/ };
 	shaderFactory.Release();
@@ -444,6 +457,9 @@ int NukeDiligent::init(const WindowDesc& desc)
 		EngineCI.GPUDescriptorHeapSize[0]        = 32768;    // static/mutable CBV/SRV/UAV
 		EngineCI.GPUDescriptorHeapSize[1]        = 512;      // static/mutable samplers
 		EngineCI.GPUDescriptorHeapDynamicSize[1] = 1536;     // dynamic samplers (512+1536 = the 2048 cap)
+		// Hull/domain stages (water near-field tessellation). OPTIONAL: consumers check
+		// GetDeviceInfo().Features.Tessellation and fall back to VS paths.
+		EngineCI.Features.Tessellation = DEVICE_FEATURE_STATE_OPTIONAL;
 		pFactory->CreateDeviceAndContextsD3D12(EngineCI, &m_impl->device, &m_impl->context);
 		if (!m_impl->device) { cout << "[NukeDiligent]\tD3D12 device creation failed" << endl; return 1; }
 		pFactory->CreateSwapChainD3D12(m_impl->device, m_impl->context, SCDesc,
@@ -474,6 +490,8 @@ int NukeDiligent::init(const WindowDesc& desc)
 		// Hardware ray tracing (VK_KHR_ray_tracing_pipeline / ray_query): request it —
 		// unlike D3D12, Vulkan device features must be opted into at creation.
 		EngineCI.Features.RayTracing = DEVICE_FEATURE_STATE_OPTIONAL;
+		// Hull/domain stages (water near-field tessellation) — same opt-in rule.
+		EngineCI.Features.Tessellation = DEVICE_FEATURE_STATE_OPTIONAL;
 		// RT shaders are SM6.x HLSL and need DXC (glslang can't parse them). ONE vendored
 		// dxcompiler.dll (the official release) serves both backends — it emits DXIL for
 		// D3D12 and SPIR-V for Vulkan; point Diligent at it instead of its default
@@ -759,6 +777,7 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 	uint64_t h = 1469598103934665603ull;
 	const size_t srcLen = ci.SourceLength ? ci.SourceLength : strlen(ci.Source);
 	h = fnv(h, ci.Source, srcLen);
+	h = fnv(h, &includeEpoch, sizeof(includeEpoch));   // include edits must invalidate too
 	if (ci.EntryPoint) h = fnv(h, ci.EntryPoint, strlen(ci.EntryPoint));
 	h = fnv(h, &ci.Desc.ShaderType, sizeof(ci.Desc.ShaderType));
 	h = fnv(h, &ci.Desc.UseCombinedTextureSamplers, sizeof(bool));

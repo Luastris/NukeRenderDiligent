@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // IMPORTANT include order: Windows-pulling headers (GLFW native + Diligent D3D)
 // MUST come before the engine headers. Several engine headers do a global
 // `using namespace std;`, which brings std::byte into scope; if the Windows SDK
@@ -128,6 +128,7 @@ struct NukeDiligent::Impl
 	// The renderer does NO file IO for shader sources.
 	RefCntAutoPtr<IShaderSourceInputStreamFactory> shaderFactory;
 	void RebuildShaderFactory();   // rebuild shaderFactory from shaderSrc (called on every push)
+	uint64_t includeEpoch = 0;     // FNV over all INCLUDE sources — part of the disk-cache key
 	std::vector<Mesh*> rtDynMeshes;   // Mesh::rtDynamic instances added this frame -> per-frame BLAS rebuild
 	void RebuildDynamicBLAS();        // rebuild their cached BLASes over the updated vertex buffers
 
@@ -508,12 +509,24 @@ struct NukeDiligent::Impl
 	void  UpdateBendCB();
 	void WriteFrameCB(const Diligent::float3& P);   // fill worldFrameCB (lights/shadows/sky/probe) — shared by camera + cube-face passes
 	float                                 curCamPos[3] = {0, 0, 0};  // set in beginCamera (PBR view dir)
+	float                                 curCamFwd[3] = {0, 0, 1};  // camera forward (ripple window aim)
+	bool                                  curCamEditor = false;      // this pass = editor viewport camera
 	uint64_t                              curTarget = 0;             // RT id bound by beginCamera (feedback guard)
 	// True between beginCamera binding its targets and the END of endCamera. Sprites (world +
 	// canvas-pre) REQUIRE the camera's colour+depth targets — a sprite emitted/flushed outside a
 	// camera pass would draw into whatever is bound (e.g. a depth-less UI target: "Sprite PSO
 	// D32_FLOAT vs DSV nullptr" spam) — such calls are dropped instead.
 	bool                                  cameraPassActive = false;
+	// Native water hooks (NukeDiligentNative.h) live in NukeDiligent_Native.cpp; the RT
+	// water-attenuation POD they feed is consumed by the ray shaders' CB fill (RT.cpp).
+	float rtWaterOcc[4] = { 0, 0, 0.25f, 0 };   // level, on (this frame), 1/opacityDepth, 0
+	float rtWaterCol[3] = { 0.02f, 0.10f, 0.09f };
+	float rtWaterAbs[3] = { 0.45f, 0.09f, 0.06f };
+	// Generic ortho bottom-depth capture (begin/end/fetchWaterBottom — NukeDiligent_Native.cpp).
+	RefCntAutoPtr<ITexture> capDepth, capStaging;
+	int   capPending = -1;
+	bool  capActive = false;
+	float capLevel = 0.0f, capEyeY = 0.0f;
 	std::vector<NukeLight>                lights;      // scene lights (setLights); empty -> default sun
 
 	// --- Shadow maps (directional + spot share a 2D array; one slice per shadow-casting light) -----
@@ -733,6 +746,13 @@ struct NukeDiligent::Impl
 	void ApplyPendingViewportOps();                            // render() top: create/resize queued swap chains
 	// Shared UI draw body (renderDrawLists + secondary viewports draw with it).
 	void DrawUILists(ITextureView* rtv, Uint32 surfW, Uint32 surfH, const NukeUIDrawData& data);
+
+	// --- Water (7.5) — MIGRATED to NukeWater.dll ------------------------------------------------
+	// Every water pass (FFT cascades, ripple sim, caustics, SWE spread, FLIP volumes, surface
+	// draws, underwater/wetness post) lives in the water module now, driven through the native
+	// escape hatch (include/NukeDiligentNative.h). The renderer keeps only GENERIC capabilities:
+	// the ortho bottom capture (NukeDiligent_Native.cpp), the shader/PSO caches, the scratch
+	// targets and the hook points in beginCamera/endCamera.
 
 	// Shader sources pushed by the engine (the renderer does NO file IO). name -> HLSL.
 	std::unordered_map<std::string, std::string> shaderSrc;

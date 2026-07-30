@@ -53,6 +53,7 @@ add_library(NukeRenderDiligent SHARED
     src/NukeDiligent_RT.cpp
     src/NukeDiligent_Sprite.cpp
     src/NukeDiligent_Decal.cpp
+    src/NukeDiligent_Native.cpp
 )
 
 target_compile_definitions(NukeRenderDiligent PRIVATE
@@ -61,6 +62,7 @@ target_compile_definitions(NukeRenderDiligent PRIVATE
     NOMINMAX
     GLFW_EXPOSE_NATIVE_WIN32
     _CRT_SECURE_NO_WARNINGS
+    NUKEDILIGENT_BUILD          # dllexport side of NukeDiligentNative.h
 )
 
 target_include_directories(NukeRenderDiligent PRIVATE

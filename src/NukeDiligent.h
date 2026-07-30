@@ -20,6 +20,9 @@ public:
 	~NukeDiligent();
 
 	void setShaderSource(const char* name, const char* source) override;
+	// (The water seams — setWaterParams/drawWaterSurface/ripples/imprints/spills/FLIP — are
+	// gone from this backend: NukeWater drives its passes itself through the native hatch
+	// (include/NukeDiligentNative.h). Only the GENERIC ortho bottom capture stays below.)
 	uint64_t createShaderPipeline(const char* name, const char* vs, const char* ps) override;
 	int  init(const WindowDesc& desc) override;
 	int  render() override;
@@ -62,6 +65,9 @@ public:
 	void setSpriteSoftDepth(float dist) override;                               // 7.3 soft particles
 	void setBendPushers(const float* xyzr, int count) override;                 // 7.4 foliage interaction
 	void setBendVolumes(const float* vols, int count) override;                 // 7.4 zones/fields bend
+	void beginWaterBottomPass(const float pos[3], const float quat[4], float sizeX, float sizeZ) override;
+	void endWaterBottomPass() override;
+	bool fetchWaterBottom(float* out, int n) override;
 	bool isMouseButtonDown(int button) override;
 	void bindRenderTarget(uint64_t rtId) override;
 	void invalidateTexture(Texture* t) override;
@@ -146,8 +152,12 @@ public:
 		double scrollX = 0.0, scrollY = 0.0;
 	} m_uiInput;
 
-private:
+public:
 	struct Impl;          // PImpl: keeps Diligent types out of this header
+	// The native escape hatch's access point (NukeDiligent_Native.cpp) — the active
+	// renderer's Impl for the exported API. Set/cleared by the ctor/dtor.
+	static Impl* nativeImpl;
+private:
 	Impl*       m_impl   = nullptr;
 	GLFWwindow* m_window = nullptr;
 	int         m_cursorMode = 0;   // 0 Normal / 1 Hidden / 2 Locked / 3 Confined
