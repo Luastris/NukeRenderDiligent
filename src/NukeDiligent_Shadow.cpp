@@ -3,8 +3,7 @@
 
 void NukeDiligent::Impl::CreateShadowResources()
 {
-	// Release prior objects so this can be re-called (e.g. a shadow-resolution change) without Diligent's
-	// "overwriting reference" assert.
+	// Release prior objects first — re-callable (shadow-res change) without Diligent's overwrite assert.
 	shadowTex.Release(); shadowCmpSampler.Release();
 	for (auto& v : shadowSliceDSV) v.Release();
 	shadowCubeTex.Release(); shadowCubeCmpSampler.Release();
@@ -21,14 +20,13 @@ void NukeDiligent::Impl::CreateShadowResources()
 	if (shadowTex)
 	{
 		shadowSRV = shadowTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);   // whole array
-		// PCF comparison sampler, attached to the SRV (combined-texture-sampler mode reads it from the view).
+		// PCF comparison sampler must be attached to the SRV — combined-texture-samplers reads it there.
 		SamplerDesc cmp; cmp.MinFilter = FILTER_TYPE_COMPARISON_LINEAR; cmp.MagFilter = FILTER_TYPE_COMPARISON_LINEAR;
 		cmp.MipFilter = FILTER_TYPE_COMPARISON_POINT;
 		cmp.AddressU = TEXTURE_ADDRESS_CLAMP; cmp.AddressV = TEXTURE_ADDRESS_CLAMP; cmp.AddressW = TEXTURE_ADDRESS_CLAMP;
 		cmp.ComparisonFunc = COMPARISON_FUNC_LESS_EQUAL;
 		device->CreateSampler(cmp, &shadowCmpSampler);
 		if (shadowSRV && shadowCmpSampler) shadowSRV->SetSampler(shadowCmpSampler);
-		// one depth-stencil view per array slice (each shadow pass renders into its slice)
 		for (int s = 0; s < SHADOW_SLOTS; ++s)
 		{
 			TextureViewDesc vd; vd.Name = "Shadow slice DSV"; vd.ViewType = TEXTURE_VIEW_DEPTH_STENCIL;
@@ -99,8 +97,7 @@ void NukeDiligent::Impl::CreateShadowResources()
 	CreateGraphicsPipelineStateCached(ci, &shadowPSO);
 	if (shadowPSO)
 	{
-		// Bind the per-draw cbuffers. Try static (on the PSO) and mutable (on the SRB) — whichever the
-		// reflected variable actually is.
+		// Bind on BOTH the PSO (static) and the SRB (mutable) — reflection decides which one is real.
 		if (auto* v = shadowPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "ShadowVSCB")) v->Set(shadowVSCB);
 		if (auto* v = shadowPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "ShadowPSCB")) v->Set(shadowPSCB);
 		shadowPSO->CreateShaderResourceBinding(&shadowSRB, true);
@@ -109,8 +106,8 @@ void NukeDiligent::Impl::CreateShadowResources()
 		shadowPsTexVar = shadowSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 	}
 
-	// INSTANCED twin (7.1): same depth state/CBs, per-instance world rows in buffer slot 3;
-	// the CB then carries the light's view*proj only (shadow.vs.hlsl NUKE_INSTANCED).
+	// Instanced twin: same depth state/CBs, per-instance world rows in buffer slot 3; the CB then
+	// carries the light's view*proj only (shadow.vs.hlsl NUKE_INSTANCED).
 	shadowPSOInst.Release(); shadowSRBInst.Release(); shadowPsTexVarInst = nullptr;
 	{
 		const std::string vsI = "#define NUKE_INSTANCED 1\n" + vs;
@@ -141,8 +138,7 @@ void NukeDiligent::Impl::CreateShadowResources()
 				shadowPSOInst->CreateShaderResourceBinding(&shadowSRBInst, true);
 				if (auto* v = shadowSRBInst->GetVariableByName(SHADER_TYPE_VERTEX, "ShadowVSCB")) v->Set(shadowVSCB);
 				if (auto* v = shadowSRBInst->GetVariableByName(SHADER_TYPE_PIXEL,  "ShadowPSCB")) v->Set(shadowPSCB);
-				// VULKAN: cbuffers may reflect MUTABLE, not static — an unbound BendCB left the
-				// whole descriptor set invalid and instanced shadows silently vanished on Vk.
+				// Vulkan: cbuffers may reflect MUTABLE, not static — an unbound BendCB invalidates the descriptor set.
 				if (auto* v = shadowSRBInst->GetVariableByName(SHADER_TYPE_VERTEX, "BendCB"))     v->Set(bendCB);
 				shadowPsTexVarInst = shadowSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 			}
@@ -284,8 +280,8 @@ void NukeDiligent::renderShadowObject(Mesh* mesh, const float pos[3], const floa
 	ctx->Draw(da);
 }
 
-// Instanced shadow draw (7.1): the [first, first+count) range of `instBuf` into the current
-// shadow slice — the CB carries the LIGHT's view*proj only (instance rows supply the world).
+// Draw the [first, first+count) range of `instBuf` into the current shadow slice. The CB carries
+// the light's view*proj only; instance rows supply the world matrices.
 void NukeDiligent::renderShadowInstanced(Mesh* mesh, uint64_t instBuf, int first, int count, Material* mat)
 {
 	if (!m_impl->shadowPSOInst || count <= 0) return;

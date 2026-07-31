@@ -32,9 +32,8 @@ void NukeDiligent::Impl::CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT d
 	auto& GP = PSOCreateInfo.GraphicsPipeline;
 	GP.NumRenderTargets  = 1;
 	GP.RTVFormats[0]     = bbFmt;
-	// UI draws with NO depth bound (SetRenderTargets passes a null DSV) and never tests/writes depth,
-	// so the PSO must declare DSVFormat = UNKNOWN — otherwise Diligent warns every frame about a
-	// depth-format mismatch (bound UNKNOWN vs PSO D32_FLOAT). dsFmt is intentionally unused.
+	// UI binds a null DSV, so the PSO must declare DSVFormat = UNKNOWN or Diligent reports a
+	// depth-format mismatch every frame. dsFmt is intentionally unused.
 	(void)dsFmt;
 	GP.DSVFormat         = TEX_FORMAT_UNKNOWN;
 	GP.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -61,9 +60,8 @@ void NukeDiligent::Impl::CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT d
 	GP.InputLayout.NumElements    = 3;
 	GP.InputLayout.LayoutElements = layout;
 
-	// MUTABLE (not DYNAMIC): the UI binds textures through a per-texture SRB CACHE, so
-	// commits consume NO dynamic GPU descriptors (a dynamic var allocated fresh ones on
-	// EVERY CommitShaderResources - dozens per frame, per window; the heap bled out).
+	// MUTABLE, not DYNAMIC: the UI binds through a per-texture SRB cache, so commits consume no
+	// dynamic GPU descriptors (a DYNAMIC var allocates fresh ones on every commit and drains the heap).
 	ShaderResourceVariableDesc vars[] = {{SHADER_TYPE_PIXEL, "Texture", SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE}};
 	PSOCreateInfo.PSODesc.ResourceLayout.Variables    = vars;
 	PSOCreateInfo.PSODesc.ResourceLayout.NumVariables = 1;
@@ -83,7 +81,6 @@ void NukeDiligent::Impl::CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT d
 	cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(cbd, nullptr, &uiCB);
 	uiPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "Constants")->Set(uiCB);
-
 	// No single SRB: DrawUILists gets one from the per-texture cache (UISRBFor).
 }
 
@@ -100,31 +97,26 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	mcbd.BindFlags = BIND_UNIFORM_BUFFER; mcbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(mcbd, nullptr, &worldMatCB);
 
-	// PS lighting buffer (camera pos + ambient + light array), bound as a static var on every world PSO.
 	BufferDesc fcbd;
 	fcbd.Name = "World FrameCB"; fcbd.Size = sizeof(FrameCBData); fcbd.Usage = USAGE_DYNAMIC;
 	fcbd.BindFlags = BIND_UNIFORM_BUFFER; fcbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(fcbd, nullptr, &worldFrameCB);
 
-	// Foliage bend CB (7.4): wind + pushers + analytic volumes for the INSTANCED vertex
-	// shaders (g_WindV, g_WindT, g_WindP, g_Push[8], g_Vol[48] = 59 float4s). Written once
-	// per frame in setWind.
+	// Bend CB for the instanced vertex shaders: 59 float4s (g_WindV, g_WindT, g_WindP, g_Push[8], g_Vol[48]).
 	BufferDesc bcbd;
 	bcbd.Name = "Bend CB"; bcbd.Size = sizeof(float) * 4 * 59; bcbd.Usage = USAGE_DYNAMIC;
 	bcbd.BindFlags = BIND_UNIFORM_BUFFER; bcbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(bcbd, nullptr, &bendCB);
 
-	// Per-draw flags CB (x = receiveShadows): its OWN tiny cbuffer, NOT a MatCB slot — custom
-	// shaders parse their MatCB layout for prop offsets, so growing the shared header would
-	// silently corrupt every user shader's first prop. Written per draw in renderObject[Instanced].
+	// Per-draw flags (x = receiveShadows) get their OWN cbuffer, not a MatCB slot: custom shaders
+	// parse MatCB for prop offsets, so growing its header would shift every user shader's props.
 	BufferDesc dfbd;
 	dfbd.Name = "DrawFlags CB"; dfbd.Size = sizeof(float) * 4; dfbd.Usage = USAGE_DYNAMIC;
 	dfbd.BindFlags = BIND_UNIFORM_BUFFER; dfbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(dfbd, nullptr, &drawFlagsCB);
 
-	// Foliage RT bend compute (bend.cs): shares nukebend.hlsl with the raster VS shaders and
-	// BendCB with setWind — bends the merged foliage chunk meshes so their BLAS (and thus RT
-	// shadows/reflections) sways with the wind. RT-only; skipped when unsupported.
+	// Foliage bend compute (bend.cs): bends merged chunk meshes so their BLAS sways with the wind.
+	// Shares nukebend.hlsl with the raster VS shaders and BendCB with setWind. RT-only.
 	if (rtSupported)
 	{
 		std::string cs = shaderSource("bend.cs");
@@ -180,14 +172,14 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	TextureData ndat; ndat.pSubResources = &nsr; ndat.NumSubresources = 1;
 	device->CreateTexture(wd, &ndat, &flatNormTex);
 
-	// Probe sampler (linear, clamp) — attached to each probe/fallback cube SRV (combined-texture-samplers mode
-	// reads it from the view), so g_Probe needs NO immutable sampler in the world PSO (custom shaders may omit it).
+	// Probe sampler (linear, clamp) attached to each probe/fallback cube SRV: combined-texture-sampler
+	// mode reads it from the view, so g_Probe needs no immutable sampler in the world PSO.
 	{
 		SamplerDesc ps; ps.MinFilter = FILTER_TYPE_LINEAR; ps.MagFilter = FILTER_TYPE_LINEAR; ps.MipFilter = FILTER_TYPE_LINEAR;
 		ps.AddressU = TEXTURE_ADDRESS_CLAMP; ps.AddressV = TEXTURE_ADDRESS_CLAMP; ps.AddressW = TEXTURE_ADDRESS_CLAMP;
 		device->CreateSampler(ps, &probeSampler);
 	}
-	// 1x1 black cube — bound to g_Probe when no reflection probe is active (so the var is always valid).
+	// 1x1 black cube bound to g_Probe when no reflection probe is active (the var must stay valid).
 	{
 		uint16_t blackF16[4] = { 0, 0, 0, 0x3C00 };   // half (0,0,0,1)
 		TextureDesc cd; cd.Name = "Fallback Cube"; cd.Type = RESOURCE_DIM_TEX_CUBE; cd.Width = 1; cd.Height = 1;
@@ -199,8 +191,8 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 			if (fallbackCubeSRV && probeSampler) fallbackCubeSRV->SetSampler(probeSampler); }
 	}
 
-	// Clamp the requested MSAA to what the device supports for BOTH color (RGBA8) and depth (D32),
-	// stepping 8->4->2->1. SampleCounts is a bitmask where the bit value equals the sample count.
+	// Clamp requested MSAA to what the device supports for BOTH color (RGBA8) and depth (D32).
+	// SampleCounts is a bitmask whose bit VALUE equals the sample count.
 	{
 		Uint32 colorSC = (Uint32)device->GetTextureFormatInfoExt(TEX_FORMAT_RGBA8_UNORM).SampleCounts;
 		Uint32 depthSC = (Uint32)device->GetTextureFormatInfoExt(TEX_FORMAT_D32_FLOAT).SampleCounts;
@@ -210,7 +202,6 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 		std::cout << "[NukeDiligent]\tMSAA samples = " << (int)samples << std::endl;
 	}
 
-	// Built-in "world" pipeline from the engine shaders.
 	defaultWorldHandle = MakeWorldPSO(shaderSource("world.vs"), shaderSource("world.ps"), "World");
 
 	BuildOutlinePipelines();   // selection outline (stencil mark + scaled draw)
@@ -222,16 +213,16 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	CreatePostResources();     // final tonemap / post-process pass
 }
 
-// Selection-outline pipelines: (1) MASK = render the mesh flat into an RGBA8 mask (alpha=1);
-// (2) EDGE = fullscreen edge-detect over the mask, drawing a constant-pixel-thickness border.
+// Build the selection-outline pipelines: mask (mesh -> RGBA8, alpha=1) and edge (fullscreen
+// edge-detect drawing a constant-pixel-thickness border).
 void NukeDiligent::Impl::BuildOutlinePipelines()
 {
-	// rebuild-safe (MSAA change re-calls this) — release prior objects so Create doesn't assert.
+	// Rebuild path (MSAA change re-calls this): release prior objects or Create asserts.
 	outlineMaskPSO.Release(); outlineMaskSRB.Release();
 	outlineEdgePSO.Release(); outlineEdgeSRB.Release(); outlineEdgeCB.Release();
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 
-	// --- mask pipeline (mesh -> mask RT) ---
+	// mask pipeline (mesh -> mask RT)
 	std::string mvs = shaderSource("outline.vs"), mps = shaderSource("outline.ps");
 	if (!mvs.empty() && !mps.empty())
 	{
@@ -262,11 +253,10 @@ void NukeDiligent::Impl::BuildOutlinePipelines()
 		}
 	}
 
-	// --- edge pipeline (fullscreen mask -> camera RT) ---
+	// edge pipeline (fullscreen mask -> camera RT)
 	std::string evs = shaderSource("outline_edge.vs"), eps = shaderSource("outline_edge.ps");
 	if (!evs.empty() && !eps.empty())
 	{
-		// constants buffer (texel size + thickness)
 		BufferDesc cbd; cbd.Name = "Outline EdgeCB"; cbd.Size = sizeof(float) * 4;
 		cbd.Usage = USAGE_DYNAMIC; cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 		device->CreateBuffer(cbd, nullptr, &outlineEdgeCB);
@@ -326,16 +316,15 @@ void NukeDiligent::Impl::EnsureOutlineMask(int w, int h)
 	}
 }
 
-// Build (or REBUILD) the 3 blend-variant PSOs + SRB into `wp` using the current `samples`. Used by both
-// MakeWorldPSO (first build) and setMSAA (rebuild in place so material->shader handles stay valid).
+// Build (or rebuild in place) the blend-variant PSOs + SRB into `wp` at the current `samples`.
+// Rebuilding in place keeps existing material->shader handles valid.
 bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg)
 {
 	if (vsSrc.empty() || psSrc.empty()) return false;
 	ShaderCreateInfo sci;
 	sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	sci.pShaderSourceStreamFactory = shaderFactory;   // resolves #include "nukebend.hlsl"
-	// Ray tracing: compile the world shaders via DXC at SM6.5 with RT_ENABLED so world.ps can use inline RayQuery
-	// (RT shadows). D3D11 / unsupported GPUs keep the default FXC SM5 path (shadow maps).
+	// Inline RayQuery needs DXC at SM6.5; unsupported devices keep the default FXC SM5 path.
 	ShaderMacro rtMacro[] = {{"RT_ENABLED", "1"}};
 	if (rtSupported)
 	{
@@ -358,8 +347,6 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	gp.RasterizerDesc.CullMode      = CULL_MODE_NONE;
 	gp.DepthStencilDesc.DepthEnable = True;
 	gp.SmplDesc.Count               = samples;   // MSAA: must match the (MS) camera target
-	// Opaque base state: blend off, depth write on. The transparent/additive variants below flip blend +
-	// depth write (the engine sorts those back-to-front so straight-alpha blending composites correctly).
 	LayoutElement layout[] = {
 		{0, 0, 3, VT_FLOAT32}, // position
 		{1, 1, 3, VT_FLOAT32}, // normal
@@ -382,15 +369,13 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		{SHADER_TYPE_PIXEL, "g_RTInst",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // per-instance RT data (shadow footprints)
 	};
 	ci.PSODesc.ResourceLayout.Variables    = vars;
-	// The RT entries (last two) only exist when rtSupported -> drop them from the list otherwise.
+	// The last two entries are RT-only — drop them when the device has no ray tracing.
 	const Uint32 kNumVars = (Uint32)(sizeof(vars) / sizeof(vars[0]));
 	ci.PSODesc.ResourceLayout.NumVariables = rtSupported ? kNumVars : kNumVars - 2;
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_WRAP; samp.AddressV = TEXTURE_ADDRESS_WRAP; samp.AddressW = TEXTURE_ADDRESS_WRAP;
-	// One immutable sampler per material-map texture. Combined-sampler mode is strict on D3D12: a texture X is
-	// sampled via X_sampler, so each needs its own immutable sampler (keyed by the texture name). Register only the
-	// maps THIS shader actually declares (query the compiled PS) — a custom shader without them must not carry
-	// unassigned immutable samplers (Diligent warns). Shadow + probe samplers are attached to their SRVs elsewhere.
+	// Combined-sampler mode on D3D12 samples texture X via X_sampler, so each map needs its OWN
+	// immutable sampler, and only for the maps this shader actually declares (unassigned ones warn).
 	static const char* const kMapTex[] = { "g_Tex", "g_Normal", "g_MetalRough", "g_Occlusion", "g_Emissive", "g_Spec" };
 	ImmutableSamplerDesc immSamp[6]; Uint32 nImm = 0;
 	ps->GetStatus(true);   // async compile (cache miss): reflection needs the FINISHED shader
@@ -414,16 +399,16 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		if (auto* d = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "DrawFlagsCB")) d->Set(drawFlagsCB);   // receiveShadows etc.
 	};
 
-	// Release any previous objects first (rebuild path) — Diligent asserts on Create over a non-null ref.
+	// Rebuild path: release first — Diligent asserts on Create over a non-null ref.
 	wp.pso.Release(); wp.psoBlend.Release(); wp.psoAdd.Release(); wp.psoWire.Release(); wp.srb.Release();
 	memset(wp.lastBind, 0, sizeof(wp.lastBind)); memset(wp.lastBindI, 0, sizeof(wp.lastBindI));   // fresh SRBs hold nothing
 
-	// 1) Opaque — blend off, depth write on (base ci as configured above).
+	// 1) Opaque — blend off, depth write on.
 	CreateGraphicsPipelineStateCached(ci, &wp.pso);
 	if (!wp.pso) { cout << "[NukeDiligent]\tPSO build failed for shader '" << dbg << "'" << endl; return false; }
 	setStatics(wp.pso);
 
-	// 2) Transparent — straight-alpha blend, depth test on but NO depth write (sorted back-to-front by engine).
+	// 2) Transparent — straight-alpha blend, depth test on but no depth write.
 	{
 		auto& rt = ci.GraphicsPipeline.BlendDesc.RenderTargets[0];
 		rt.BlendEnable = True;
@@ -444,8 +429,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		CreateGraphicsPipelineStateCached(ci, &wp.psoAdd);
 		if (wp.psoAdd) setStatics(wp.psoAdd);
 	}
-	// 4) Wireframe — opaque state (blend off, depth write on) with line fill; the scene draw-mode
-	// toggle (setWireframe) makes renderObject pick this variant for EVERY material.
+	// 4) Wireframe — opaque state with line fill.
 	{
 		ci.GraphicsPipeline.BlendDesc.RenderTargets[0] = RenderTargetBlendDesc{};
 		ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = True;
@@ -456,7 +440,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	}
 
 	wp.pso->CreateShaderResourceBinding(&wp.srb, true);
-	// VULKAN: cbuffers may reflect MUTABLE — bind through the SRB too (see BendCB note below).
+	// Vulkan: cbuffers may reflect as MUTABLE, so bind through the SRB as well as the statics.
 	if (auto* d = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "DrawFlagsCB")) d->Set(drawFlagsCB);
 	wp.texVar  = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 	wp.normVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
@@ -470,10 +454,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.tlasVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_TLAS");
 	wp.rtInstVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_RTInst");
 
-	// --- INSTANCED variants (7.1): only for shaders that OPT IN by handling NUKE_INSTANCED. ---
-	// Same vs/ps sources compiled with the define prepended; the input layout gains 5 per-
-	// instance float4 attributes (world rows + tint + custom) in buffer slot 3. Rebuilt with
-	// the base variants on every MSAA/HDR flip (this function IS the rebuild path).
+	// Instanced variants — only for shaders that opt in by handling NUKE_INSTANCED. Same sources
+	// with the define prepended; the layout gains 5 per-instance float4 attributes in slot 3.
 	wp.psoInst.Release(); wp.psoInstBlend.Release(); wp.psoInstAdd.Release(); wp.psoInstWire.Release(); wp.srbInst.Release();
 	wp.texVarI = wp.normVarI = wp.mrVarI = wp.aoVarI = wp.emVarI = wp.specVarI = nullptr;
 	wp.shadowVarI = wp.cubeVarI = wp.probeVarI = wp.tlasVarI = nullptr;
@@ -540,8 +522,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 					if (wp.psoInstWire) setStatics(wp.psoInstWire);
 				}
 				wp.psoInst->CreateShaderResourceBinding(&wp.srbInst, true);
-				// VULKAN: cbuffers may reflect MUTABLE — bind BendCB through the SRB too (an
-				// unbound descriptor invalidates the whole set; grass ignored the wind on Vk).
+				// Vulkan: cbuffers may reflect as MUTABLE, and one unbound descriptor invalidates
+				// the whole set — bind BendCB through the SRB as well as the statics.
 				if (auto* b = wp.srbInst->GetVariableByName(SHADER_TYPE_VERTEX, "BendCB")) b->Set(bendCB);
 				if (auto* d = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "DrawFlagsCB")) d->Set(drawFlagsCB);
 				wp.texVarI  = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
@@ -573,9 +555,8 @@ uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::s
 	return h;
 }
 
-// After `samples` changes, rebuild everything whose PSO sample count or texture sample count depends on it:
-// all world pipelines (in place, so material->shader handles stay valid), the sky + outline-edge PSOs, the
-// MS backbuffer, and every render target. Shadow maps / outline mask / UI are single-sample and untouched.
+// Rebuild everything whose PSO/texture sample count depends on `samples`: world pipelines (in
+// place), sky/debug/sprite/decal/outline PSOs, the MS backbuffer and every render target.
 void NukeDiligent::Impl::RebuildForMSAA()
 {
 	for (auto& kv : worldPipes)
@@ -594,8 +575,7 @@ void NukeDiligent::Impl::RebuildForMSAA()
 			kv.second = MakeRT(kv.second.w, kv.second.h);
 			TrashRT(old);
 		}
-	// Every cached UI SRB keys a view that may have just been replaced — drop wholesale (parked, not
-	// freed); the cache repopulates on the next draw.
+	// Cached UI SRBs key views that were just replaced — park them all; the cache refills on next draw.
 	for (auto& kv : uiSRBCache) Trash(kv.second.srb);
 	uiSRBCache.clear();
 }
@@ -604,7 +584,7 @@ uint64_t NukeDiligent::createShaderPipeline(const char* name, const char* vs, co
 {
 	if (!vs || !ps) return 0;
 	uint64_t h = m_impl->MakeWorldPSO(vs, ps, "Shader");   // world-type PSO (layout/CBs) from custom VS+PS
-	// A shader that ships "<name>.surf.hlsl" gets an auto-generated RT closest-hit (per-shader reflections).
+	// A shader shipping "<name>.surf.hlsl" gets an auto-generated RT closest-hit group.
 	if (h && name && *name && m_impl->rtSupported && m_impl->shaderFactory)
 	{
 		RefCntAutoPtr<IFileStream> stream;

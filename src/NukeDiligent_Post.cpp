@@ -1,9 +1,8 @@
 #include "NukeDiligentImpl.h"
 
 
-// Final post-process pipeline: fullscreen pass that tonemaps the HDR scene into an LDR target.
-// After swap-chain creation: if the monitor is in HDR mode, switch the swap chain to the HDR10 (PQ, Rec2020)
-// colour space so the backbuffer drives the display as real HDR. Falls back to plain (SDR) on failure.
+// After swap-chain creation: if the monitor is in HDR mode, switch the swap chain to the HDR10
+// (PQ, Rec2020) colour space. Falls back to SDR on failure.
 void NukeDiligent::Impl::SetupHDROutput()
 {
 	hdr10Active = false;
@@ -82,16 +81,14 @@ void NukeDiligent::Impl::CreatePostResources()
 	BufferDesc cbd; cbd.Name = "PostCB"; cbd.Size = sizeof(float) * 8; cbd.Usage = USAGE_DYNAMIC;   // g_Post + g_Grade
 	cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(cbd, nullptr, &postCB);
-	// Shared cbuffers for custom post-effect pipelines: PostParams (per-effect params, packed by the engine)
-	// and PostFrame (resolution / time, for blur kernels & animated effects).
+	// Shared cbuffers for custom post-effect pipelines: per-effect params + resolution/time.
 	if (!postParamsCB) { BufferDesc d; d.Name = "PostParams"; d.Size = 256; d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &postParamsCB); }
 	if (!postFrameCB)  { BufferDesc d; d.Name = "PostFrame";  d.Size = sizeof(float) * 8; d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &postFrameCB); }
-	// SSR matrices (view/proj/invProj + resolution), filled per camera in RunSSR.
 	if (!ssrCB) { BufferDesc d; d.Name = "SSRCB"; d.Size = sizeof(float) * (16 * 4 + 4); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &ssrCB); }   // view/proj/invProj/invView + res
 	// 2 float4x4 + 5 float4 (camera, params, water level/fade, water scatter, water absorb).
 	if (!rtRefCB) { BufferDesc d; d.Name = "RTRefCB"; d.Size = sizeof(float) * (32 + 4 * 6); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &rtRefCB); }
 	if (!taaCB) { BufferDesc d; d.Name = "TAACB"; d.Size = sizeof(float) * (16 * 4 + 4 * 2); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &taaCB); }
-	BuildGBufferPipe();   // gbuffer.ps + world.vs (shares worldCB/worldMatCB) — for the SSR prepass
+	BuildGBufferPipe();
 
 	// Build one post PSO per output format: RGBA8 for RT targets, swap-chain format for the backbuffer.
 	auto buildPost = [&](TEXTURE_FORMAT fmt, const char* name,
@@ -124,7 +121,7 @@ void NukeDiligent::Impl::CreatePostResources()
 	TEXTURE_FORMAT bbFmt = swapChain ? swapChain->GetDesc().ColorBufferFormat : TEX_FORMAT_RGBA8_UNORM;
 	buildPost(bbFmt, "Post PSO BB", postPSOBB, postSRBBB, postHdrVarBB);
 
-	// --- Built-in bloom pipelines (bright-pass / blur / composite), all fullscreen HDR ----------------
+	// Built-in bloom pipelines: bright-pass / blur / composite, all fullscreen HDR.
 	bloomBrightPSO.Release(); bloomBlurPSO.Release(); bloomCompPSO.Release(); bloomCB.Release();
 	if (!bloomCB) { BufferDesc d; d.Name = "BloomCB"; d.Size = sizeof(float) * 8; d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &bloomCB); }
 	auto bloomPSO = [&](const char* psName, const char* dbg, bool twoTex,
@@ -171,16 +168,15 @@ void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV,
 	if (!pso || !srb || !hdrSRV || !dstRTV) return;
 	const float mode = !hdr ? 0.0f : ((toBackbuffer && hdr10Active) ? 2.0f : 1.0f);   // 0=passthrough,1=sRGB SDR,2=HDR10 PQ
 	{
-		MapHelper<float> cb(context, postCB, MAP_WRITE, MAP_FLAG_DISCARD);   // final pass = tonemap/encode ONLY
-		if (cb == nullptr) return;   // dead device (mid-frame removal): Map yields null — bail, render() suspends
+		MapHelper<float> cb(context, postCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (cb == nullptr) return;   // dead device: Map yields null mid-frame removal
 		for (int k = 0; k < 8; ++k) cb[k] = 0.0f;
-		// g_Post.x = transparent output: the final backbuffer pass emits PREMULTIPLIED scene
-		// alpha (rgb*a, a) so a DirectComposition window shows the desktop where alpha < 1.
+		// g_Post.x = transparent output: emits PREMULTIPLIED alpha for DirectComposition windows.
 		cb[0] = (toBackbuffer && transparent) ? 1.0f : 0.0f;
 		cb[1] = mode;
 		cb[2] = hdrPaperWhite; cb[3] = hdrPeak;   // HDR10 mapping (post.ps mode 2)
 		cb[4] = toneExposure;   // g_Grade.x = exposure
-		cb[5] = toneWhite;      // g_Grade.y = tonemap white point (linear value -> pure white). TODO: expose in World Settings
+		cb[5] = toneWhite;      // g_Grade.y = tonemap white point
 	}
 	context->SetRenderTargets(1, &dstRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
@@ -195,7 +191,7 @@ void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV,
 // Build a custom post-effect pipeline from a fullscreen PS (samples g_Source, params in PostParams).
 uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::string& ps)
 {
-	if (name == "rtreflect")   // built-in RT reflections: a real ray-tracing pipeline (rt_rgen/rmiss/rchit + SBT), not a post PS
+	if (name == "rtreflect")   // built-in: a real ray-tracing pipeline + SBT, not a post PS
 	{
 		if (!rtSupported || !BuildRTPipeline()) return 0;
 		PostPipe pp; pp.isRTRef = true;
@@ -218,17 +214,12 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
 	gp.DepthStencilDesc.DepthEnable = False;
 	gp.InputLayout.NumElements = 0;
-	// "musicvis" (audio-reactive ghost overlays) shares SSR's resource layout: G-buffer
-	// normals + prepass depth + camera matrices (SSRCB), PLUS the generic per-object id
-	// target. Same isSSR path end to end — the difference is in the pixel shader.
-	const bool mvis = (name == "musicvis");
-	const bool ssr = (name == "ssr" || mvis);   // built-in: also samples the G-buffer + depth + camera matrices (SSRCB)
-	const bool taa = (name == "taa");   // built-in: samples depth + a history texture + camera matrices (TAACB)
+	const bool mvis = (name == "musicvis");     // shares SSR's resource layout, plus the object-id target
+	const bool ssr = (name == "ssr" || mvis);   // also samples the G-buffer + depth + SSRCB
+	const bool taa = (name == "taa");           // also samples depth + history + TAACB
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP;
-	// POINT sampler for depth + G-buffer: linear filtering of depth/normal across a curved surface (sphere) blends
-	// neighbouring values -> wrong reconstructed position (drifts INSIDE the sphere -> self-intersection). Flat
-	// surfaces (mirror) have ~constant depth so linear looked fine. Point sampling = exact per-pixel value.
+	// Depth/G-buffer must be POINT-sampled: linear blends neighbours into a wrong reconstructed position.
 	SamplerDesc psamp; psamp.MinFilter = FILTER_TYPE_POINT; psamp.MagFilter = FILTER_TYPE_POINT; psamp.MipFilter = FILTER_TYPE_POINT;
 	psamp.AddressU = TEXTURE_ADDRESS_CLAMP; psamp.AddressV = TEXTURE_ADDRESS_CLAMP;
 	std::vector<ShaderResourceVariableDesc> vars = {{SHADER_TYPE_PIXEL, "g_Source", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC}};
@@ -240,7 +231,7 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 		imms.push_back({SHADER_TYPE_PIXEL, "g_GBuffer", psamp});
 		imms.push_back({SHADER_TYPE_PIXEL, "g_Depth",   psamp});
 	}
-	if (mvis)   // generic per-object id (gbuffer RT2; POINT — ids must not blend)
+	if (mvis)   // per-object id (gbuffer RT2), point-sampled: ids must not blend
 	{
 		vars.push_back({SHADER_TYPE_PIXEL, "g_ObjId", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 		imms.push_back({SHADER_TYPE_PIXEL, "g_ObjId", psamp});
@@ -269,16 +260,14 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	if (ssr) { pp.gbufVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GBuffer"); pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.isSSR = true; }
 	if (mvis) pp.objIdVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ObjId");
 	if (taa) { pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.histVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_History"); pp.velVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Velocity"); pp.isTAA = true; }
-	pp.isBloom = (name == "bloom");   // built-in multi-pass effect; the renderer runs the passes itself
+	pp.isBloom = (name == "bloom");   // multi-pass: the renderer drives the passes itself
 	uint64_t h = nextShaderHandle++;
 	postPipes[h] = std::move(pp);
 	return h;
 }
 
-// Equal formats -> plain CopyTexture. Different formats -> fullscreen blit: D3D12 only
-// allows copies inside a format family, and the chain legitimately crosses families
-// (RGBA8 scene color with HDR off vs the RGBA16F chain scratch). One tiny PSO per
-// destination format, built lazily.
+// Copy srcSRV into dstTex. Equal formats use CopyTexture; different formats need a fullscreen
+// blit because D3D12 only allows copies inside one format family. One lazy PSO per dst format.
 void NukeDiligent::Impl::BlitTexture(ITextureView* srcSRV, ITexture* dstTex)
 {
 	if (!srcSRV || !dstTex) return;
@@ -343,9 +332,8 @@ void NukeDiligent::Impl::BlitTexture(ITextureView* srcSRV, ITexture* dstTex)
 	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 }
 
-// Per-size cache (G-buffer pattern): several DIFFERENT-sized chain cameras render in ONE frame
-// (viewport + camera preview + asset previews). Releasing + recreating one shared pair on every size
-// change was a mid-frame lifetime race (intermittent device removal) and an allocation storm.
+// Make the post ping-pong scratch pair for w*h current. Cached per size: differently-sized
+// cameras render in one frame, and recreating a shared pair mid-frame is a lifetime race.
 void NukeDiligent::Impl::EnsureScratch(int w, int h)
 {
 	if (w <= 0 || h <= 0) return;
@@ -390,8 +378,7 @@ void NukeDiligent::Impl::EnsureBloom(int w, int h)
 	EvictSized(bloomCache, key);
 }
 
-// Built-in bloom: bright-pass (-> half-res A) -> separable blur (A<->B, a few iterations) -> composite
-// (scene + A*intensity -> dst).
+// Built-in bloom: bright-pass to half-res, separable blur, composite scene + bloom into dstRTV.
 void NukeDiligent::Impl::RunBloom(ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, float threshold, float intensity)
 {
 	if (!bloomBrightPSO || !bloomBlurPSO || !bloomCompPSO || !srcSRV || !dstRTV) return;
@@ -443,8 +430,7 @@ void NukeDiligent::setMSAA(int s)
 	Uint32 colorSC = (Uint32)m_impl->device->GetTextureFormatInfoExt(TEX_FORMAT_RGBA8_UNORM).SampleCounts;
 	Uint32 depthSC = (Uint32)m_impl->device->GetTextureFormatInfoExt(TEX_FORMAT_D32_FLOAT).SampleCounts;
 	while (req > 1 && !((colorSC & req) && (depthSC & req))) req >>= 1;
-	// Defer the rebuild to the start of the next frame — doing it now (mid ImGui frame) would free the RT
-	// textures the current frame's draw data still references (UI ImGui::Image), crashing renderDrawLists.
+	// Defer to the next frame: rebuilding now frees RT textures this frame's UI draw data still references.
 	m_impl->pendingSamples = req;
 }
 

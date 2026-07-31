@@ -1,27 +1,21 @@
 ﻿#pragma once
-// IMPORTANT include order: Windows-pulling headers (GLFW native + Diligent D3D)
-// MUST come before the engine headers. Several engine headers do a global
-// `using namespace std;`, which brings std::byte into scope; if the Windows SDK
-// headers (objidl.h/oaidl.h, pulled by Diligent's D3D backend) are processed
-// after that, `byte` becomes ambiguous (std::byte vs Windows ::byte). Processing
-// the Windows headers first avoids the clash.
+// Include order matters: Windows-pulling headers (GLFW native + Diligent D3D) MUST come
+// before the engine headers, which do `using namespace std;` (std::byte vs ::byte clash).
 
-#include <cmath>   // acosf (spot shadow FOV)
+#include <cmath>
 
-// GLFW: window creation + native Win32 handle
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3.h>
 #include <GLFW/glfw3native.h>
-#include <shellapi.h>   // ExtractIconEx (set the window icon from the .exe)
-#include <dwmapi.h>     // DwmSetWindowAttribute (dark title bar)
+#include <shellapi.h>   // ExtractIconEx
+#include <dwmapi.h>     // DwmSetWindowAttribute
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20   // Win10 2004+ (build 19041+)
 #endif
 
-// Diligent Engine
 #include "EngineFactoryD3D11.h"
-#include "EngineFactoryD3D12.h"   // D3D12 backend (ray tracing); chosen at launch via WindowDesc.backend
-#include "EngineFactoryVk.h"      // Vulkan backend (task #138): editor default; shaders HLSL->SPIRV via glslang
+#include "EngineFactoryD3D12.h"   // D3D12 backend (ray tracing)
+#include "EngineFactoryVk.h"      // Vulkan backend: HLSL->SPIRV via glslang
 #include "RenderDevice.h"
 #include "DeviceContext.h"
 #include "SwapChain.h"
@@ -30,24 +24,25 @@
 #include "Buffer.h"
 #include "Texture.h"
 #include "Shader.h"
-#include "BottomLevelAS.h"   // ray tracing acceleration structures (D3D12)
+#include "BottomLevelAS.h"   // ray tracing acceleration structures
 #include "TopLevelAS.h"
 #include "RefCntAutoPtr.hpp"
 #include "MapHelper.hpp"
 #include "BasicMath.hpp"
 #include "GraphicsAccessories.hpp"
-// --- Windows-only HDR10 display output (DXGI / D3D11). Other platforms: no D3D11, HDR output is a no-op. ---
+// Windows-only HDR10 display output (DXGI). The d3d11/d3d12/dxgi headers MUST precede
+// the Diligent SwapChainD3D* interface headers below.
 #ifdef _WIN32
-#include <d3d11.h>           // ID3D11View etc. (needed BEFORE the Diligent D3D11 interface headers below)
-#include <d3d12.h>           // D3D12_CPU_DESCRIPTOR_HANDLE etc. (needed BEFORE the Diligent D3D12 interface headers)
-#include <dxgi1_6.h>         // IDXGISwapChain3/4 + IDXGIOutput6 (HDR10 colour space + display detection)
-#include "SwapChainD3D11.h"  // Diligent ISwapChainD3D11::GetDXGISwapChain (HDR10 swap-chain access)
-#include "SwapChainD3D12.h"  // Diligent ISwapChainD3D12::GetDXGISwapChain (HDR10 on the D3D12 backend)
+#include <d3d11.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include "SwapChainD3D11.h"
+#include "SwapChainD3D12.h"
 #endif
 
 // Engine headers last (they do `using namespace std;` internally).
 #include "NukeDiligent.h"
-#include <interface/NUKEEInteface.h>   // NUKEModule — the renderer is an ordinary plugin now
+#include <interface/NUKEEInteface.h>
 
 #include <cstring>
 #include <vector>
@@ -59,8 +54,7 @@
 #include <string>
 
 using namespace Diligent;
-// NOTE: deliberately NOT `using namespace std` — it pulls std::byte, which clashes
-// with the Windows SDK's ::byte (rpcndr.h) and makes `byte` ambiguous.
+// Deliberately NOT `using namespace std` — std::byte clashes with the Windows SDK's ::byte.
 using std::cout;
 using std::endl;
 
@@ -70,62 +64,46 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IDeviceContext> context;
 	RefCntAutoPtr<ISwapChain>     swapChain;
 
-	// ---- CENTRALIZED GPU-resource lifetime manager --------------------------------------------------
-	// THE rule: a GPU object whose raw pointer may still sit in CPU-side data (UI draw lists recorded
-	// this frame, texId handles, cached SRVs/RTVs, SRBs, BLAS geometry refs) is NEVER Release()d
-	// inline — it goes through Trash(). Trash parks a strong ref for kTrashFrames frames, so any stale
-	// pointer still dereferences a LIVE object (and its address cannot be reused by a fresh allocation
-	// while parked); Diligent then defers the underlying D3D12 memory to the frame fence. Inline
-	// releases of objects like these were the random "device removed" (ACCESS_DENIED / page fault)
-	// crashes with detached windows open. Purged once per render(); drained fully in deinit().
-	static const uint64_t kTrashFrames = 4;   // > max frames in flight + recorded-but-not-yet-drawn UI window
-	uint64_t frameId = 0;                     // advanced once at the top of render()
+	// Centralized GPU-resource lifetime manager. A GPU object whose raw pointer may still sit in
+	// CPU-side data (UI draw lists, texId handles, cached views, SRBs, BLAS refs) is NEVER Release()d
+	// inline — Trash() parks a strong ref for kTrashFrames frames so stale pointers stay valid and the
+	// address cannot be reused. Purged once per render(); drained fully in deinit().
+	static const uint64_t kTrashFrames = 4;   // > max frames in flight + recorded-but-undrawn UI window
+	uint64_t frameId = 0;
 	std::vector<std::pair<RefCntAutoPtr<IObject>, uint64_t>> gpuTrash;
 	std::mutex trashMutex;                    // create/destroy may arrive off the render thread
 	void Trash(IObject* o);                   // null-safe: park an object until the GPU can't see it
 	void PurgeTrash(bool everything = false); // frame tick (or full drain after IdleGPU)
-	// True (and logs the removal reason once) if the D3D12 device has been removed. Guard every Present/
-	// Flush with it so a device loss degrades to a skipped frame + a console reason, NOT a Diligent
-	// debug-assert crash dialog (the assert fires INSIDE Present, too late to catch otherwise).
+	// True (logs the reason once) if the D3D12 device has been removed. Guard every Present/Flush
+	// with it — the Diligent debug-assert fires INSIDE Present, too late to catch otherwise.
 	bool  DeviceRemoved();
-	void* d3d12DevCache = nullptr;   // cached ID3D12Device* (void* keeps <d3d12.h> out of this header)
-	bool                          useD3D12 = false;   // active backend (set in init from WindowDesc.backend)
-	bool                          useVulkan = false;  // backend == 2: Vulkan (task #138) — no DXGI anywhere
+	void* d3d12DevCache = nullptr;   // cached ID3D12Device* (void* keeps <d3d12.h> out of the header)
+	bool                          useD3D12 = false;   // active backend (set in init from WindowDesc)
+	bool                          useVulkan = false;  // backend == 2: Vulkan — no DXGI anywhere
 
-	// DISK shader-bytecode cache (OUR OWN, Vulkan only): a Vulkan boot re-runs glslang
-	// over every HLSL shader (~3s). Key = FNV-1a of the full compile inputs (source,
-	// entry, type, macros, flags); value = the compiled SPIR-V (IShader::GetBytecode),
-	// one file per shader under config/shadercache_vk/. A hit feeds ByteCode straight to
-	// CreateShader — glslang never runs; an edited shader changes the key and recompiles.
+	// Disk shader-bytecode cache (Vulkan only): key = FNV-1a of the full compile inputs, value =
+	// compiled SPIR-V under config/shadercache_vk/. A hit feeds ByteCode straight to CreateShader.
 	void CreateShaderCached(const Diligent::ShaderCreateInfo& ci, Diligent::IShader** pp);
 	void CreateGraphicsPipelineStateCached(const Diligent::GraphicsPipelineStateCreateInfo& ci, Diligent::IPipelineState** pp)
 	{
-		// Cache-miss shaders compile ASYNC on the worker pool — the PSO needs them ready,
-		// so wait here: by this point the whole batch created earlier has been compiling
-		// in parallel, and the bind sites never see a not-ready pipeline.
+		// Cache-miss shaders compile ASYNC on the worker pool — the PSO needs them ready.
 		auto wait = [](Diligent::IShader* s) { if (s) s->GetStatus(true); };
 		wait(ci.pVS); wait(ci.pPS); wait(ci.pGS); wait(ci.pHS); wait(ci.pDS);
 		device->CreateGraphicsPipelineState(ci, pp);
 	}
-	// Async-compiled cache misses: the SPIR-V is grabbed and written to disk once the
-	// worker finishes (polled per frame — PollShaderSaves).
+	// Async cache misses: SPIR-V grabbed and written to disk once the worker finishes.
 	std::vector<std::pair<Diligent::RefCntAutoPtr<Diligent::IShader>, std::string>> pendingShaderSaves;
 	void PollShaderSaves();
-	bool                          vsync    = true;    // main-present sync interval: true = 1 (vsync), false = 0 (uncapped)
-	// DirectComposition objects for a TRANSPARENT window (per-pixel alpha to the desktop):
-	// the composition swap chain presents into this visual tree. Stored as IUnknown* so the
-	// widely-included Impl header stays free of <dcomp.h> (typed use lives in NukeDiligent.cpp).
+	bool                          vsync    = true;    // main-present sync interval (1 = vsync, 0 = uncapped)
+	// DirectComposition objects for a TRANSPARENT window. IUnknown* keeps <dcomp.h> out of this
+	// header (typed use lives in NukeDiligent.cpp).
 	IUnknown*                     dcompDevice = nullptr;   // IDCompositionDevice
 	IUnknown*                     dcompTarget = nullptr;   // IDCompositionTarget
 	IUnknown*                     dcompVisual = nullptr;   // IDCompositionVisual
-	bool                          transparent = false;     // transparent window: the empty background
-	                                                       // clears to alpha 0 and the final pass outputs
-	                                                       // PREMULTIPLIED alpha so the desktop shows through.
-	bool                          rtSupported = false; // device reports ray-tracing capability (D3D12 + RT-capable GPU)
-	// #include resolver (+ RT shader loading): a MEMORY factory over the sources the ENGINE
-	// pushed through setShaderSource — disk files in dev, game.nupak entries in a packaged
-	// dist — so includes ("nukebend.hlsl", "rt_common.hlsl") resolve identically everywhere.
-	// The renderer does NO file IO for shader sources.
+	bool                          transparent = false;     // clears to alpha 0; final pass outputs PREMULTIPLIED alpha
+	bool                          rtSupported = false;     // device reports ray-tracing capability
+	// #include resolver (+ RT shader loading): a MEMORY factory over the sources the engine pushed
+	// through setShaderSource. The renderer does NO file IO for shader sources.
 	RefCntAutoPtr<IShaderSourceInputStreamFactory> shaderFactory;
 	void RebuildShaderFactory();   // rebuild shaderFactory from shaderSrc (called on every push)
 	uint64_t includeEpoch = 0;     // FNV over all INCLUDE sources — part of the disk-cache key
@@ -138,15 +116,13 @@ struct NukeDiligent::Impl
 
 	// --- generic 2D (UI) draw-list renderer ---
 	RefCntAutoPtr<IPipelineState>         uiPSO;
-	// Per-texture SRB cache (MUTABLE var, set once): zero dynamic descriptors per
-	// commit. LRU-purged by frame stamp; destroyTexture2D drops its entry eagerly.
+	// Per-texture SRB cache (MUTABLE var, set once): zero dynamic descriptors per commit.
 	struct UISRBEntry { RefCntAutoPtr<IShaderResourceBinding> srb; uint64_t lastUse = 0; };
 	std::unordered_map<ITextureView*, UISRBEntry> uiSRBCache;
 	uint64_t uiFrame = 0;
 	IShaderResourceBinding* UISRBFor(ITextureView* view);
 
-	// Frame statistics (editor status bar): scene draws counted this frame, latched at
-	// the start of the next one (getFrameStats reads the completed frame's numbers).
+	// Frame statistics (editor status bar); latched at the start of the next frame.
 	int statDraws = 0, statTris = 0;
 	int statDrawsOut = 0, statTrisOut = 0;
 	RefCntAutoPtr<IBuffer>                uiVB, uiIB, uiCB;
@@ -173,11 +149,9 @@ struct NukeDiligent::Impl
 	uint64_t rtCounter = 0;
 	void TrashRT(RT& rt);                    // park ALL of an RT's textures (before replacing it)
 
-	// Per-size transient-target cache (scratch / bloom / RT-reflection output). Several DIFFERENT-sized
-	// cameras render in one frame (viewport + camera preview + asset-editor previews) — a single shared
-	// target that was Release()+recreated on every size change was a mid-frame lifetime race (the exact
-	// intermittent device-removal class the G-buffer already got fixed for) AND an allocation storm.
-	// Same pattern as GBufferSet: keyed by (w<<32|h), bounded LRU, evictions go through Trash().
+	// Per-size transient-target cache (scratch / bloom / RT-reflection output): several
+	// DIFFERENT-sized cameras render in one frame, so targets must not be recreated mid-frame.
+	// Keyed by (w<<32|h), bounded LRU, evictions go through Trash().
 	struct SizedTexSet { RefCntAutoPtr<ITexture> a, b; uint64_t lastUsed = 0; };
 	std::unordered_map<uint64_t, SizedTexSet> scratchCache, bloomCache, rtOutCache;
 	uint64_t sizedClock = 0;                 // shared LRU clock for the sized caches
@@ -187,7 +161,7 @@ struct NukeDiligent::Impl
 	Uint8 samples = 4;                 // hardware multisample count for all geometry passes (1 = off)
 	int   pendingSamples = -1;         // requested sample count; applied at the START of render() (never mid-frame)
 	RT    backbufferMS;                // MS color+depth for camera target 0 (Player), resolved to the backbuffer
-	// Resolve bookkeeping for the current camera pass (set in beginCamera, consumed in endCamera).
+	// Resolve bookkeeping for the current camera pass (set in beginCamera, used in endCamera).
 	bool      curMSAA = false;
 	ITexture* curResolveSrc = nullptr; // MS HDR color to resolve from
 	ITexture* curResolveDst = nullptr; // single-sample HDR destination
@@ -203,7 +177,7 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>                postCB;
 	IShaderResourceVariable*              postHdrVar = nullptr;
 	IShaderResourceVariable*              postHdrVarBB = nullptr;
-	// Custom post-effect chain (one fullscreen pipeline per effect; ping-ponged in HDR before the final tonemap).
+	// Custom post-effect chain: one fullscreen pipeline per effect, ping-ponged in HDR before tonemap.
 	struct PostPipe { RefCntAutoPtr<IPipelineState> pso; RefCntAutoPtr<IShaderResourceBinding> srb; IShaderResourceVariable* srcVar = nullptr; bool isBloom = false;
 	                  IShaderResourceVariable* gbufVar = nullptr; IShaderResourceVariable* depthVar = nullptr; bool isSSR = false;
 	                  IShaderResourceVariable* objIdVar = nullptr;   // musicvis: generic per-OBJECT id (gbuffer RT2)
@@ -221,14 +195,13 @@ struct NukeDiligent::Impl
 	std::vector<ChainStage>               postChain;      // current camera's effect chain (copied in setPostChain)
 	uint64_t CreatePostPipe(const std::string& name, const std::string& ps);
 	void     EnsureScratch(int w, int h);
-	// Format-safe texture transfer: equal formats -> CopyTexture; different -> fullscreen
-	// blit (CopyTextureRegion between e.g. RGBA8 scene color and RGBA16F chain scratch is
-	// an INVALID D3D12 call — it poisons the command list and Close() fails E_INVALIDARG).
+	// Format-safe texture transfer: equal formats -> CopyTexture; different -> fullscreen blit
+	// (CopyTextureRegion across formats is an INVALID D3D12 call and poisons the command list).
 	void     BlitTexture(ITextureView* srcSRV, ITexture* dstTex);
 	std::map<TEXTURE_FORMAT, std::pair<RefCntAutoPtr<IPipelineState>, RefCntAutoPtr<IShaderResourceBinding>>> blitPipes;
 
-	// Built-in bloom (multi-pass): bright-pass -> separable blur (half-res ping-pong) -> composite. Invoked
-	// for a chain stage whose post shader is named "bloom".
+	// Built-in bloom: bright-pass -> separable blur (half-res ping-pong) -> composite.
+	// Invoked for a chain stage whose post shader is named "bloom".
 	RefCntAutoPtr<IPipelineState>         bloomBrightPSO, bloomBlurPSO, bloomCompPSO;
 	RefCntAutoPtr<IShaderResourceBinding> bloomBrightSRB, bloomBlurSRB, bloomCompSRB;
 	IShaderResourceVariable*              bbSrc = nullptr;   // bright g_Source
@@ -250,11 +223,10 @@ struct NukeDiligent::Impl
 		RefCntAutoPtr<ITextureView> dsv;
 		ITextureView*               srv = nullptr;   // cube SRV (default view, texture-owned)
 		int res = 0, mips = 1;
-		bool fmtHdr = true;   // which SceneFmt the cube was built with (rebuild on HDR toggle to match world PSO)
-		// MSAA capture intermediates: sky/world PSOs are built at the CURRENT sample count —
-		// rendering them straight into the single-sample cube face is a Vulkan render-pass
-		// incompatibility (DEVICE_LOST; D3D12 silently tolerated it). Faces render here and
-		// resolve into the cube slice per face.
+		bool fmtHdr = true;   // SceneFmt the cube was built with (rebuild on HDR toggle to match world PSO)
+		// MSAA capture intermediates: sky/world PSOs are built at the current sample count, so drawing
+		// straight into the single-sample cube face is a Vulkan render-pass incompatibility (DEVICE_LOST).
+		// Faces render here and resolve into the cube slice.
 		RefCntAutoPtr<ITexture> msColor, msDepth;
 		int msSamples = 1;    // sample count the intermediates were built with (rebuild on change)
 	};
@@ -264,22 +236,16 @@ struct NukeDiligent::Impl
 	ITextureView*                        fallbackCubeSRV = nullptr;
 	RefCntAutoPtr<ISampler>              probeSampler;     // linear-clamp; attached to probe/fallback cube SRVs
 
-	// G-buffer prepass (single-sample) for screen-space reflections: normal(oct)+roughness+metalness + depth.
-	// Rendered per SSR camera before the colour pass; the "ssr" post effect samples it. Own 1x depth -> no MSAA
-	// depth resolve, and the colour/custom shaders stay untouched (a dedicated gbuffer.ps fills it).
+	// G-buffer prepass (single-sample) for screen-space reflections: normal(oct)+roughness+metalness
+	// + depth. Rendered per SSR camera before the colour pass; the "ssr" post effect samples it.
 	RefCntAutoPtr<ITexture>             gbufColor, gbufDepth, gbufVel, gbufObjId;
 	ITextureView*                       gbufRTV = nullptr, *gbufDSV = nullptr, *gbufSRV = nullptr, *gbufDepthSRV = nullptr;
 	ITextureView*                       gbufVelRTV = nullptr, *gbufVelSRV = nullptr;   // screen-space motion (TAA)
 	ITextureView*                       gbufObjIdRTV = nullptr, *gbufObjIdSRV = nullptr; // generic per-OBJECT id (pivot hash)
 	int                                 gbufW = 0, gbufH = 0;
-	// G-buffers are cached PER SIZE. The editor renders the main scene and a small
-	// selected-camera preview (different sizes) in the SAME frame; a single shared buffer
-	// used to be Release()+recreated twice every frame — a per-frame lifetime race that
-	// intermittently removed the device (GPU still reading the buffer we just freed). Now
-	// each size keeps its own persistent set and the live gbuf* members above merely point
-	// at the active one. Bounded LRU so drag-resize (many transient sizes) can't grow
-	// unbounded; eviction just drops the refs and lets Diligent's deferred release free the
-	// memory after the frame fence (safe — the active set is never evicted).
+	// G-buffers are cached PER SIZE (several differently-sized cameras render in one frame; a shared
+	// buffer recreated mid-frame is a lifetime race). The gbuf* members above point at the active set.
+	// Bounded LRU; eviction drops refs and lets Diligent's deferred release free after the frame fence.
 	struct GBufferSet {
 		RefCntAutoPtr<ITexture> color, depth, vel, objId;
 		ITextureView *rtv = nullptr, *dsv = nullptr, *srv = nullptr, *depthSRV = nullptr,
@@ -297,8 +263,8 @@ struct NukeDiligent::Impl
 	IShaderResourceVariable*            gbufNrmVar = nullptr;  // PS g_Normal (dynamic) — normal-mapped gbuffer normal
 	RefCntAutoPtr<IBuffer>              ssrCB;                 // SSR matrices (view/proj/invProj/res)
 	RefCntAutoPtr<IBuffer>              rtRefCB;               // RT reflections (invViewProj, light, ambient, sky)
-	// Temporal AA: per-camera history + previous view/proj (keyed by curTarget), a shared CB, and the current
-	// frame's sub-pixel jitter (pixels; applied to the COLOUR projection only, in beginCamera).
+	// Temporal AA: per-camera history + previous view/proj (keyed by curTarget), shared CB, and this
+	// frame's sub-pixel jitter (applied to the COLOUR projection only, in beginCamera).
 	RefCntAutoPtr<IBuffer>              taaCB;
 	struct TAAState { RefCntAutoPtr<ITexture> hist; float4x4 prevView, prevProj; bool valid = false; int w = 0, h = 0; };
 	std::map<uint64_t, TAAState>        taaStates;
@@ -314,7 +280,7 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>             tlasScratch, tlasInstanceBuf;
 	Uint32                             tlasMaxInstances = 0;
 	// Foliage RT bend (bend.cs): bends the merged chunk meshes with the shared NukeBend and
-	// rebuilds their BLAS every frame — RT shadows/reflections of vegetation SWAY.
+	// rebuilds their BLAS every frame, so RT shadows/reflections of vegetation sway.
 	RefCntAutoPtr<IPipelineState>         bendCSPSO;
 	RefCntAutoPtr<IShaderResourceBinding> bendCSSRB;
 	RefCntAutoPtr<IBuffer>                bendCSParamsCB;
@@ -332,20 +298,16 @@ struct NukeDiligent::Impl
 	IBottomLevelAS* GetMeshBLAS(Mesh* mesh);                   // get-or-build the BLAS for a mesh (from its pos buffer)
 	void EnsureRTFallback();                                   // build the empty fallback TLAS once
 
-	// RT reflection hit shading: per-instance geometry (normals) + material, so a ray hit can be shaded.
-	// Normals of every referenced mesh are concatenated into one raw buffer; each instance stores its byte offset.
-	// matByteOffset = this instance's MatCB block in g_MatBytes (auto-gen hit shaders load their params from it).
-	// Mirrors HLSL RTInstanceData (rt_common.hlsl) byte-for-byte. 16-byte aligned rows for StructuredBuffer.
-	// MIRRORED byte-for-byte in rt_common.hlsl (RTInstanceData) AND world.ps.hlsl (RTInstInfo,
-	// shadow candidate loop) — change all three together.
+	// RT reflection hit shading: per-instance geometry offsets (into the concatenated normal/uv/pos
+	// buffers) + material block offset in g_MatBytes. MIRRORED byte-for-byte in rt_common.hlsl
+	// (RTInstanceData) AND world.ps.hlsl (RTInstInfo) — change all three together. 16-byte rows.
 	struct RTInstanceData {
 		uint32_t nrmOffset, uvOffset, posOffset, matByteOffset;
 		uint32_t texIndex, nrmTexIndex, mrTexIndex, aoTexIndex;
 		uint32_t emTexIndex, specTexIndex; float specularFactor; uint32_t nrmFlipG;   // 1 = flip green (OpenGL)
 		float albedoMetal[4]; float emissiveRough[4];
-		// Dynamic sprite meshes (particles): byte offset into the per-frame color pool
-		// (g_DynCol; 0xFFFFFFFF = none), the shadow-ray footprint (0 quad/1 disc/2 strip)
-		// and the instance alpha multiplier for shadow candidates.
+		// Particles: colOffset = byte offset into g_DynCol (0xFFFFFFFF = none),
+		// shadowShape = 0 quad / 1 disc / 2 strip.
 		uint32_t colOffset; uint32_t shadowShape; float shadowAlpha; uint32_t pad0;
 	};
 	std::unordered_map<Mesh*, uint32_t> meshNrmByteOffset;     // mesh -> byte offset of its normals in rtNrmBuf
@@ -357,8 +319,8 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>              rtUVBuf;      IBufferView* rtUVSRV   = nullptr;   // ByteAddressBuffer (all uvs)
 	RefCntAutoPtr<IBuffer>              rtPosBuf;     IBufferView* rtPosSRV  = nullptr;   // ByteAddressBuffer (all positions)
 	RefCntAutoPtr<IBuffer>              rtInstBuf;    IBufferView* rtInstSRV = nullptr;   // StructuredBuffer<RTInstanceData>
-	// Per-frame color pool for dynamic sprite meshes (particle gradients/fade): rebuilt every
-	// frame from Mesh::rtColorArray of the instances added (RAW buffer, grows as needed).
+	// Per-frame color pool for dynamic sprite meshes (particle gradients/fade), rebuilt from
+	// Mesh::rtColorArray of the instances added. RAW buffer, grows as needed.
 	std::vector<float>                  rtDynColCPU;
 	RefCntAutoPtr<IBuffer>              rtDynColBuf;  IBufferView* rtDynColSRV = nullptr;
 	Uint64                              rtDynColCap = 0;
@@ -369,19 +331,19 @@ struct NukeDiligent::Impl
 	std::vector<ITextureView*>          matTexSRVs;            // unique material map SRVs (<= kMaxMatTex)
 	std::vector<Texture*>               matTexPtr;             // engine texture per slot (re-resolve SRV each frame -> animation)
 
-	// --- RT reflection PIPELINE (real DXR: ray-gen + miss + closest-hit + SBT, native recursion) -------------
+	// --- RT reflection pipeline (DXR: ray-gen + miss + closest-hit + SBT) ---
 	RefCntAutoPtr<IPipelineState>         rtPSO;               // ray-tracing PSO (rt_rgen/rt_rmiss/rt_rchit)
 	RefCntAutoPtr<IShaderResourceBinding> rtSRB;               // dynamic resources (TLAS, gbuffer, bindless, output)
 	RefCntAutoPtr<IShaderBindingTable>    rtSBT;               // shader binding table (ray-gen + miss + hit group)
 	RefCntAutoPtr<ITexture>               rtOutTex;            // UAV the ray-gen writes the composited reflection into
 	int                                   rtOutW = 0, rtOutH = 0;
-	// Global RTX reflection quality (Project Settings -> config/main.json, pushed via setRTReflection).
+	// Global RTX reflection quality (pushed via setRTReflection).
 	float rtCfgIntensity = 1.0f; float rtCfgMaxDist = 100.0f; int rtCfgBounces = 3; float rtCfgRoughCut = 0.6f;
 	bool BuildRTPipeline();                                    // build rtPSO/rtSRB/rtSBT (needs shaderFactory + DXC)
 	void EnsureRTOutput(int w, int h);                         // (re)create the RGBA16F UAV output at viewport size
 	void RunRTReflectPipeline(ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params);
-	// Auto-generated per-shader RT closest-hits. A material shader with a "<name>.surf.hlsl" gets its own hit
-	// group, built by GenChitSource() from the shader's MatCB schema + that surface file (no hand-written .rchit).
+	// Auto-generated per-shader RT closest-hits: a material shader with a "<name>.surf.hlsl" gets its
+	// own hit group, built by GenChitSource() from the shader's MatCB schema + that surface file.
 	std::unordered_map<std::string, std::string> rtSurfShaders;  // shader name -> its PS source (has the MatCB schema)
 	std::unordered_map<std::string, std::string> shaderHitGroup; // shader name -> hit-group name in the RT PSO
 	std::string GenChitSource(const std::string& name, const std::string& psSource);  // codegen the closest-hit HLSL
@@ -436,37 +398,33 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              probeVar  = nullptr;// PS "g_Probe" (reflection cubemap, dynamic)
 		IShaderResourceVariable*              tlasVar   = nullptr;// PS "g_TLAS" (ray-tracing accel struct, RT builds only)
 		IShaderResourceVariable*              rtInstVar = nullptr;// PS "g_RTInst" (per-instance RT data: shadow footprints)
-		// INSTANCED variants (7.1): built only when the shader source handles NUKE_INSTANCED
-		// (the built-in world shader does; custom shaders opt in). Same blend variants; the
-		// instanced SRB has its OWN variable set (a different compiled shader pair).
+		// INSTANCED variants: built only when the shader source handles NUKE_INSTANCED. Same blend
+		// variants; the instanced SRB has its OWN variable set (a different compiled shader pair).
 		RefCntAutoPtr<IPipelineState>         psoInst, psoInstBlend, psoInstAdd, psoInstWire;
 		RefCntAutoPtr<IShaderResourceBinding> srbInst;
 		IShaderResourceVariable *texVarI = nullptr, *normVarI = nullptr, *mrVarI = nullptr, *aoVarI = nullptr,
 		                        *emVarI = nullptr, *specVarI = nullptr, *shadowVarI = nullptr, *cubeVarI = nullptr,
 		                        *probeVarI = nullptr, *tlasVarI = nullptr, *rtInstVarI = nullptr;
-		// Redundancy gates (perf): the object each DYNAMIC variable currently holds. Diligent
-		// rewrites the descriptor cache on EVERY Set() of a dynamic var (no same-object skip),
-		// so the draw path only calls Set() when the pointer actually changes. Cleared when
-		// the SRBs are (re)created. [0..10] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst.
+		// Redundancy gates: object each DYNAMIC variable currently holds — Diligent rewrites the
+		// descriptor cache on EVERY Set() of a dynamic var, so only Set() on an actual change.
+		// [0..10] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst. Cleared when SRBs are rebuilt.
 		IDeviceObject* lastBind[11]  = {};
 		IDeviceObject* lastBindI[11] = {};
-		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on an MSAA change)
+		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
 	};
 	std::unordered_map<uint64_t, WorldPipe> worldPipes;   // shader handle -> pipeline
 	uint64_t                              defaultWorldHandle = 0;   // builtin "world" pipeline
 
-	// --- Per-draw redundancy gates (perf). Shared dynamic CBs (worldCB/worldMatCB/drawFlagsCB)
-	// only re-map when their content actually changes WITHIN a pass; every pass begin bumps
-	// passSerial, which invalidates all gates (dynamic rings recycle per frame, and other
-	// passes — g-buffer prepass — write their own content into the same buffers).
-	uint32_t        passSerial = 1;                 // bumped in beginCamera/beginCubeFace/beginGBufferPass/beginShadowPass
+	// Per-draw redundancy gates: the shared dynamic CBs (worldCB/worldMatCB/drawFlagsCB) only re-map
+	// when their content changes WITHIN a pass. Every pass begin bumps passSerial and invalidates all
+	// gates — dynamic rings recycle per frame and other passes write the same buffers.
+	uint32_t        passSerial = 1;                 // bumped by every begin*Pass / beginCamera / beginCubeFace
 	const Material* matCBFor   = nullptr;           // material whose bytes sit in worldMatCB + drawFlagsCB
 	uint32_t        matCBPass  = 0;                 // ...valid while == passSerial
 	uint32_t        instWorldCBPass = 0;            // pass in which worldCB holds the instanced VP (identity world)
 	struct { const void* mesh = nullptr; uint64_t buf = 0; void* pso = nullptr; uint32_t pass = 0; } lastInstBind;
 
-	// --- GPU instancing (7.1) -----------------------------------------------------------
-	// Persistent instance buffers (engine handle -> dynamic VB of NukeInstanceData records).
+	// --- GPU instancing: persistent instance buffers (handle -> dynamic VB of NukeInstanceData) ---
 	struct InstBuf { RefCntAutoPtr<IBuffer> buf; int capacity = 0; int count = 0; };
 	std::unordered_map<uint64_t, InstBuf> instBufs;
 	uint64_t nextInstBuf = 1;
@@ -487,42 +445,39 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<ITexture>               whiteTex;    // 1x1 fallback when a material has no texture
 	RefCntAutoPtr<ITexture>               flatNormTex; // 1x1 (0.5,0.5,1) flat normal fallback
 	RefCntAutoPtr<IBuffer>                worldFrameCB;// PS b1: camera pos + ambient + light array (shared)
-	// PBR lighting buffer layout (matches FrameCB in world.ps.hlsl). Each float4 = 16 bytes.
+	// PBR lighting buffer layout — MUST match FrameCB in world.ps.hlsl. Each float4 = 16 bytes.
 	static const int                      kMaxLights = 256;
 	struct GPULight { float posType[4]; float dirRange[4]; float colorIntensity[4]; float spot[4]; };
 	struct FrameCBData { float camPos[4]; float ambient[4]; float lightCount[4]; GPULight lights[kMaxLights];
 	                     float shadowVP[16 * 4]; float shadowParams[4];        // 4 = SHADOW_SLOTS
 	                     float skyTop[4]; float skyHorizon[4]; float skyGround[4]; float skyParams[4];      // IBL
 	                     float probePos[4]; float probeParams[4]; float probeBox[4];    // probe: pos.xyz+active, intensity+maxMip, boxHalf.xyz+valid
-	                     float wind[4]; float wind2[4]; };   // 7.2: dir.xyz+gusted strength; turbAmount, 1/turbScale, time, gustFreq
-	float windDirStrength[4] = { 1, 0, 0, 0 };   // setWind (World::Render pushes per frame)
+	                     float wind[4]; float wind2[4]; };   // dir.xyz+gusted strength; turbAmount, 1/turbScale, time, gustFreq
+	float windDirStrength[4] = { 1, 0, 0, 0 };   // setWind (pushed per frame)
 	float windParams[4]      = { 0, 0, 0, 0 };
-	// Foliage bend (7.4): the VS-side BendCB — wind + up to 8 "pushers" (characters/bodies
-	// that part the blades). Written once per frame from setWind (pushers arrive just before
-	// via setBendPushers); bound as a STATIC var on every INSTANCED pipeline whose vertex
-	// shader declares cbuffer BendCB (world/gbuffer/shadow instanced variants).
+	// Foliage bend: the VS-side BendCB — wind + up to 8 "pushers" that part the blades. Written
+	// once per frame from setWind; bound as a STATIC var on every INSTANCED pipeline whose vertex
+	// shader declares cbuffer BendCB.
 	RefCntAutoPtr<IBuffer> bendCB;
 	float bendPushers[8][4] = {};
 	int   bendPusherCount = 0;
 	float bendVolumes[16][12] = {};   // (pos,r)(dir,strength)(mode,falloff,seed,0) per volume
 	int   bendVolumeCount = 0;
 	void  UpdateBendCB();
-	void WriteFrameCB(const Diligent::float3& P);   // fill worldFrameCB (lights/shadows/sky/probe) — shared by camera + cube-face passes
+	void WriteFrameCB(const Diligent::float3& P);   // fill worldFrameCB (lights/shadows/sky/probe)
 	float                                 curCamPos[3] = {0, 0, 0};  // set in beginCamera (PBR view dir)
 	float                                 curCamFwd[3] = {0, 0, 1};  // camera forward (ripple window aim)
 	bool                                  curCamEditor = false;      // this pass = editor viewport camera
 	uint64_t                              curTarget = 0;             // RT id bound by beginCamera (feedback guard)
-	// True between beginCamera binding its targets and the END of endCamera. Sprites (world +
-	// canvas-pre) REQUIRE the camera's colour+depth targets — a sprite emitted/flushed outside a
-	// camera pass would draw into whatever is bound (e.g. a depth-less UI target: "Sprite PSO
-	// D32_FLOAT vs DSV nullptr" spam) — such calls are dropped instead.
+	// True between beginCamera binding its targets and the end of endCamera. Sprites REQUIRE the
+	// camera's colour+depth targets, so sprite calls outside a camera pass are dropped.
 	bool                                  cameraPassActive = false;
-	// Native water hooks (NukeDiligentNative.h) live in NukeDiligent_Native.cpp; the RT
-	// water-attenuation POD they feed is consumed by the ray shaders' CB fill (RT.cpp).
+	// RT water attenuation, fed by the native water hooks (NukeDiligent_Native.cpp), consumed by
+	// the ray shaders' CB fill (RT.cpp).
 	float rtWaterOcc[4] = { 0, 0, 0.25f, 0 };   // level, on (this frame), 1/opacityDepth, 0
 	float rtWaterCol[3] = { 0.02f, 0.10f, 0.09f };
 	float rtWaterAbs[3] = { 0.45f, 0.09f, 0.06f };
-	// Generic ortho bottom-depth capture (begin/end/fetchWaterBottom — NukeDiligent_Native.cpp).
+	// Generic ortho bottom-depth capture (begin/end/fetchWaterBottom, NukeDiligent_Native.cpp).
 	RefCntAutoPtr<ITexture> capDepth, capStaging;
 	int   capPending = -1;
 	bool  capActive = false;
@@ -530,7 +485,7 @@ struct NukeDiligent::Impl
 	std::vector<NukeLight>                lights;      // scene lights (setLights); empty -> default sun
 
 	// --- Shadow maps (directional + spot share a 2D array; one slice per shadow-casting light) -----
-	int                                   shadowRes    = 2048;   // global, World-Settings-driven (rebuilds on change)
+	int                                   shadowRes    = 2048;   // World-Settings-driven (rebuilds on change)
 	int                                   pendingShadowRes = 0;  // requested resolution; applied at render() top
 	float                                 shadowDistance = 60.0f; // directional ortho extent / range
 	float                                 shadowDepthBias = 0.0015f;
@@ -546,15 +501,10 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>                shadowVSCB;    // VS: g_LightWVP (per shadow draw)
 	RefCntAutoPtr<IBuffer>                shadowPSCB;    // PS: g_Alpha    (per shadow draw)
 	RefCntAutoPtr<ISampler>               shadowCmpSampler;   // PCF comparison sampler (set on shadowSRV)
-	// Procedural sky / environment.
-	NukeSky                               sky;
-	// Debug/gizmo lines (iRender::drawDebugLine): per-frame vertex list (pos3+col4),
-	// guarded (game + fixed threads emit), drawn depth-tested at endCamera, cleared at
-	// the top of render().
-	// Drawn AFTER the post chain (LDR, no depth): TAA has no velocity for lines (they
-	// smear/vanish while the camera moves) and the RT-reflection composite overwrites
-	// them on reflective surfaces - post-last avoids both. Two PSOs: RT (RGBA8) targets
-	// and the swap-chain backbuffer format.
+	NukeSky                               sky;   // procedural sky / environment
+	// Debug/gizmo lines (iRender::drawDebugLine): per-frame vertex list (pos3+col4), mutex-guarded
+	// (game + fixed threads emit), cleared at the top of render(). Drawn AFTER the post chain (LDR,
+	// no depth) — TAA has no velocity for lines and the RT-reflection composite would overwrite them.
 	RefCntAutoPtr<IPipelineState> debugPSO;      // -> RT post targets (RGBA8)
 	RefCntAutoPtr<IPipelineState> debugPSOBB;    // -> the backbuffer (swap-chain format)
 	RefCntAutoPtr<IShaderResourceBinding> debugSRB;
@@ -566,11 +516,9 @@ struct NukeDiligent::Impl
 	std::mutex debugMutex;
 	void CreateDebugResources();
 	void DrawDebugLines(bool toBackbuffer);
-	// DEPTH-TESTED lines (drawDebugLineDepth): drawn INSIDE the camera pass while the MS scene
-	// targets are still bound (endCamera top), so geometry occludes them — quiet gizmos like
-	// unselected canvas frames. PSO depends on samples/HDR -> built lazily against the current
-	// SceneFmt()/samples and rebuilt when they change. Batch is CONSUMED per camera (cleared
-	// after the draw) so one camera's gizmos never leak into another camera's pass.
+	// DEPTH-TESTED lines (drawDebugLineDepth): drawn INSIDE the camera pass while the MS scene targets
+	// are still bound, so geometry occludes them. PSO depends on samples/HDR -> built lazily against
+	// the current SceneFmt()/samples. Batch is CONSUMED per camera so gizmos don't leak between passes.
 	RefCntAutoPtr<IPipelineState>         debugDepthPSO;
 	RefCntAutoPtr<IShaderResourceBinding> debugDepthSRB;
 	int            debugDepthSamples = 0;                        // PSO built for this sample count
@@ -579,16 +527,15 @@ struct NukeDiligent::Impl
 	void DrawDepthDebugLines();
 
 	// Sprites (iRender::drawSprite): unlit textured quads, alpha-blended, drawn IN the camera pass
-	// (SceneFmt + MSAA + depth-test, no depth write). PSO depends on samples/HDR -> rebuilt with them.
+	// (SceneFmt + MSAA + depth-test, no depth write). PSO depends on samples/HDR and rebuilds with them.
 	RefCntAutoPtr<IPipelineState>         spritePSO;
 	RefCntAutoPtr<IShaderResourceBinding> spriteSRB;
 	IShaderResourceVariable*              spriteTexVar = nullptr;   // PS g_Sprite (dynamic)
 	RefCntAutoPtr<IBuffer>                spriteCB;                 // view*proj
 	RefCntAutoPtr<IBuffer>                spriteVB;                 // dynamic (grows), 9 floats/vertex
 	int                                   spriteVBSize = 0;         // VB capacity in vertices
-	// Batching: drawSprite ACCUMULATES quads and flushes ONE draw per texture run (sprites arrive
-	// pre-sorted back-to-front, so consecutive same-texture sprites merge). Flushed on texture
-	// change and at endCamera (before the MSAA resolve).
+	// Batching: drawSprite accumulates quads and flushes ONE draw per texture run (sprites arrive
+	// pre-sorted back-to-front). Flushed on texture change and at endCamera, before the MSAA resolve.
 	Texture*                              spriteBatchTex = nullptr;
 	bool                                  spriteBatchOpen = false;   // batch live (tex may legally be null -> white 1x1)
 	float                                 spriteSoftDist = 0.f;      // soft-particle fade distance for the CURRENT run (0 = off)
@@ -599,8 +546,8 @@ struct NukeDiligent::Impl
 	void FlushSprites();
 
 	// LIT sprite runs (drawSpriteRunLit — tilemap layers with a normal map): same batch layout,
-	// Lambert lighting from worldFrameCB, per-batch plane TBN in spriteLitCB. SRBs are cached
-	// per (diffuse, normal) SRV pair. Flushed on pair change / kind switch / endCamera.
+	// Lambert lighting from worldFrameCB, per-batch plane TBN in spriteLitCB. SRBs cached per
+	// (diffuse, normal) SRV pair; flushed on pair change / kind switch / endCamera.
 	RefCntAutoPtr<IPipelineState>         spriteLitPSO;
 	RefCntAutoPtr<IBuffer>                spriteLitCB;              // float4 T,B,N (N.w = green flip)
 	std::map<std::pair<ITextureView*, ITextureView*>, RefCntAutoPtr<IShaderResourceBinding>> spriteLitSRBs;
@@ -611,10 +558,8 @@ struct NukeDiligent::Impl
 	void FlushSpritesLit();
 
 	// Screen-space (Canvas HUD) sprites — verts already in NDC, identity transform. Two queues:
-	// PRE = drawn with the scene before post (reuses spritePSO; NDC z=0 => always on top); POST =
-	// drawn on the final image after post (own output-format PSO, single-sample, no depth). Both defer
-	// their draw to a flush point, so they store per-texture RUNS (texture + vertex count) into one
-	// vertex list that the flush replays.
+	// PRE = drawn with the scene before post (reuses spritePSO); POST = drawn on the final image
+	// after post (own output-format PSO, single-sample, no depth). Each stores per-texture runs.
 	struct SprRun { Texture* tex; int count; };
 	std::vector<float>   spriteScrPreVerts;   std::vector<SprRun> spriteScrPreRuns;
 	std::vector<float>   spriteScrPostVerts;  std::vector<SprRun> spriteScrPostRuns;
@@ -629,8 +574,8 @@ struct NukeDiligent::Impl
 	void FlushScreenPre();                    // at endCamera, before the MSAA resolve (into the scene target)
 	void FlushScreenPost(bool toBackbuffer);  // after post, on the final output
 
-	// Screen-space decals (iRender::drawDecal): a box volume, surface reconstructed from the gbuf depth,
-	// texture projected along the box +Z. Albedo = alpha blend, LightProjector = additive. Unit-cube VB.
+	// Screen-space decals (iRender::drawDecal): box volume, surface reconstructed from the gbuf depth,
+	// texture projected along the box +Z. Albedo = alpha blend, LightProjector = additive.
 	RefCntAutoPtr<IPipelineState>         decalPSO, decalPSOAdd;
 	RefCntAutoPtr<IShaderResourceBinding> decalSRB, decalSRBAdd;
 	IShaderResourceVariable*              decalTexVar = nullptr, *decalDepthVar = nullptr;
@@ -665,19 +610,17 @@ struct NukeDiligent::Impl
 	bool     BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg);
 	void     RebuildForMSAA();   // rebuild all sample-count-dependent pipelines + targets after `samples` changes
 	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; int version = 0;
-	                 // RT wind bend (foliage merged chunks, Mesh::rtBendArray): NukeBend compute
-	                 // inputs + the BENT position buffer the BLAS builds over (refit per frame).
+	                 // RT wind bend: NukeBend compute inputs + the BENT position buffer the BLAS builds over.
 	                 RefCntAutoPtr<IBuffer> bendSrc, bendData, bendPivot, posBent, blasScratch; };
 	std::unordered_map<Mesh*, MeshGPU>          meshCache;
-	MeshGPU* GetMeshGPU(Mesh* mesh);   // get-or-build the GPU vertex buffers (pos/nrm/uv) for a mesh;
-	                                   // re-uploads in place when Mesh::version changed (skinned/procedural)
+	MeshGPU* GetMeshGPU(Mesh* mesh);   // get-or-build a mesh's GPU vertex buffers; re-uploads in
+	                                   // place when Mesh::version changed (skinned/procedural)
 	std::unordered_map<Texture*, RefCntAutoPtr<ITexture>> texCache;   // engine Texture -> GPU texture
 	std::unordered_map<Texture*, std::vector<RefCntAutoPtr<ITexture>>> animTex;   // GIF: one Texture2D per frame
 	float4x4 curView, curProj;   // set in beginCamera, used in renderObject
 
-	// Selection outline (editor): post-process. Pass 1 renders the selected mesh into a mask RT;
-	// pass 2 is a fullscreen edge-detect that draws a CONSTANT-pixel-thickness border around the mask
-	// (independent of distance/size, works for any geometry incl. flat planes).
+	// Selection outline (editor): pass 1 renders the selected mesh into a mask RT; pass 2 is a
+	// fullscreen edge-detect drawing a constant-pixel-thickness border around the mask.
 	RefCntAutoPtr<IPipelineState>         outlineMaskPSO, outlineEdgePSO;
 	RefCntAutoPtr<IShaderResourceBinding> outlineMaskSRB, outlineEdgeSRB;
 	IShaderResourceVariable*              outlineEdgeMaskVar = nullptr;   // edge PS "g_Mask" (dynamic)
@@ -687,72 +630,58 @@ struct NukeDiligent::Impl
 	int                                   outlineMaskW = 0, outlineMaskH = 0;
 	RefCntAutoPtr<IBuffer>                outlineEdgeCB;      // texel size + thickness
 	ITextureView*                         curRTV = nullptr;   // current camera color target (outline rebind)
-	ITextureView*                         curDSV = nullptr;   // ...and its depth: passes that bind their own
-	                                                          // targets (outline) must RESTORE both — later
-	                                                          // draws (gizmos/sprites) expect the camera depth
+	ITextureView*                         curDSV = nullptr;   // ...and its depth; passes that bind their own
+	                                                          // targets must RESTORE both before returning
 	int                                   curRTW = 0, curRTH = 0;
 	ITextureView*                         uiRTV = nullptr;    // explicit 2D target (bindRenderTarget); null = backbuffer
 	Uint32                                uiTW = 0, uiTH = 0; // its size (0 = use swapchain)
 	void BuildOutlinePipelines();
 	void EnsureOutlineMask(int w, int h);
 
-	// UI multi-viewport: one swap chain per detached OS window (keyed by native handle,
-	// HWND on Windows). Swap-chain CREATION/RESIZE/DESTRUCTION never happens mid-frame —
-	// uiViewportRender/Destroy only QUEUE the request and render() applies them at the top
-	// of the next frame, when nothing is recorded (creating or resizing a DXGI swap chain
-	// between passes under heavy GPU load intermittently wedged the queue: endless "Timeout
-	// elapsed while waiting for the frame waitable object"). Destruction parks the swap
-	// chain in the GPU trash instead of a mid-frame IdleGPU.
+	// UI multi-viewport: one swap chain per detached OS window (keyed by native handle). Swap-chain
+	// CREATE/RESIZE/DESTROY must NEVER happen mid-frame — doing so between passes wedges the DXGI
+	// queue — so requests are queued and applied by render() at the top of the next frame.
+	// Destruction parks the swap chain in the GPU trash instead of a mid-frame IdleGPU.
 	std::map<void*, RefCntAutoPtr<ISwapChain>> uiVpSC;
 	std::map<void*, std::pair<int, int>>       uiVpPending;   // create/resize requests (handle -> size)
-	// Resize DEBOUNCE per window: (last requested size, consecutive frames it held). A live
-	// drag re-requests a new size EVERY frame; resizing (Flush+IdleGPU+Resize) 30+ times/sec
-	// starves the main swap chain's frame-latency waitable object — permanent "Timeout
-	// elapsed waiting for the frame waitable object" stalls. Resize only once the size
-	// settles; meanwhile the old buffers present stretched (visually fine mid-drag).
+	// Resize debounce per window: (last requested size, consecutive frames it held). Resizing every
+	// frame during a live drag starves the main swap chain's frame-latency waitable object, so only
+	// resize once the size settles; meanwhile the old buffers present stretched.
 	std::map<void*, std::pair<std::pair<int, int>, int>> uiVpStable;
 	std::map<void*, int> uiVpCooldown;   // frames to skip a window after a FAILED chain creation
 	std::map<void*, int> uiVpGrace;      // frames to skip draw+present right after a resize (diag)
-	// Secondary presents are DEFERRED to after the MAIN Present: presenting (and its
-	// internal Flush) mid-frame splits the command stream between the preview RT's write
-	// and its SRV sampling — the D3D12 debug layer then kills the device with
-	// ACCESS_DENIED ("rendering to a texture with read access") on RT-sampling windows.
+	// Secondary presents are DEFERRED to after the MAIN Present: presenting mid-frame splits the
+	// command stream between a preview RT's write and its SRV sampling, which the D3D12 debug layer
+	// kills with ACCESS_DENIED.
 	std::vector<void*> vpPresentQueue;
-	size_t vpPresentRR = 0;   // round-robin cursor: ONE secondary present per frame (see render())
+	size_t vpPresentRR = 0;   // round-robin cursor: ONE secondary present per frame
 	uint64_t uiVpFrameNo = 0; // frame counter for the multi-window draw interleave (uiViewportRender)
 
-	// GDI-BLIT host windows (task #137): a detached window = offscreen RT + staging ring +
-	// SetDIBitsToDevice. ZERO DXGI objects per window — no secondary swap chains, resizes
-	// or presents, so the month-long "secondary present vs heavy frame" ACCESS_DENIED
-	// device removal cannot exist BY CONSTRUCTION. Readback is async (ring of 3, mapped
-	// with DO_NOT_WAIT after the main present): ~2 frames of latency, invisible for tool
-	// windows, and the main frame does no extra flushes at all.
+	// GDI-blit host windows: a detached window = offscreen RT + staging ring + SetDIBitsToDevice.
+	// Zero DXGI objects per window, so no secondary swap chains, resizes or presents. Readback is
+	// async (ring of 3, mapped DO_NOT_WAIT after the main present): ~2 frames of latency, no extra flush.
 	struct HostBlit
 	{
 		Diligent::RefCntAutoPtr<Diligent::ITexture> rt;          // offscreen UI render target
 		Diligent::RefCntAutoPtr<Diligent::ITexture> staging[3];  // readback ring
 		int  w = 0, h = 0;
 		int  cur = 0;                  // ring slot written THIS frame
-		bool valid[3] = {};            // slot holds a issued copy
+		bool valid[3] = {};            // slot holds an issued copy
 		std::vector<uint8_t> scratch;  // BGRX rows for GDI
 	};
 	std::map<void*, HostBlit> uiHostBlits;
 	std::vector<void*> uiHostBlitQueue;   // windows to blit AFTER the main Present
 	void BlitHostWindows();               // map ready staging + SetDIBitsToDevice
-	// VULKAN native viewports: per-window SWAPCHAIN render (imgui multi-viewport).
-	// The Vulkan WSI has none of the DXGI create/resize/present races — this is the
-	// normal multi-window path; GDI blit stays the D3D fallback.
+	// Vulkan native viewports: per-window swapchain render (imgui multi-viewport). The Vulkan WSI
+	// has none of the DXGI create/resize/present races; GDI blit stays the D3D fallback.
 	void ViewportRenderSwapchain(void* nativeHandle, int w, int h, const NukeUIDrawData& data);
 	void ApplyPendingViewportOps();                            // render() top: create/resize queued swap chains
 	// Shared UI draw body (renderDrawLists + secondary viewports draw with it).
 	void DrawUILists(ITextureView* rtv, Uint32 surfW, Uint32 surfH, const NukeUIDrawData& data);
 
-	// --- Water (7.5) — MIGRATED to NukeWater.dll ------------------------------------------------
-	// Every water pass (FFT cascades, ripple sim, caustics, SWE spread, FLIP volumes, surface
-	// draws, underwater/wetness post) lives in the water module now, driven through the native
-	// escape hatch (include/NukeDiligentNative.h). The renderer keeps only GENERIC capabilities:
-	// the ortho bottom capture (NukeDiligent_Native.cpp), the shader/PSO caches, the scratch
-	// targets and the hook points in beginCamera/endCamera.
+	// Water lives in NukeWater.dll, driven through the native escape hatch (NukeDiligentNative.h).
+	// The renderer keeps only generic capabilities: the ortho bottom capture, the shader/PSO caches,
+	// the scratch targets and the hook points in beginCamera/endCamera.
 
 	// Shader sources pushed by the engine (the renderer does NO file IO). name -> HLSL.
 	std::unordered_map<std::string, std::string> shaderSrc;

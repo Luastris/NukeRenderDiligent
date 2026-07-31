@@ -3,8 +3,7 @@
 
 namespace nukediligent { const WaterHooks& ActiveWaterHooks(); }
 
-// Camera basis -> curView/curProj/curCamPos. Shared by beginCamera and the SSR gbuffer prepass so both use the
-// exact same transform (left-handed look-at; same projection as beginCamera).
+// Camera basis -> curView/curProj/curCamPos (left-handed look-at). Shared by beginCamera and the SSR prepass.
 void NukeDiligent::Impl::SetCameraViewProj(const NukeCameraDesc& cam, int w, int h)
 {
 	const float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
@@ -13,7 +12,6 @@ void NukeDiligent::Impl::SetCameraViewProj(const NukeCameraDesc& cam, int w, int
 	float3 U = float3(cam.camUp[0], cam.camUp[1], cam.camUp[2]);
 	float3 R = normalize(cross(U, F)); U = cross(F, R);
 	curView = float4x4(R.x, U.x, F.x, 0.f, R.y, U.y, F.y, 0.f, R.z, U.z, F.z, 0.f, -dot(P, R), -dot(P, U), -dot(P, F), 1.f);
-	// Camera diagnostics (NUKE_TM_DIAG=1): what basis the renderer actually received.
 	static const bool diag = []{ const char* e = std::getenv("NUKE_TM_DIAG"); return e && *e == '1'; }();
 	if (diag)
 	{
@@ -22,8 +20,7 @@ void NukeDiligent::Impl::SetCameraViewProj(const NukeCameraDesc& cam, int w, int
 		                            << ") F(" << F.x << "," << F.y << "," << F.z << ") vp " << w << "x" << h
 		                            << " ortho " << cam.ortho << " near " << cam.nearZ << " far " << cam.farZ << std::endl; }
 	}
-	// Projection: perspective, orthographic, or an element-wise blend of the two matrices (the
-	// standard perspective<->ortho tween — the engine animates cam.ortho for a smooth transition).
+	// Projection: perspective, orthographic, or an element-wise blend of the two (cam.ortho tween).
 	float4x4 persp = float4x4::Projection(cam.fov, aspect, cam.nearZ, cam.farZ, false);
 	if (cam.ortho <= 0.0001f)
 		curProj = persp;
@@ -40,8 +37,6 @@ void NukeDiligent::Impl::SetCameraViewProj(const NukeCameraDesc& cam, int w, int
 	curCamPos[0] = P.x; curCamPos[1] = P.y; curCamPos[2] = P.z;
 	curCamFwd[0] = F.x; curCamFwd[1] = F.y; curCamFwd[2] = F.z;
 	curCamEditor = cam.editorCamera != 0;   // module passes read this through the native hatch
-	// (The water module anchors its ripple window to GAME cameras itself, via the
-	// camera-begin hook + Frame.camIsEditor.)
 }
 
 // Target size for a camera (matches beginCamera): backbuffer (target 0) or the off-screen RT.
@@ -84,7 +79,6 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	m_impl->instWorldCBPass = 0;          // worldCB now holds THIS object's matrices, not the instanced VP
 	m_impl->lastInstBind.pso = nullptr;   // and the pipeline/vertex-buffer state is about to change
 
-	// Material: base color + PBR maps/params (fallbacks when none).
 	float col[4] = { 1, 1, 1, 1 };
 	float metallic = 0.0f, roughness = 0.6f;
 	float emissive[3] = { 0, 0, 0 }, emissiveI = 0.0f;
@@ -104,7 +98,6 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 		if (mat->em)   emsrv = m_impl->GetTexSRV(mat->em);
 		if (mat->spec) specsrv = m_impl->GetTexSRV(mat->spec);
 	}
-	// Pick the pipeline for this material's shader (fallback to the built-in "world" pipeline).
 	uint64_t h = (mat && mat->shader && mat->shader->rendererHandle) ? mat->shader->rendererHandle
 	                                                                  : m_impl->defaultWorldHandle;
 	auto pit = m_impl->worldPipes.find(h);
@@ -112,9 +105,7 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	if (pit == m_impl->worldPipes.end()) return;
 	Impl::WorldPipe& wp = pit->second;
 
-	// Per-draw flags + material CB: content is a pure function of the MATERIAL — consecutive
-	// draws with the same one within a pass re-upload byte-identical bytes, so both maps are
-	// gated on the material actually changing (dynamic rings recycle per frame -> pass-scoped).
+	// Gated on the material changing; dynamic CBs recycle per frame, so the gate is pass-scoped.
 	if (m_impl->matCBFor != mat || m_impl->matCBPass != m_impl->passSerial)
 	{
 		m_impl->matCBFor = mat; m_impl->matCBPass = m_impl->passSerial;
@@ -123,9 +114,8 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 			MapHelper<float> fc(m_impl->context, m_impl->drawFlagsCB, MAP_WRITE, MAP_FLAG_DISCARD);
 			if (fc != nullptr) { fc[0] = (mat && !mat->receiveShadows) ? 0.0f : 1.0f; fc[1] = fc[2] = fc[3] = 0.0f; }
 		}
-		// Material constant buffer: standard color @0 + params @16, then the shader's custom props at
-		// their engine-parsed offsets (Shader::props). The renderer consumes the schema the engine
-		// parsed from the shader source — it never reads shader files itself.
+		// MatCB layout mirrors the HLSL cbuffer: color @0, params @16/@32/@48, then the shader's
+		// custom props at the engine-parsed offsets (Shader::props).
 		MapHelper<Uint8> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		Uint8* p = mb;
 		memset(p, 0, Impl::kMatCBBytes);
@@ -141,17 +131,14 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 		if (mat && mat->shader)
 			for (const nuke::ShaderProp& sp : mat->shader->props)
 			{
-				// Value from the material INSTANCE's prop map (data only — no engine symbols linked);
-				// unset -> the shader's HLSL default.
-				auto pv = mat->props.find(sp.name);
+				auto pv = mat->props.find(sp.name);   // unset -> the shader's HLSL default
 				const float* v = (pv != mat->props.end()) ? pv->second.data() : sp.def;
 				uint32_t bytes = (uint32_t)sp.components * sizeof(float);
 				if (sp.offset + bytes <= Impl::kMatCBBytes) memcpy(p + sp.offset, v, bytes);
 			}
 	}
 
-	// Dynamic-var binds gated on the pointer actually changing (Diligent rewrites the
-	// descriptor cache on every Set() of a DYNAMIC var — no internal same-object skip).
+	// Gate on the pointer changing: Diligent rewrites the descriptor cache on every DYNAMIC-var Set().
 	auto bindIf = [](IShaderResourceVariable* v, IDeviceObject* o, IDeviceObject*& cached)
 	{ if (v && o && o != cached) { v->Set(o); cached = o; } };
 	ITextureView* whiteSRV = m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
@@ -171,8 +158,7 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	IBuffer* vbs[]    = { g.pos, g.nrm, g.uv };
 	Uint64   offs[]   = { 0, 0, 0 };
 	ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
-	// Pick the blend variant for this material (engine sorts transparent/additive back-to-front).
-	// Wireframe draw mode overrides them all — every mesh renders as lines.
+	// Blend variant for this material; wireframe draw mode overrides them all.
 	IPipelineState* pso = wp.pso;
 	if (m_impl->wireframe && wp.psoWire) pso = wp.psoWire;
 	else if (mat) { if (mat->blendMode == 1 && wp.psoBlend) pso = wp.psoBlend; else if (mat->blendMode == 2 && wp.psoAdd) pso = wp.psoAdd; }
@@ -193,7 +179,7 @@ void NukeDiligent::renderSelectionOutline(Mesh* mesh, const float pos[3], const 
 
 	IDeviceContext* ctx = m_impl->context;
 
-	// --- pass 1: render the selected mesh into the mask RT (alpha = 1 over the object) ---
+	// pass 1: mesh -> mask RT (alpha = 1 over the object)
 	{
 		float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
 		               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
@@ -214,7 +200,7 @@ void NukeDiligent::renderSelectionOutline(Mesh* mesh, const float pos[3], const 
 		ctx->Draw(da);
 	}
 
-	// --- pass 2: fullscreen edge-detect over the mask -> draw the border into the camera RT ---
+	// pass 2: fullscreen edge-detect over the mask -> border into the camera RT
 	{
 		struct EdgeData { float texel[4]; };
 		{
@@ -233,20 +219,17 @@ void NukeDiligent::renderSelectionOutline(Mesh* mesh, const float pos[3], const 
 		ctx->Draw(fs);
 	}
 
-	// RESTORE the camera targets WITH depth: endCamera's gizmo/sprite flushes run after us
-	// and expect the camera depth bound — leaving the depth-less edge binding made every
-	// later draw warn (PSO wants D32, bound DSV = UNKNOWN) and skip depth testing.
+	// Must restore the camera targets WITH depth: endCamera's flushes use D32 PSOs, and a
+	// depth-less binding (DSV = UNKNOWN) makes every later draw mismatch and skip depth testing.
 	ctx->SetRenderTargets(1, &m_impl->curRTV, m_impl->curDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 }
 
-// Fill the world FrameCB (camera pos, ambient, lights, shadow maps/params, sky IBL, reflection probe).
-// Shared by the camera pass and the probe cube-face passes (no duplication).
+// Fill the world FrameCB (camera pos, ambient, lights, shadow params, sky IBL, reflection probe).
+// Shared by the camera pass and the probe cube-face passes.
 void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 {
 	MapHelper<FrameCBData> fb(context, worldFrameCB, MAP_WRITE, MAP_FLAG_DISCARD);
-	// A dead device (removal detected mid-frame) makes Map return null — writing through
-	// it turned a recoverable removal into an editor CRASH. Bail; render() suspends.
-	if (fb == nullptr) return;
+	if (fb == nullptr) return;   // dead device (removal mid-frame): Map returns null
 	memset(fb, 0, sizeof(FrameCBData));
 	fb->camPos[0] = P.x; fb->camPos[1] = P.y; fb->camPos[2] = P.z;
 	fb->ambient[0] = sky.ambient[0]; fb->ambient[1] = sky.ambient[1];
@@ -276,12 +259,8 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 	}
 	for (int s = 0; s < SHADOW_SLOTS; ++s) memcpy(fb->shadowVP + s * 16, &slotVP[s], sizeof(float) * 16);
 	fb->shadowParams[0] = (float)numShadowSlots;
-	// SHADOW BIAS CALIBRATION — clamped to WORLD scale, or a large Shadow Distance silently
-	// eats every short-range shadow: an NDC bias of 0.0015 equals 18 cm of caster-receiver
-	// separation at distance 60 and 1.5 m at 500 — grass could never shadow grass, only tall
-	// objects survived. Effective depth bias is CAPPED at ~3 cm world equivalent (a finer
-	// user value wins — it tightens contact further); the normal-offset floor is half a
-	// shadow texel clamped to [0.5, 3] cm (kills blade acne, keeps 5 cm+ casters shadowing).
+	// Shadow bias in NDC scales with Shadow Distance, so clamp to world units: depth bias capped
+	// at ~3 cm equivalent, normal offset floored at half a shadow texel clamped to [0.5, 3] cm.
 	{
 		const float depthRange = 2.0f * (shadowDistance > 0.5f ? shadowDistance : 0.5f);
 		const float ndcCap     = 0.03f / depthRange;
@@ -315,8 +294,7 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	int w = 0, h = 0;
 	if (cam.target == 0)
 	{
-		// The backbuffer path always renders through an HDR intermediate, then the post pass tonemaps it
-		// into the actual (LDR) swap-chain backbuffer in endCamera.
+		// Backbuffer path renders to an HDR intermediate; endCamera's post pass tonemaps into the swap chain.
 		w = (int)m_impl->swapChain->GetDesc().Width;
 		h = (int)m_impl->swapChain->GetDesc().Height;
 		m_impl->EnsureBackbufferMS(w, h);
@@ -347,10 +325,8 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 
 	IDeviceContext* ctx = m_impl->context;
 	ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	// Clear to the camera's Background colour. Its ALPHA drives transparency on a composited
-	// window: opaque geometry writes alpha 1 over it, a procedural sky fills it opaque, and the
-	// final pass carries the alpha premultiplied so the desktop shows where the background alpha
-	// (and no geometry) is below 1. On an opaque window the alpha is ignored by the final pass.
+	// Clear alpha is carried premultiplied through the final pass — it drives per-pixel
+	// transparency on a composited window (ignored on an opaque one).
 	ctx->ClearRenderTarget(rtv, cam.clear, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	if (dsv)
 		ctx->ClearDepthStencil(dsv, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -366,7 +342,6 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 		m_impl->curProj.m[2][1] += m_impl->curJitterY * 2.0f / (float)h;
 	}
 
-	// PBR lighting buffer for this pass: camera pos + ambient + scene lights (default sun if none).
 	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
 	m_impl->WriteFrameCB(P);
 
@@ -378,8 +353,8 @@ void NukeDiligent::setSky(const NukeSky& s) { m_impl->sky = s; m_impl->toneExpos
 // Halton low-discrepancy sequence (1-based index) — even sub-pixel coverage for the TAA jitter.
 static float Halton(int i, int b) { float f = 1.0f, r = 0.0f; while (i > 0) { f /= b; r += f * (i % b); i /= b; } return r; }
 
-// Enable/disable TAA for the camera about to render. When enabled, advance the jitter (Halton 2,3; ±0.5 px) so the
-// next beginCamera offsets the colour projection. Called by World::Render per camera before the prepass/beginCamera.
+// Enable/disable TAA for the camera about to render; when enabled, advances the sub-pixel
+// jitter (Halton 2,3; ±0.5 px) that the next beginCamera applies to the colour projection.
 void NukeDiligent::setCameraTAA(bool enabled)
 {
 	m_impl->curTAA = enabled;
@@ -423,8 +398,7 @@ void NukeDiligent::Impl::CreateDebugResources()
 	cbd.Usage = USAGE_DYNAMIC; cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(cbd, nullptr, &debugCB);
 
-	// Post-last overlay: LDR targets, single-sample, NO depth (the scene depth is
-	// multisampled and long resolved by this point; gizmos read on top of the image).
+	// Post-last overlay: LDR target, single-sample, no depth (scene depth is already resolved).
 	auto build = [&](TEXTURE_FORMAT fmt, const char* name,
 	                 RefCntAutoPtr<IPipelineState>& pso, RefCntAutoPtr<IShaderResourceBinding>& srb)
 	{
@@ -497,10 +471,8 @@ void NukeDiligent::Impl::DrawDebugLines(bool toBackbuffer)
 	context->Draw(da);
 }
 
-// Depth-tested gizmo lines: drawn while the (MS) scene color+depth are still bound, so the
-// scene geometry occludes them. The PSO is built lazily against the CURRENT SceneFmt()/samples
-// (and rebuilt when MSAA/HDR change — those flip only at the frame boundary). The batch is
-// consumed here: one camera's quiet gizmos never bleed into the next camera's pass.
+// Depth-tested gizmo lines, drawn while the (MS) scene color+depth are still bound. PSO is built
+// lazily against the current SceneFmt()/samples; the batch is consumed (never bleeds to the next camera).
 void NukeDiligent::Impl::DrawDepthDebugLines()
 {
 	std::vector<float> verts;
@@ -527,7 +499,7 @@ void NukeDiligent::Impl::DrawDepthDebugLines()
 		gp.DSVFormat = TEX_FORMAT_D32_FLOAT;
 		gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_LINE_LIST;
 		gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
-		gp.DepthStencilDesc.DepthEnable = True;         // occluded by the scene — the whole point
+		gp.DepthStencilDesc.DepthEnable = True;         // occluded by scene geometry
 		gp.DepthStencilDesc.DepthWriteEnable = False;
 		gp.SmplDesc.Count = samples;                    // matches the bound MS camera targets
 		LayoutElement layout[] = {
@@ -587,8 +559,7 @@ void NukeDiligent::endCamera()
 		ra.Format = m_impl->SceneFmt();
 		m_impl->context->ResolveTextureSubresource(m_impl->curResolveSrc, m_impl->curResolveDst, ra);
 	}
-	// 1.5) Module post hook (the water module's underwater/wetness passes live behind it):
-	// after the resolve, BEFORE the user chain — the hook's output is scene content.
+	// 1.5) Module post hook — after the resolve, BEFORE the user chain: its output is scene content.
 	ITextureView* chainSrc = m_impl->curPostSrc;
 	{
 		const nukediligent::WaterHooks& wh = nukediligent::ActiveWaterHooks();
@@ -662,9 +633,8 @@ void NukeDiligent::endCamera()
 	{
 		m_impl->RunPostPass(chainSrc, m_impl->curPostDst, m_impl->curRTW, m_impl->curRTH, m_impl->curTarget == 0);
 
-		// Debug/gizmo lines LAST, over the final LDR image (target still bound by RunPostPass):
-		// TAA has no velocity for lines and the RT-reflection composite overwrites them -
-		// post-last dodges both. No depth here -> gizmos read on top (X-ray); fine for an editor.
+		// Gizmo lines last, over the final LDR image (target still bound by RunPostPass): TAA has
+		// no velocity for lines and the RT-reflection composite would overwrite them.
 		m_impl->DrawDebugLines(m_impl->curTarget == 0);
 		m_impl->FlushScreenPost(m_impl->curTarget == 0);   // AfterPost screen-space canvas sprites (crisp HUD)
 	}
@@ -681,7 +651,7 @@ void NukeDiligent::getViewProj(float* view16, float* proj16)
 	if (proj16) memcpy(proj16, m_impl->curProj.Data(), 16 * sizeof(float));
 }
 
-// Wind push (7.2): World::Render forwards the CURRENT animated global once per frame.
+// Push the current global wind (direction+strength, params) for this frame.
 void NukeDiligent::setWind(const float dirStrength[4], const float params[4])
 {
 	memcpy(m_impl->windDirStrength, dirStrength, sizeof(m_impl->windDirStrength));
@@ -689,8 +659,7 @@ void NukeDiligent::setWind(const float dirStrength[4], const float params[4])
 	m_impl->UpdateBendCB();   // wind + pushers land in the instanced-VS BendCB once per frame
 }
 
-// Foliage interaction (7.4): world positions that part the blades this frame. Stored here;
-// the CB write rides the per-frame setWind that follows.
+// Store the world positions (xyz + radius) that part foliage this frame; the CB write rides setWind.
 void NukeDiligent::setBendPushers(const float* xyzr, int count)
 {
 	m_impl->bendPusherCount = (!xyzr || count <= 0) ? 0 : (count > 8 ? 8 : count);
@@ -698,8 +667,7 @@ void NukeDiligent::setBendPushers(const float* xyzr, int count)
 		memcpy(m_impl->bendPushers, xyzr, (size_t)m_impl->bendPusherCount * 4 * sizeof(float));
 }
 
-// Foliage bend volumes (7.4): wind zones / force fields / weather as analytic volumes
-// (12 floats each — see irender.h). Stored here; written with the per-frame setWind.
+// Store foliage bend volumes (12 floats each, see irender.h); the CB write rides setWind.
 void NukeDiligent::setBendVolumes(const float* vols, int count)
 {
 	m_impl->bendVolumeCount = (!vols || count <= 0) ? 0 : (count > 16 ? 16 : count);
@@ -707,10 +675,8 @@ void NukeDiligent::setBendVolumes(const float* vols, int count)
 		memcpy(m_impl->bendVolumes, vols, (size_t)m_impl->bendVolumeCount * 12 * sizeof(float));
 }
 
-// BendCB layout (must match the instanced vertex shaders): g_WindV (dir.xyz, gusted
-// strength), g_WindT (x = wind time, y = pusher count, z = volume count), g_WindP
-// (turbAmount, 1/turbScale — world turbulence for the shader's spatial noise), g_Push[8]
-// (xyz, radius), g_Vol[48] (16 volumes x 3 float4).
+// Write BendCB. Layout MUST match the instanced vertex shaders: g_WindV (dir.xyz, strength),
+// g_WindT (time, pusherCount, volCount), g_WindP, g_Push[8] (xyz, radius), g_Vol[16 x 3 float4].
 void NukeDiligent::Impl::UpdateBendCB()
 {
 	if (!bendCB || !context) return;
@@ -750,11 +716,8 @@ void NukeDiligent::updateInstanceBuffer(uint64_t id, const NukeInstanceData* dat
 		m_impl->Trash(ib.buf);   // GPU lifetime rule: never inline-release a live buffer
 		ib.buf.Release();
 		while (ib.capacity < count) ib.capacity = ib.capacity ? ib.capacity * 2 : 64;
-		// USAGE_DEFAULT + UpdateBuffer, NOT dynamic: instance sets can be BIG and persistent
-		// (a foliage layer is easily megabytes). Vulkan dynamic buffers live in the per-frame
-		// dynamic heap — one large scatter upload exhausted it ("Space in dynamic heap is
-		// exhausted" + draws over the never-mapped buffer). Default-heap uploads go through
-		// the staging path and have no such budget.
+		// USAGE_DEFAULT + UpdateBuffer, NOT dynamic: Vulkan dynamic buffers live in the per-frame
+		// dynamic heap, which a multi-megabyte instance set exhausts.
 		BufferDesc bd; bd.Name = "Instance VB"; bd.BindFlags = BIND_VERTEX_BUFFER;
 		bd.Usage = USAGE_DEFAULT;
 		bd.Size = (Uint64)ib.capacity * sizeof(NukeInstanceData);
@@ -774,9 +737,8 @@ void NukeDiligent::destroyInstanceBuffer(uint64_t id)
 	m_impl->instBufs.erase(it);
 }
 
-// One mesh+material, [first, first+count) instances of `instBuf`, ONE draw. Identical material
-// path to renderObject, but the world transform comes from the per-instance attributes: the CB
-// carries VIEW*PROJ in wvp and identity in world (see world.vs.hlsl NUKE_INSTANCED).
+// Draw [first, first+count) instances of `instBuf` with one mesh+material in a single call. The
+// world transform comes from per-instance attributes, so the CB carries VIEW*PROJ and identity world.
 void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count)
 {
 	if (m_impl->worldPipes.empty() || count <= 0) return;
@@ -789,8 +751,7 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	m_impl->statTris += mesh ? (mesh->numVerts / 3) * count : 0;
 	Impl::MeshGPU& g = *gp;
 
-	// worldCB for instanced draws = VP only (identity world) — identical for EVERY instanced
-	// draw of the pass; mapped once per pass and whenever a non-instanced draw overwrote it.
+	// Identical for every instanced draw of the pass: map once, and again if a plain draw overwrote it.
 	if (m_impl->instWorldCBPass != m_impl->passSerial)
 	{
 		struct CBData { float4x4 wvp; float4x4 world; };
@@ -820,8 +781,7 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 		if (mat->em)   emsrv = m_impl->GetTexSRV(mat->em);
 		if (mat->spec) specsrv = m_impl->GetTexSRV(mat->spec);
 	}
-	// Pipeline for this material's shader; a shader WITHOUT an instanced variant falls back to
-	// the default world shader's instanced pipeline (standard PBR shading, logged once).
+	// A shader without an instanced variant falls back to the default world instanced pipeline.
 	uint64_t h = (mat && mat->shader && mat->shader->rendererHandle) ? mat->shader->rendererHandle
 	                                                                  : m_impl->defaultWorldHandle;
 	auto pit = m_impl->worldPipes.find(h);
@@ -889,8 +849,7 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	IPipelineState* pso = wp.psoInst;
 	if (m_impl->wireframe && wp.psoInstWire) pso = wp.psoInstWire;
 	else if (mat) { if (mat->blendMode == 1 && wp.psoInstBlend) pso = wp.psoInstBlend; else if (mat->blendMode == 2 && wp.psoInstAdd) pso = wp.psoInstAdd; }
-	// Consecutive chunks of the same set draw with identical vertex buffers + PSO — bind once.
-	// Any non-instanced scene draw (renderObject, sprites, decals) resets lastInstBind.
+	// Consecutive chunks share vertex buffers + PSO — bind once; any plain draw resets lastInstBind.
 	if (m_impl->lastInstBind.mesh != (const void*)gp || m_impl->lastInstBind.buf != instBuf ||
 	    m_impl->lastInstBind.pso != (void*)pso || m_impl->lastInstBind.pass != m_impl->passSerial)
 	{

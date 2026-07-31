@@ -1,11 +1,10 @@
 #include "NukeDiligentImpl.h"
 #include <cstring>
 
-// Sprite pipeline: unlit textured quads (iRender::drawSprite). Alpha-blended, single texture per
-// draw, depth-tested but no depth write — drawn IN the camera pass (SceneFmt + MSAA) after opaque
-// geometry, so sprites get tonemap/post like everything else. Double-sided (CULL_NONE), so the
-// engine's quad winding is irrelevant. Immediate per-sprite draw (batching is a later optimisation).
+// Sprite pipeline: alpha-blended unlit textured quads, one texture per draw, drawn in the
+// camera pass (SceneFmt + MSAA) with depth test but no depth write.
 
+// Build the unlit, screen and lit sprite PSOs and their SRBs/constant buffers.
 void NukeDiligent::Impl::CreateSpriteResources()
 {
 	spritePSO.Release(); spriteSRB.Release(); spriteCB.Release(); spriteTexVar = nullptr;
@@ -68,8 +67,7 @@ void NukeDiligent::Impl::CreateSpriteResources()
 		if (spriteSRB) spriteDepthVar = spriteSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneDepth");
 	}
 
-	// After-post screen variants: same sprite shaders, but output-format RTV, single-sample, NO depth
-	// (drawn over the final image). One for the RT post texture (RGBA8), one for the backbuffer.
+	// After-post screen variants: same shaders, RTV in the output format, single-sample, no depth.
 	auto buildScreen = [&](TEXTURE_FORMAT fmt, const char* nm, RefCntAutoPtr<IPipelineState>& pso,
 	                       RefCntAutoPtr<IShaderResourceBinding>& srb, IShaderResourceVariable*& tvar)
 	{
@@ -104,8 +102,7 @@ void NukeDiligent::Impl::CreateSpriteResources()
 	TEXTURE_FORMAT bbFmt = swapChain ? swapChain->GetDesc().ColorBufferFormat : TEX_FORMAT_RGBA8_UNORM;
 	buildScreen(bbFmt, "Sprite Screen PSO BB", spriteScreenPSOBB, spriteScreenSRBBB, spriteScreenTexVarBB);
 
-	// LIT variant (drawSpriteRunLit): sprite_lit shaders — diffuse+normal, Lambert from the
-	// shared worldFrameCB, per-batch plane TBN. Same blend/depth/MSAA as the unlit sprite PSO.
+	// Lit variant (drawSpriteRunLit): diffuse+normal Lambert off the shared worldFrameCB.
 	spriteLitPSO.Release(); spriteLitCB.Release(); spriteLitSRBs.clear();
 	std::string lvs = shaderSource("sprite_lit.vs"), lps = shaderSource("sprite_lit.ps");
 	if (!lvs.empty() && !lps.empty() && worldFrameCB)
@@ -146,20 +143,18 @@ void NukeDiligent::Impl::CreateSpriteResources()
 	          << (spriteLitPSO ? " (+lit)" : "") << std::endl;
 }
 
-// Accumulate one quad. The batch flushes when the texture changes (a new run) or at endCamera —
-// so consecutive same-texture sprites collapse to a single draw call.
+// Accumulate one quad; the batch flushes when the texture changes or at endCamera.
 void NukeDiligent::drawSprite(Texture* tex, const float center[3], const float right[3], const float up[3],
                               const float uv[4], const float tint[4])
 {
 	m_impl->lastInstBind.pso = nullptr;   // sprite pipeline replaces the instanced VB/PSO state
 	if (!m_impl->spritePSO || !tex) return;
-	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw (see Impl flag)
+	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw
 	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();   // kind switch: keep paint order
 	if (m_impl->spriteBatchOpen && tex != m_impl->spriteBatchTex) m_impl->FlushSprites();   // texture changed -> new batch
 	m_impl->spriteBatchTex = tex;
 	m_impl->spriteBatchOpen = true;
 
-	// center + half-extent vectors right/up (already scaled + pivoted engine-side); ±1 = full quad.
 	auto push = [&](float sx, float sy, float u, float vv)
 	{
 		std::vector<float>& b = m_impl->spriteBatchVerts;
@@ -174,8 +169,7 @@ void NukeDiligent::drawSprite(Texture* tex, const float center[3], const float r
 	push(-1.f,  1.f, u0, v0); push( 1.f, -1.f, u1, v1); push(-1.f, -1.f, u0, v1);   // TL, BR, BL
 }
 
-// Soft-particle fade distance for SUBSEQUENT sprite runs (7.3 VFX). A change mid-frame
-// flushes the open batch — the parameter is per-run, not per-frame. 0 = off (default).
+// Set the soft-particle fade distance for subsequent sprite runs (0 = off); flushes the open batch.
 void NukeDiligent::setSpriteSoftDepth(float dist)
 {
 	if (dist < 0.f) dist = 0.f;
@@ -184,12 +178,11 @@ void NukeDiligent::setSpriteSoftDepth(float dist)
 	m_impl->spriteSoftDist = dist;
 }
 
-// BULK append (tilemap chunks): pre-baked quads in the batch's exact vertex layout —
-// one memcpy instead of thousands of drawSprite calls. Same per-texture run semantics.
+// Bulk-append pre-baked quads already in the batch vertex layout (9 floats per vertex).
+// tex may be null — untextured runs draw as tinted white quads.
 void NukeDiligent::drawSpriteRun(Texture* tex, const float* verts, int vertCount)
 {
 	m_impl->lastInstBind.pso = nullptr;   // sprite pipeline replaces the instanced VB/PSO state
-	// tex == null is LEGAL here (7.3 VFX: untextured particles draw as tinted white quads).
 	if (!m_impl->spritePSO || !verts || vertCount <= 0) return;
 	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw
 	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();   // kind switch: keep paint order
@@ -200,8 +193,8 @@ void NukeDiligent::drawSpriteRun(Texture* tex, const float* verts, int vertCount
 	b.insert(b.end(), verts, verts + (size_t)vertCount * 9);
 }
 
-// LIT bulk append: same layout, drawn with the normal-mapped Lambert pipeline. Falls back
-// to the unlit run when the lit PSO/normal map is unavailable (backends stay honest).
+// Bulk-append quads drawn with the normal-mapped Lambert pipeline; falls back to the unlit
+// run when the lit PSO or normal map is unavailable.
 void NukeDiligent::drawSpriteRunLit(Texture* tex, Texture* normal, const float* verts, int vertCount,
                                     bool normalFlipY)
 {
@@ -217,17 +210,16 @@ void NukeDiligent::drawSpriteRunLit(Texture* tex, Texture* normal, const float* 
 	b.insert(b.end(), verts, verts + (size_t)vertCount * 9);
 }
 
-// Draw the accumulated batch (one texture) in a single call. Called on a texture change and at
-// endCamera (before the MSAA resolve, while the camera targets are still bound).
+// Draw the accumulated batch (one texture) in a single call. Must run while the camera targets
+// are still bound — i.e. before the MSAA resolve.
 void NukeDiligent::Impl::FlushSprites()
 {
 	if (!spritePSO || spriteBatchVerts.empty()) { spriteBatchVerts.clear(); spriteBatchTex = nullptr; spriteBatchOpen = false; return; }
-	// Outside a camera pass the bound target has no (matching) depth buffer — the sprite PSO needs
-	// D32. Drop the batch instead of spamming D3D12 with format-mismatch draws.
+	// The sprite PSO needs a D32 depth buffer; outside a camera pass the bound target has none.
 	if (!cameraPassActive) { spriteBatchVerts.clear(); spriteBatchTex = nullptr; spriteBatchOpen = false; return; }
 	ITextureView* srv = spriteBatchTex ? GetTexSRV(spriteBatchTex)
 	                                   : (whiteTex ? whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr);
-	// Draw-path diagnostics (NUKE_TM_DIAG=1): a dropped batch is invisible art with no error.
+	// Draw-path diagnostics (NUKE_TM_DIAG=1).
 	static const bool diag = []{ const char* e = std::getenv("NUKE_TM_DIAG"); return e && *e == '1'; }();
 	if (diag)
 	{
@@ -265,8 +257,7 @@ void NukeDiligent::Impl::FlushSprites()
 	}
 	{ MapHelper<float>    mv(context, spriteVB, MAP_WRITE, MAP_FLAG_DISCARD); std::memcpy(mv, spriteBatchVerts.data(), spriteBatchVerts.size() * sizeof(float)); }
 	{
-		// VP + soft-particle params. Soft needs the depth PREPASS (single-sample) — without it
-		// this frame, the fade silently disables (honest: no depth to compare against).
+		// Soft particles need the single-sample depth prepass; without it the fade disables.
 		const bool soft = spriteSoftDist > 0.f && gbufActive && gbufDepthSRV;
 		struct SpriteCBData { float4x4 vp; float soft[4]; float soft2[4]; };
 		MapHelper<SpriteCBData> cb(context, spriteCB, MAP_WRITE, MAP_FLAG_DISCARD);
@@ -292,8 +283,8 @@ void NukeDiligent::Impl::FlushSprites()
 	spriteBatchOpen = false;
 }
 
-// Draw the accumulated LIT batch (one diffuse+normal pair). Plane TBN comes from the first
-// quad's corners (a run shares one plane: TL,TR,BR — T = TL->TR, B = BR->TR ⊥ish, N = T×B).
+// Draw the accumulated lit batch (one diffuse+normal pair); the plane TBN comes from the
+// first quad's corners, since a run shares one plane.
 void NukeDiligent::Impl::FlushSpritesLit()
 {
 	if (spriteLitVerts.empty() || !spriteLitTex) { spriteLitVerts.clear(); spriteLitTex = nullptr; spriteLitNormal = nullptr; return; }
@@ -341,7 +332,7 @@ void NukeDiligent::Impl::FlushSpritesLit()
 		if (cb != nullptr) { cb->vp = curView * curProj; memset(cb->soft, 0, sizeof(cb->soft)); memset(cb->soft2, 0, sizeof(cb->soft2)); }
 	}
 
-	// SRB per (diffuse, normal) pair — MUTABLE vars set once (no dynamic-descriptor churn).
+	// One SRB per (diffuse, normal) pair: MUTABLE vars are set once, avoiding dynamic descriptors.
 	RefCntAutoPtr<IShaderResourceBinding>& srb = spriteLitSRBs[{srv, nsrv}];
 	if (!srb)
 	{
@@ -373,13 +364,13 @@ void NukeDiligent::drawSpriteScreenEx(Texture* tex, const float rect[4], const f
                                       const float uv[4], const float tint[4], int afterPost, int scaleMode)
 {
 	if (!tex) return;
-	if (!m_impl->cameraPassActive) return;   // canvas sprites need the camera targets (see Impl flag)
+	if (!m_impl->cameraPassActive) return;   // canvas sprites need the camera targets bound
 	if (afterPost) m_impl->AppendScreenSprite(m_impl->spriteScrPostVerts, m_impl->spriteScrPostRuns, tex, rect, refSize, uv, tint, scaleMode);
 	else           m_impl->AppendScreenSprite(m_impl->spriteScrPreVerts,  m_impl->spriteScrPreRuns,  tex, rect, refSize, uv, tint, scaleMode);
 }
 
-// Build one NDC quad from a reference-pixel rect (centre + size), mapped to the current target per
-// the canvas scale mode, and append it (+ a per-texture run marker) to a screen batch.
+// Build one NDC quad from a reference-pixel rect (centre + size) per the canvas scale mode and
+// append it, plus a per-texture run marker, to a screen batch.
 void NukeDiligent::Impl::AppendScreenSprite(std::vector<float>& verts, std::vector<SprRun>& runs, Texture* tex,
                                             const float rect[4], const float refSize[2], const float uv[4], const float tint[4],
                                             int scaleMode)
@@ -453,10 +444,10 @@ void NukeDiligent::Impl::FlushScreen(std::vector<float>& verts, std::vector<SprR
 	verts.clear(); runs.clear();
 }
 
-// Before-post screen sprites reuse the in-scene sprite PSO (NDC z=0 => drawn on top of the scene).
+// Draw the before-post screen sprites; they reuse the depth-tested in-scene sprite PSO, so the
+// camera targets must be bound.
 void NukeDiligent::Impl::FlushScreenPre()
 {
-	// Pre-post canvas sprites reuse the depth-tested sprite PSO -> camera targets required.
 	if (!cameraPassActive) { spriteScrPreVerts.clear(); spriteScrPreRuns.clear(); return; }
 	FlushScreen(spriteScrPreVerts, spriteScrPreRuns, spritePSO, spriteSRB, spriteTexVar);
 }

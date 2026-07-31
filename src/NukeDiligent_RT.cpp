@@ -2,7 +2,7 @@
 #include <sstream>
 #include <cctype>
 
-// float/float2/int4/... -> component count (0 = unsupported, skip). Mirrors the engine's MatCB schema parse.
+// HLSL scalar/vector type name -> component count (0 = unsupported).
 static int RTCompsOf(const std::string& t)
 {
 	if (t == "float" || t == "int" || t == "uint" || t == "bool") return 1;
@@ -13,8 +13,7 @@ static int RTCompsOf(const std::string& t)
 }
 
 // Generate a closest-hit shader for a material shader from its MatCB schema + its "<name>.surf.hlsl".
-// Per-field statics are loaded from the per-instance MatCB block (g_MatBytes); the shader's Surface() then
-// runs verbatim (same code as the raster pass) and the harness lights/recurses the result.
+// Returns the HLSL source.
 std::string NukeDiligent::Impl::GenChitSource(const std::string& name, const std::string& ps)
 {
 	std::string decls, loads;
@@ -72,15 +71,12 @@ std::string NukeDiligent::Impl::GenChitSource(const std::string& name, const std
 	  << "  float3 R=reflect(wdir,IN.worldNormal); float3 env=ReflEnv(R,O.roughness), traced=env;\n"
 	  << "  if (p.depth<(uint)g_RTParams.z){ RayDesc ray; ray.Origin=IN.worldPos+IN.worldNormal*0.08+R*0.05; ray.Direction=R; ray.TMin=0.02; ray.TMax=(g_RTParams.y>0.5)?g_RTParams.y:1000.0; RTPayload p2; p2.color=0.0; p2.depth=p.depth+1; TraceRay(g_TLAS,RAY_FLAG_NONE,RT_REFLECT_MASK,0,1,0,ray,p2); traced=p2.color; }\n"
 	  << "  col += SpecFr(IN.worldNormal,IN.viewDir,O.roughness,O.albedo,O.metallic,specM)*lerp(traced,env,O.roughness);\n"
-	  << "  float wT=RTWaterTrans(WorldRayOrigin(),IN.worldPos); p.color=col*wT+RTWaterLook(wdir)*(1.0-wT);\n}\n";   // water crossed by this segment (see rt_common)
+	  << "  float wT=RTWaterTrans(WorldRayOrigin(),IN.worldPos); p.color=col*wT+RTWaterLook(wdir)*(1.0-wT);\n}\n";
 	return s.str();
 }
 
-// Ray tracing foundation (D3D12): BLAS per mesh + a per-frame scene TLAS that the world shader ray-queries.
-// Phase 2A — builds the acceleration structures only (no shader use yet). All gated on rtSupported.
-
-// Get-or-build the bottom-level AS for a mesh, from its (ray-tracing-capable) position buffer. Non-indexed
-// triangle soup (numVerts/3 triangles), matching how renderObject draws. Cached for the mesh's lifetime.
+// Get-or-build the bottom-level AS for a mesh from its position buffer (non-indexed triangle
+// soup, numVerts/3 triangles). Cached for the mesh's lifetime; null if not buildable.
 IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
 {
 	auto it = blasCache.find(mesh);
@@ -119,8 +115,7 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
 	td.VertexValueType      = VT_FLOAT32;
 	td.VertexComponentCount = 3;
 	td.PrimitiveCount       = (Uint32)(gp->numVerts / 3);
-	// Alpha-tested geometry (particle quads) is NON-OPAQUE: rays run the any-hit alpha test /
-	// the shadow queries' candidate loops instead of committing on the raw triangle.
+	// Alpha-tested geometry must be NON-OPAQUE or traversal commits without running the alpha test.
 	td.Flags                = mesh->rtAlphaTested ? RAYTRACING_GEOMETRY_FLAG_NONE : RAYTRACING_GEOMETRY_FLAG_OPAQUE;
 
 	BuildBLASAttribs ba;
@@ -137,16 +132,13 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
 	return blas;
 }
 
-// Empty TLAS bound to g_TLAS whenever there is no scene TLAS (e.g. a scene with no opaque meshes) so the shader
-// resource is always valid; ray queries against it simply miss (fully lit). Built once.
+// Build the empty TLAS bound to g_TLAS when there is no scene TLAS, so the shader resource
+// is always valid; all ray queries against it miss. Built once.
 void NukeDiligent::Impl::EnsureRTFallback()
 {
 	if (fallbackTLAS || !rtSupported) return;
 
-	// EMPTY TLAS (0 instances) — spec-legal, every ray query MISSES by definition. This is
-	// the safest possible fallback: no geometry for traversal to ever touch. The Vulkan
-	// zero-instance crash was a Diligent bug (null upload block for a 0-byte instance
-	// copy) — NUKE-patched in DeviceContextVkImpl::BuildTLAS.
+	// Zero-instance TLAS: requires the NUKE patch in DeviceContextVkImpl::BuildTLAS (null upload block).
 	TopLevelASDesc td; td.Name = "Fallback TLAS"; td.MaxInstanceCount = 1; td.Flags = RAYTRACING_BUILD_AS_PREFER_FAST_TRACE;
 	device->CreateTLAS(td, &fallbackTLAS);
 	if (!fallbackTLAS) return;
@@ -198,7 +190,6 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 	}
 	if (!blas || !mesh->normalArray || mesh->numVerts < 3) return;
 
-	// Register this mesh's normals + uvs + positions in the concatenated buffers (once per unique mesh).
 	uint32_t nrmOff, uvOff, posOff;
 	auto nit = m_impl->meshNrmByteOffset.find(mesh);
 	if (nit == m_impl->meshNrmByteOffset.end())
@@ -217,8 +208,7 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 	}
 	else { nrmOff = nit->second; uvOff = m_impl->meshUVByteOffset[mesh]; posOff = m_impl->meshPosByteOffset[mesh]; }
 
-	// Register a material texture in the bindless map array (shared across all map types). Returns 0xFFFFFFFF when
-	// absent or the table is full. De-duplicated per engine texture so each unique map occupies one slot.
+	// Register a texture in the bindless map array; 0xFFFFFFFF when absent or the table is full.
 	auto slotFor = [&](Texture* t) -> uint32_t {
 		if (!t) return 0xFFFFFFFFu;
 		auto tit = m_impl->matTexSlot.find(t);
@@ -243,16 +233,12 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 
 	TLASBuildInstanceData inst;
 	inst.pBLAS    = blas;
-	// TLAS visibility bits: 0x01 = reflection rays (RT_REFLECT_MASK), 0x02 = direct shadow rays
-	// (world.ps RTShadow traces with mask 0x02 — Cast Shadows OFF makes the instance transparent
-	// to sunlight). Upper bits stay set for future ray kinds.
+	// TLAS visibility bits: 0x01 = reflection rays (RT_REFLECT_MASK), 0x02 = shadow rays; upper bits reserved.
 	inst.Mask     = (Uint8)(0xFC | (inReflections ? 0x01 : 0x00) | (castShadows ? 0x02 : 0x00));
 	inst.Flags    = RAYTRACING_INSTANCE_NONE;
 	inst.CustomId = (Uint32)m_impl->rtInstances.size();   // -> g_Instances index (InstanceID() in the shader)
 	inst.ContributionToHitGroupIndex = TLAS_INSTANCE_OFFSET_AUTO;   // PER_TLAS binding: offset computed by Diligent
 
-	// Per-instance material. albedoMetal/emissiveRough feed the standard PBR hit shader; the full MatCB block
-	// (g_MatBytes) feeds auto-generated per-shader hit shaders (they load their own params from it).
 	Impl::RTInstanceData d{}; d.nrmOffset = nrmOff; d.uvOffset = uvOff; d.posOffset = posOff;
 	d.texIndex = texIdx; d.nrmTexIndex = nrmIdx; d.mrTexIndex = mrIdx; d.aoTexIndex = aoIdx; d.emTexIndex = emIdx; d.specTexIndex = specIdx;
 	d.nrmFlipG = (mat && mat->norm && mat->norm->invertGreen) ? 1u : 0u;   // green convention (OpenGL +Y)
@@ -266,9 +252,6 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 	d.specularFactor = specF;
 	d.albedoMetal[0] = alb[0]; d.albedoMetal[1] = alb[1]; d.albedoMetal[2] = alb[2]; d.albedoMetal[3] = metal;
 	d.emissiveRough[0] = em[0] * emI; d.emissiveRough[1] = em[1] * emI; d.emissiveRough[2] = em[2] * emI; d.emissiveRough[3] = rough;
-	// Dynamic sprite meshes (particles): this frame's per-vertex colors go into the color
-	// pool (rebuilt every frame — beginRTScene clears it); shadow candidates get the quad
-	// footprint + the instance alpha (mat->color.a — the emitter's average alive alpha).
 	d.colOffset = 0xFFFFFFFFu;
 	if (mesh->rtColorArray && mesh->rtDynamic)
 	{
@@ -280,7 +263,7 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 	d.shadowAlpha = alb[3];
 	d.pad0 = 0;
 
-	// MatCB block — same packing as the raster MatCB (NukeDiligent_Scene.cpp): standard fields + custom props.
+	// MatCB block: must match the raster MatCB packing (NukeDiligent_Scene.cpp).
 	d.matByteOffset = (uint32_t)m_impl->allMatCPU.size();
 	m_impl->allMatCPU.resize(m_impl->allMatCPU.size() + Impl::kMatBlock, 0);
 	float* mb = reinterpret_cast<float*>(m_impl->allMatCPU.data() + d.matByteOffset);
@@ -300,8 +283,7 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 
 	m_impl->rtInstShaderGuid.push_back(mat ? mat->shaderGuid : std::string());
 	m_impl->rtInstData.push_back(d);
-	// InstanceMatrix is 3x4 row-major (rotation | translation). Our world matrix is row-vector (v*M), so the
-	// instance row r / col c = world.m[c][r] (transpose of the upper 3x3, translation from row 3).
+	// InstanceMatrix is 3x4 row-major; our world matrix is row-vector (v*M), hence the transpose.
 	for (int r = 0; r < 3; ++r)
 		for (int c = 0; c < 4; ++c)
 			inst.Transform.data[r][c] = world.m[c][r];
@@ -310,9 +292,8 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 	m_impl->rtInstances.push_back(inst);
 }
 
-// Foliage RT bend: run the shared NukeBend compute over every bend mesh seen this frame and
-// REBUILD its BLAS over the bent positions — ray-traced shadows/reflections of vegetation
-// sway exactly like the raster blades (same include, same BendCB, zero drift).
+// Run the NukeBend compute over every bend mesh seen this frame and rebuild its BLAS over
+// the bent positions. Sets blasBentThisFrame.
 void NukeDiligent::Impl::BendRTMeshes()
 {
 	blasBentThisFrame = false;
@@ -364,10 +345,8 @@ void NukeDiligent::Impl::BendRTMeshes()
 	}
 }
 
-// DYNAMIC meshes (particle quads): the engine rewrote the vertex data this frame (version
-// bump -> GetMeshGPU updated the pos buffer in place) — rebuild each mesh's CACHED BLAS over
-// the new positions. Shares blasBentThisFrame so the TLAS refits and the static skip stands
-// down (only sets it, never clears — BendRTMeshes owns the reset).
+// Rebuild the cached BLAS of every mesh whose vertices the engine rewrote this frame.
+// Only sets blasBentThisFrame — BendRTMeshes owns the reset.
 void NukeDiligent::Impl::RebuildDynamicBLAS()
 {
 	if (rtDynMeshes.empty()) return;
@@ -409,12 +388,10 @@ void NukeDiligent::buildRTScene()
 	d->BendRTMeshes();         // sway the foliage BLASes BEFORE the TLAS build/refit
 	d->RebuildDynamicBLAS();   // particle quad BLASes follow this frame's vertex data
 	const Uint32 count = (Uint32)d->rtInstances.size();
-	// Fix up InstanceName pointers (the names vector may have reallocated during accumulation).
+	// Re-point InstanceName: the names vector may have reallocated during accumulation.
 	for (Uint32 i = 0; i < count; ++i) d->rtInstances[i].InstanceName = d->rtInstanceNames[i].c_str();
 
-	// FULL static skip: a byte-identical scene (same BLAS set, transforms, masks, per-instance
-	// data and material blocks) needs NOTHING — keep last frame's TLAS/buffers untouched. This
-	// makes a static world's per-frame RT cost the rays only, not a rebuild.
+	// Static skip: a byte-identical scene keeps last frame's TLAS/buffers untouched.
 	{
 		auto fnv = [](uint64_t h, const void* p, size_t n)
 		{ const unsigned char* b = (const unsigned char*)p; for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; } return h; };
@@ -455,8 +432,7 @@ void NukeDiligent::buildRTScene()
 	}
 	if (!d->tlasScratch || !d->tlasInstanceBuf) { d->rtSceneReady = false; return; }
 
-	// Refit (update) instead of a full rebuild when the topology (instance count + BLAS set) is unchanged — only
-	// transforms moved. A periodic full rebuild keeps the AS quality from degrading. Topology change -> rebuild.
+	// Refit only while the topology (count + BLAS set) holds; periodic full rebuild keeps AS quality.
 	size_t sig = count;
 	for (Uint32 i = 0; i < count; ++i) sig = sig * 1315423911ull + (size_t)d->rtInstances[i].pBLAS;
 	bool refit = !recreated && sig == d->lastTlasSig && (d->tlasFrameCtr % 32 != 0);
@@ -477,7 +453,6 @@ void NukeDiligent::buildRTScene()
 	ba.ScratchBufferTransitionMode  = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
 	d->context->BuildTLAS(ba);
 
-	// Concatenated normals (immutable; rebuilt only when a new mesh appeared).
 	if (d->allNrmDirty && !d->allNrmCPU.empty())
 	{
 		d->Trash(d->rtNrmBuf);
@@ -511,7 +486,6 @@ void NukeDiligent::buildRTScene()
 		}
 		d->allNrmDirty = false;
 	}
-	// Per-instance data (rebuilt each frame; grows capacity as needed).
 	if (!d->rtInstBuf || d->rtInstCapacity < count)
 	{
 		d->Trash(d->rtInstBuf);
@@ -542,9 +516,6 @@ void NukeDiligent::buildRTScene()
 			d->context->UpdateBuffer(d->rtMatBuf, 0, (Uint64)d->allMatCPU.size(), d->allMatCPU.data(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	}
 
-	// Per-frame color pool (dynamic sprite meshes: particle gradients/fade) — RAW buffer,
-	// rebuilt every frame the particles move (their BLAS rebuild already disables the
-	// static skip, so this upload always runs together with fresh instance data).
 	if (!d->rtDynColCPU.empty())
 	{
 		const Uint64 need = (Uint64)d->rtDynColCPU.size() * sizeof(float);
@@ -564,12 +535,8 @@ void NukeDiligent::buildRTScene()
 	d->rtSceneReady = true;
 }
 
-// =================================================================================================
-// RT reflection PIPELINE — real DXR: ray-gen + miss + closest-hit + SBT, native recursion.
-// rt_rgen finds the primary reflector and spawns one reflection ray; rt_rchit reproduces the engine
-// material model at the hit and recurses (mirror-in-mirror) via TraceRay; rt_rmiss = environment.
-// Replaces the inline-RayQuery post pass.
-// =================================================================================================
+// Build the DXR reflection pipeline (ray-gen + miss + closest-hit + any-hit + SBT), including
+// an auto-generated closest-hit per custom material shader. Returns false on failure.
 bool NukeDiligent::Impl::BuildRTPipeline()
 {
 	if (rtPSO && !rtPipelineDirty) return true;
@@ -591,8 +558,7 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 	if (!mk("rt_rgen.hlsl",  SHADER_TYPE_RAY_GEN,         "RT RayGen",     rg))  return false;
 	if (!mk("rt_rmiss.hlsl", SHADER_TYPE_RAY_MISS,        "RT Miss",       rm))  return false;
 	if (!mk("rt_rchit.hlsl", SHADER_TYPE_RAY_CLOSEST_HIT, "RT ClosestHit", rch)) return false;
-	// Any-hit alpha test — shared by EVERY hit group; runs only for non-opaque geometry
-	// (Mesh::rtAlphaTested particle quads), so opaque hits pay nothing.
+	// Any-hit alpha test, shared by every hit group; only runs for non-opaque geometry.
 	if (!mk("rt_ahit.hlsl",  SHADER_TYPE_RAY_ANY_HIT,     "RT AnyHit",     rah)) return false;
 
 	// Auto-generate a closest-hit per material shader that ships a "<name>.surf.hlsl" (codegen from its schema).
@@ -669,8 +635,7 @@ void NukeDiligent::Impl::EnsureRTOutput(int w, int h)
 {
 	if (w <= 0 || h <= 0) return;
 	if (rtOutTex && rtOutW == w && rtOutH == h) return;
-	// Per-size cache: two RTX cameras of different sizes in one frame must not release + recreate a
-	// shared UAV mid-frame (lifetime race + churn) — same pattern as the G-buffer / scratch caches.
+	// Per-size cache: a shared UAV must never be released/recreated mid-frame.
 	const uint64_t key = ((uint64_t)(uint32_t)w << 32) | (uint32_t)h;
 	SizedTexSet& s = rtOutCache[key];
 	if (!s.a)
@@ -689,26 +654,15 @@ void NukeDiligent::Impl::EnsureRTOutput(int w, int h)
 void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params)
 {
 	if (!dstTex || !srcSRV) return;
-	// The chain runner leaves the previous stage's target bound; TraceRays/CopyTexture into a
-	// BOUND render target makes Diligent auto-unbind with an Info nag every frame ("Texture
-	// 'Post Scratch' is currently bound as render target...") — unbind explicitly, silently.
+	// TraceRays/CopyTexture must not target a still-bound render target — unbind first.
 	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 	if (rtPipelineDirty)
 	{
 		BuildRTPipeline();   // a custom shader appeared/changed -> rebuild with its hit group
-		// The FIRST ray-traced frame otherwise lands in ONE giant command list: every BLAS build,
-		// the TLAS, a cold-compiled DXR PSO and TraceRays on top of the whole scene pass. That
-		// single submission intermittently starves the frame waitable ("Timeout elapsed ..." every
-		// frame -> the editor hangs at boot) or trips the TDR (device removed). Submit everything
-		// recorded so far — the GPU starts executing the AS builds while the rest is recorded.
-		context->Flush();
+		context->Flush();    // split the AS builds + cold DXR PSO off the frame's command list (TDR/timeout guard)
 	}
-	// No scene to trace (no opaque meshes) -> pass the chain colour through unchanged.
-	// BlitTexture, NOT CopyTexture: on the FIRST chain stage the source is the SCENE
-	// color (RGBA8 with HDR off) while the destination is the RGBA16F chain scratch —
-	// a cross-format CopyTextureRegion is invalid and poisons the command list (this
-	// exact call was the "Failed to close the command list" crash on opening an EMPTY
-	// world: no meshes -> no RT scene -> this branch).
+	// No scene to trace -> pass the chain colour through. Must be BlitTexture, not CopyTexture:
+	// source and destination formats differ (RGBA8 scene vs RGBA16F scratch).
 	if (!rtPSO || !rtSBT || !rtSceneReady || !tlas)
 	{
 		BlitTexture(srcSRV, dstTex);
@@ -720,19 +674,16 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	{   // RTRefCB: clip->view + view->world + camera + (intensity, maxDist, maxDepth) + water
 		struct CB { float4x4 ip, iv; float4 cam; float4 prm; float4 waterOcc; float4 waterCol; float4 waterAbs; };
 		MapHelper<CB> cb(context, rtRefCB, MAP_WRITE, MAP_FLAG_DISCARD);
-		cb->ip  = curProjNoJitter.Inverse(); cb->iv = curView.Inverse();   // unjittered — matches the unjittered gbuffer depth (TAA jitter must not leak into RT reflections)
+		cb->ip  = curProjNoJitter.Inverse(); cb->iv = curView.Inverse();   // unjittered: must match the gbuffer depth
 		cb->cam = float4(curCamPos[0], curCamPos[1], curCamPos[2], 1.0f);
-		float intensity = rtCfgIntensity;   // GLOBAL settings (Project Settings -> config), not the per-effect chip
+		float intensity = rtCfgIntensity;
 		float maxDist   = rtCfgMaxDist;
 		float maxDepth  = (float)rtCfgBounces;
 		float roughCut  = rtCfgRoughCut;
 		maxDepth = (maxDepth < 1.0f) ? 1.0f : (maxDepth > 7.0f ? 7.0f : maxDepth);   // PSO MaxRecursionDepth = 8
 		if (roughCut < 0.05f) roughCut = 0.05f;
 		cb->prm = float4(intensity, maxDist, maxDepth, roughCut);
-		// Water occlusion for reflections: the gbuffer has no water — reflectors on the far
-		// side of the drawn body's level fade out instead of punching through the surface.
-		// The water module publishes its attenuation state through the native hatch
-		// (SetRTWaterState) — `on` already carries the this-frame freshness.
+		// Water occlusion state, published by the water module via SetRTWaterState.
 		cb->waterOcc = float4(rtWaterOcc[0], rtWaterOcc[1], rtWaterOcc[2], 0.0f);
 		cb->waterCol = float4(rtWaterCol[0], rtWaterCol[1], rtWaterCol[2], 0.0f);
 		cb->waterAbs = float4(rtWaterAbs[0], rtWaterAbs[1], rtWaterAbs[2], rtWaterOcc[2]);
@@ -756,8 +707,8 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	setv("g_AllUV",    rtUVSRV ? rtUVSRV : rtNrmSRV);
 	setv("g_AllPos",   rtPosSRV ? rtPosSRV : rtNrmSRV);
 	setv("g_Instances",rtInstSRV);
-	setv("g_MatBytes", rtMatSRV ? rtMatSRV : rtInstSRV);   // per-instance MatCB blocks (auto-gen chits); rtInstSRV = valid non-null fallback
-	setv("g_DynCol",   rtDynColSRV ? rtDynColSRV : rtNrmSRV);   // per-frame particle colors (fallback = any valid RAW SRV)
+	setv("g_MatBytes", rtMatSRV ? rtMatSRV : rtInstSRV);   // fallback must be a valid non-null SRV
+	setv("g_DynCol",   rtDynColSRV ? rtDynColSRV : rtNrmSRV);   // fallback must be a valid RAW SRV
 	{   // bindless albedo array (re-resolve each frame -> animated textures update)
 		ITextureView* white = whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 		IDeviceObject* arr[Impl::kMaxMatTex];
@@ -770,11 +721,8 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_ANY_HIT,     "g_MatTex")) v->SetArray(arr, 0, kMaxMatTex);
 	}
 
-	// The TLAS is rebuilt every frame -> refresh the SBT's per-instance hit-group mapping each frame. Each
-	// instance routes to its shader's closest-hit (unlit -> its own RT shader; everything else -> standard PBR).
-	// RESET first: the SBT accumulates bindings by instance NAME — when the instance set shrinks (a
-	// MeshRenderer was disabled), a stale entry for a no-longer-existing instance stays behind and
-	// TraceRays asserts "instance to shader mapping is incorrect" (crash on toggling renderers).
+	// The SBT accumulates hit-group bindings by instance name, so it must be reset before
+	// re-binding — stale entries make TraceRays reject the instance-to-shader mapping.
 	rtSBT->ResetHitGroups();
 	for (size_t i = 0; i < rtInstData.size() && i < rtInstanceNames.size(); ++i)
 	{

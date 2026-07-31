@@ -1,12 +1,8 @@
 ﻿#include "NukeDiligentImpl.h"
 #include "../include/NukeDiligentNative.h"
 
-// The NATIVE ESCAPE HATCH (NukeDiligentNative.h): the exported surface a backend-specific
-// companion module (NukeWater) drives its own GPU passes through, plus the GENERIC ortho
-// bottom-depth capture that stayed a renderer capability (it rides the shadow path and any
-// module may capture top-down depth with it — begin/end/fetchWaterBottom on iRender).
-
-// The active renderer's Impl comes from the public static (set by ctor/dtor).
+// Implementation of the native escape hatch (NukeDiligentNative.h) plus the generic ortho
+// bottom-depth capture on iRender. The active Impl comes from the NukeDiligent::nativeImpl static.
 
 namespace nukediligent {
 
@@ -115,10 +111,9 @@ void SetRTWaterState(float level, float on, float fade, const float scatter[3], 
 
 }  // namespace nukediligent
 
-// ---- generic ortho bottom-depth capture (iRender seam; rides the shadow draw path) ----------
-// An ortho top-down DEPTH render over a rect: begin sets curShadowVP + binds the small D32
-// target, the World submits opaque meshes with renderShadowObject, end copies to staging;
-// fetch maps it a few frames later and converts to meters-below-level. One in flight.
+// Ortho top-down depth capture over a rect, riding the shadow draw path: begin binds the D32
+// target, the World submits via renderShadowObject, end copies to staging, fetch maps it a few
+// frames later as meters-below-level. One capture in flight.
 
 static const int   kBottomCapN    = 128;     // must equal WaterBody::kDepthN (the fetch guard)
 static const float kBottomCapNear = 0.1f;
@@ -175,6 +170,8 @@ void NukeDiligent::endWaterBottomPass()
 	Impl* d = m_impl;
 	if (!d->capActive) return;
 	d->capActive = false;
+	// Unbind first: the copy transitions the DSV to COPY_SOURCE, which warns while still bound.
+	d->context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 	CopyTextureAttribs cp(d->capDepth, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
 	                      d->capStaging, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	d->context->CopyTexture(cp);
@@ -204,8 +201,7 @@ bool NukeDiligent::fetchWaterBottom(float* out, int n)
 				const float worldY = d->capEyeY - (kBottomCapNear + z * (kBottomCapFar - kBottomCapNear));
 				d2 = d->capLevel - worldY;
 			}
-			// -40 floor: consumers reuse this capture as raw TERRAIN around the reference —
-			// hills well above it must survive (shore math only eats the shallow band).
+			// -40 floor: consumers reuse this as raw terrain, so hills above the reference must survive.
 			dst[i] = std::max(std::min(d2, 60.0f), -40.0f);
 		}
 	}

@@ -1,10 +1,7 @@
 #include "NukeDiligentImpl.h"
 
-// Screen-space decals: rasterize the decal's box, reconstruct the covered surface from the depth
-// prepass, project the decal texture onto it. Two PSOs (Albedo = alpha blend, Light Projector =
-// additive). Composited into the scene colour AFTER the opaque pass, so it needs gbufDepth (the
-// engine forces the depth prepass when a decal is present). Draws back faces (CULL_FRONT), depth
-// test OFF — the box is only a screen-space bound; the PS decides via the reconstructed depth.
+// Screen-space decals: rasterize the decal box, reconstruct the surface from the depth prepass,
+// project the texture onto it. Two PSOs (alpha blend / additive); requires gbufDepth.
 
 namespace {
 struct DecalCBData

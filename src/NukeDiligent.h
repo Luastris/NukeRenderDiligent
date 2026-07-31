@@ -1,8 +1,6 @@
 #pragma once
 // Diligent-based renderer implementing the engine's abstract iRender interface.
-// Lives in its own DLL (NukeRenderDiligent) and is loaded as a render module.
-// Depends ONLY on the iRender interface (no engine singletons), so the engine
-// core can stay a static library.
+// Own DLL, loaded as a render module; depends only on iRender (no engine singletons).
 
 #include <render/irender.h>
 #include <boost/function.hpp>
@@ -20,9 +18,8 @@ public:
 	~NukeDiligent();
 
 	void setShaderSource(const char* name, const char* source) override;
-	// (The water seams — setWaterParams/drawWaterSurface/ripples/imprints/spills/FLIP — are
-	// gone from this backend: NukeWater drives its passes itself through the native hatch
-	// (include/NukeDiligentNative.h). Only the GENERIC ortho bottom capture stays below.)
+	// Water passes live in NukeWater via the native hatch (include/NukeDiligentNative.h);
+	// only the generic ortho bottom capture remains here.
 	uint64_t createShaderPipeline(const char* name, const char* vs, const char* ps) override;
 	int  init(const WindowDesc& desc) override;
 	int  render() override;
@@ -54,7 +51,7 @@ public:
 	void getCursorPos(double& x, double& y) override;
 	void setCursorMode(int mode) override;
 	int  getCursorMode() override;
-	// GPU instancing (7.1)
+	// GPU instancing
 	uint64_t createInstanceBuffer() override;
 	void     updateInstanceBuffer(uint64_t id, const NukeInstanceData* data, int count) override;
 	void     destroyInstanceBuffer(uint64_t id) override;
@@ -135,7 +132,7 @@ public:
 	void rawMouse(double xpos, double ypos) override;
 	void mouseEnterLeave(int entered) override;
 
-	// Runtime-GUI input seam (2.5): drained queues filled by the GLFW callbacks.
+	// Runtime-GUI input seam: drained queues filled by the GLFW callbacks.
 	int  fetchUIChars(unsigned int* out, int max) override;
 	int  fetchUIKeys(int* keys, int* actions, int* mods, int max) override;
 	void getScrollDelta(double& x, double& y) override;
@@ -154,15 +151,12 @@ public:
 
 public:
 	struct Impl;          // PImpl: keeps Diligent types out of this header
-	// The native escape hatch's access point (NukeDiligent_Native.cpp) — the active
-	// renderer's Impl for the exported API. Set/cleared by the ctor/dtor.
-	static Impl* nativeImpl;
+	static Impl* nativeImpl;   // active renderer's Impl for the native hatch; set/cleared by ctor/dtor
 private:
 	Impl*       m_impl   = nullptr;
 	GLFWwindow* m_window = nullptr;
 	int         m_cursorMode = 0;   // 0 Normal / 1 Hidden / 2 Locked / 3 Confined
-	// Windowed placement remembered when going fullscreen, so returning to windowed restores
-	// a sane position/size (glfwSetWindowMonitor to NULL needs an explicit rect). -1 = unset.
+	// Windowed rect kept across fullscreen (glfwSetWindowMonitor(NULL) needs an explicit rect). -1 = unset.
 	int m_winX = -1, m_winY = -1, m_winW = 0, m_winH = 0;
 	int m_windowMode = 0;   // current applied WindowMode (0/1/2)
 };

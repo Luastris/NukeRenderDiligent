@@ -1,5 +1,5 @@
 #include "NukeDiligentImpl.h"
-#include "RenderDeviceD3D12.h"   // drain the D3D12 debug layer into OUR console (see below)
+#include "RenderDeviceD3D12.h"   // D3D12 debug-layer drain
 #include "SwapChainD3D12.h"      // ISwapChainD3D12::GetDXGISwapChain (bind into DComp)
 #include "SwapChainD3D11.h"
 #include <config.h>              // nuke::WindowMode (window display mode)
@@ -13,16 +13,14 @@
 #include "ShaderSourceFactoryUtils.h"   // memory #include resolver over pushed shader sources
 #include <iterator>              // istreambuf_iterator (cache load)
 
-// NUKE PATCH global (DEFINED in the vendored SwapChainD3DBase.cpp so the Diligent DLLs resolve
-// it too): true => the PRIMARY swap chain is created for DirectComposition (premultiplied
-// alpha) instead of the HWND. Set only around the transparent window's swap-chain creation.
+// NUKE PATCH global, defined in the vendored SwapChainD3DBase.cpp: true => the PRIMARY swap
+// chain is created for DirectComposition (premultiplied alpha) instead of the HWND.
 extern "C" bool g_NukeCompositionSwapChain;
 
 #include "DebugOutput.h"   // Diligent::SetDebugMessageCallback
 
-// Diligent's DEFAULT debug output writes to the console from whatever thread logs — the
-// async shader-compile workers included. Concurrent fwrite on one stream trips the debug
-// CRT ("Inconsistent Stream Count"). Route every Diligent message through one mutex.
+// Serializes Diligent log output: its workers log concurrently and concurrent fwrite on one
+// stream trips the debug CRT.
 static void NukeDiligentLogCallback(Diligent::DEBUG_MESSAGE_SEVERITY sev, const Diligent::Char* msg,
                                     const char* /*func*/, const char* /*file*/, int /*line*/)
 {
@@ -34,13 +32,8 @@ static void NukeDiligentLogCallback(Diligent::DEBUG_MESSAGE_SEVERITY sev, const 
 	std::cout << "Diligent Engine: " << tag << ": " << (msg ? msg : "") << std::endl;
 }
 
-// The D3D12 debug layer reports the ACTUAL invalid operation (what the "Failed to close
-// the command list" / device-removed asserts are symptoms of) — but only into the
-// debugger's output window, which nobody sees on a console run. Drain the info queue
-// into stdout every frame so the console names the real error, not the aftermath.
-// On device removal: print the reason + the DRED breadcrumb trail (the EXACT command
-// list/op the GPU faulted on — command lists execute async, so the CPU-side assert
-// location is meaningless) + the page-fault allocation, once.
+// Prints the device-removal reason plus the DRED breadcrumb trail and page-fault
+// allocation, once per process.
 static void DumpDeviceRemoval(ID3D12Device* d3dDev)
 {
 	const HRESULT reason = d3dDev->GetDeviceRemovedReason();
@@ -56,10 +49,8 @@ static void DumpDeviceRemoval(ID3D12Device* d3dDev)
 		D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
 		if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc)))
 		{
-			// Removals that aren't a classic page fault (e.g. ACCESS_DENIED) often leave every
-			// list either untouched or fully completed — the old mid-list-only filter printed
-			// NOTHING for those ("empty report"). Print one line per list so the state right
-			// before the removal is always visible; mid-list ones are the actual suspects.
+			// One line per list: non-page-fault removals leave lists untouched or complete,
+			// so a mid-list-only filter would print nothing.
 			int lists = 0;
 			for (const D3D12_AUTO_BREADCRUMB_NODE* n = bc.pHeadAutoBreadcrumbNode; n; n = n->pNext)
 			{
@@ -107,7 +98,7 @@ static void DrainD3D12DebugMessages(Diligent::IRenderDevice* dev, bool useD3D12)
 			d3dDev->QueryInterface(__uuidof(ID3D12InfoQueue), (void**)&iq);
 		}
 	}
-	if (d3dDev) DumpDeviceRemoval(d3dDev);   // async GPU faults surface HERE, with breadcrumbs
+	if (d3dDev) DumpDeviceRemoval(d3dDev);   // async GPU faults surface here
 	if (!iq) return;
 	const Diligent::Uint64 n = iq->GetNumStoredMessages();
 	static Diligent::Uint64 seen = 0;
@@ -125,9 +116,7 @@ static void DrainD3D12DebugMessages(Diligent::IRenderDevice* dev, bool useD3D12)
 	}
 	seen = n;
 
-	// DXGI keeps its OWN info queue — swapchain/present errors land THERE, never in the
-	// D3D12 device queue. The "silent" ACCESS_DENIED removals were DXGI naming the guilty
-	// call into a queue nobody read.
+	// DXGI keeps its OWN info queue: swapchain/present errors land there, never in the D3D12 device queue.
 #ifdef _WIN32
 	// DXGI_DEBUG_ALL without dxguid.lib (same GUID, local definition).
 	static const GUID kDxgiDebugAll = { 0xe48ae283, 0xda80, 0x490b, { 0x87, 0xe6, 0x43, 0xe9, 0xa9, 0xcf, 0xda, 0x08 } };
@@ -174,7 +163,7 @@ bool NukeDiligent::Impl::DeviceRemoved()
 	}
 	ID3D12Device* dev = (ID3D12Device*)d3d12DevCache;
 	if (!dev || SUCCEEDED(dev->GetDeviceRemovedReason())) return false;
-	DumpDeviceRemoval(dev);   // prints reason once (+ DRED breadcrumbs when NUKE_GPU_VALIDATION is on)
+	DumpDeviceRemoval(dev);   // prints once
 	return true;
 }
 
@@ -183,8 +172,7 @@ static void glfw_error(int code, const char* desc)
 	fprintf(stderr, "[NukeDiligent] GLFW error %d: %s\n", code, desc);
 }
 
-// GLFW input -> iRender neutral callbacks. The renderer forwards raw input via
-// the interface; whoever set the callbacks (the UI module / editor) interprets it.
+// GLFW input -> iRender neutral callbacks (raw input forwarded; the UI module interprets it).
 static void cb_cursorpos(GLFWwindow* w, double x, double y)
 {
 	auto* self = static_cast<NukeDiligent*>(glfwGetWindowUserPointer(w));
@@ -233,7 +221,6 @@ static void cb_char(GLFWwindow* w, unsigned int cp)
 	if (self->_UIchar) self->_UIchar(cp);
 }
 
-// --- runtime-GUI input seam (2.5) --------------------------------------------------------
 int NukeDiligent::fetchUIChars(unsigned int* out, int max)
 {
 	if (!out || max <= 0) return 0;
@@ -280,10 +267,6 @@ void NukeDiligent::setClipboardText(const char* text)
 	if (m_window && text) glfwSetClipboardString(m_window, text);
 }
 
-// The native escape hatch (NukeDiligentNative.h) reaches the ACTIVE renderer through this —
-// set for the instance's lifetime (one renderer object per process; a backend swap replaces
-// it and the pointer follows). Public static member: file-scope globals can't name the
-// private Impl type.
 NukeDiligent::Impl* NukeDiligent::nativeImpl = nullptr;
 
 NukeDiligent::NukeDiligent() : m_impl(new Impl()) { nativeImpl = m_impl; }
@@ -296,21 +279,16 @@ void NukeDiligent::setShaderSource(const char* name, const char* source)
 	m_impl->RebuildShaderFactory();   // includes must resolve from the pushed set (pak or disk)
 }
 
-// The shader #include resolver over the PUSHED sources — the ONE existing pattern: the engine
-// pushes every shaders/*.hlsl through setShaderSource (loose files in dev, game.nupak entries
-// in a packaged dist), the renderer touches no disk. Every entry resolves both as "<name>" and
-// "<name>.hlsl" (sources are pushed by stem; includes are written as "nukebend.hlsl"/
-// "rt_common.hlsl").
+// Rebuilds the memory #include resolver over the sources pushed via setShaderSource (no disk IO).
+// Every entry resolves both as "<name>" and "<name>.hlsl", since sources are pushed by stem.
 void NukeDiligent::Impl::RebuildShaderFactory()
 {
 	std::vector<MemoryShaderSourceFileInfo> files;
 	std::vector<std::string> hlslNames;                  // backing storage for "<name>.hlsl"
 	files.reserve(shaderSrc.size() * 2);
 	hlslNames.reserve(shaderSrc.size());                 // no realloc: c_str()s must stay valid
-	// Include epoch for the disk shader cache: the cache key hashes the TOP-LEVEL source only,
-	// so an edit to an INCLUDE (nukebend/water_common/rt_common — dot-less names; pass sources
-	// are "name.vs" etc.) silently served STALE bytecode. Fold every include's content into one
-	// hash that CreateShaderCached mixes into each key.
+	// Cache keys hash only the top-level source, so fold every include (dot-less name) into one
+	// hash CreateShaderCached mixes in — otherwise an include edit serves stale bytecode.
 	includeEpoch = 1469598103934665603ull;
 	for (auto& kv : shaderSrc)
 	{
@@ -330,7 +308,6 @@ int NukeDiligent::init(const WindowDesc& desc)
 {
 	int w = desc.w, h = desc.h;
 	cout << "[NukeDiligent]\tinit(" << w << ", " << h << ")" << endl;
-	// Serialize Diligent's log output (async shader-compile workers log concurrently).
 	Diligent::SetDebugMessageCallback(&NukeDiligentLogCallback);
 	if (w <= 0 || h <= 0) { cout << "[NukeDiligent]\tbad size, using 1280x720" << endl; w = 1280; h = 720; }
 
@@ -339,23 +316,18 @@ int NukeDiligent::init(const WindowDesc& desc)
 
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API); // Diligent owns the graphics API
 	glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);     // create hidden; show after the dark title-bar attr is set
-	// Window properties from the neutral WindowDesc (config-driven, see iRender).
 	glfwWindowHint(GLFW_DECORATED, desc.decorated ? GLFW_TRUE : GLFW_FALSE);
 	glfwWindowHint(GLFW_RESIZABLE, desc.resizable ? GLFW_TRUE : GLFW_FALSE);
 	glfwWindowHint(GLFW_FLOATING,  desc.floating  ? GLFW_TRUE : GLFW_FALSE);
 	glfwWindowHint(GLFW_MAXIMIZED, desc.maximized ? GLFW_TRUE : GLFW_FALSE);
 	if (desc.transparent)
-		glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, GLFW_TRUE); // NOTE: true see-through also needs swapchain alpha (DComp) — not yet wired
-	// Always create WINDOWED; a fullscreen mode is applied right after init via applyWindow
-	// (one code path for launch + runtime). Avoids the exclusive-at-create special case.
+		glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, GLFW_TRUE); // see-through also needs swapchain alpha (DComp)
+	// Always create WINDOWED; fullscreen is applied right after init via applyWindow.
 	const char*  title   = (desc.title && desc.title[0]) ? desc.title : "NukeEngine";
 	m_window = glfwCreateWindow(w, h, title, nullptr, nullptr);
 	if (!m_window) { cout << "[NukeDiligent]\tglfwCreateWindow failed" << endl; glfwTerminate(); return 1; }
-	// GLFW window hints are STICKY (process-global). Reset transparency IMMEDIATELY: every window
-	// created later through this GLFW instance (ImGui multi-viewport secondary windows) would
-	// inherit it — and our patched GLFW gives transparent windows WS_EX_NOREDIRECTIONBITMAP, on
-	// which an ordinary HWND swap chain's Present fails with DXGI_ERROR_ACCESS_DENIED and REMOVES
-	// THE DEVICE (the "opening any detached window crashes" bug when the config was transparent).
+	// GLFW hints are sticky/process-global: reset transparency at once, or later windows inherit
+	// WS_EX_NOREDIRECTIONBITMAP (patched GLFW) and an HWND swap chain's Present fails ACCESS_DENIED.
 	glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, GLFW_FALSE);
 
 	glfwSetWindowUserPointer(m_window, this);
@@ -367,9 +339,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 
 	HWND hWnd = glfwGetWin32Window(m_window);
 
-	// Give the OS window the application's own icon (the host .exe's first icon
-	// group) so the editor/game window matches the taskbar/console icon. Generic:
-	// no dependence on a specific resource id, works for any host exe.
+	// Window icon = the host exe's first icon group (no fixed resource id).
 	{
 		wchar_t exePath[MAX_PATH];
 		if (GetModuleFileNameW(nullptr, exePath, MAX_PATH))
@@ -381,8 +351,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 		}
 	}
 
-	// Dark title bar to match the editor's dark theme (no more glowing white bar).
-	// Set while the window is still hidden so the first non-client paint is dark.
+	// Dark title bar — must be set while the window is still hidden (first non-client paint).
 	{
 		BOOL dark = TRUE;
 		HRESULT hr = DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
@@ -394,43 +363,33 @@ int NukeDiligent::init(const WindowDesc& desc)
 
 	m_impl->useD3D12  = (desc.backend == 1);
 	m_impl->useVulkan = (desc.backend == 2);
-	// Per-pixel transparency: the PRIMARY swap chain is built for DirectComposition (see the
-	// vendored SwapChainD3DBase.hpp patch). D3D backends only — Vulkan has no DComp path.
-	// Set the flag around creation only; reset after so secondary (UI viewport) swap chains
-	// stay ordinary opaque HWND chains.
+	// D3D only (vendored SwapChainD3DBase.hpp patch): set around PRIMARY creation only, so
+	// secondary UI-viewport swap chains stay ordinary opaque HWND chains.
 	g_NukeCompositionSwapChain = desc.transparent && !m_impl->useVulkan;
 	Win32NativeWindow Window{ hWnd };
 	SwapChainDesc SCDesc;
-	// Match the World PSO + offscreen render targets (RGBA8_UNORM). Diligent defaults the
-	// backbuffer to *_SRGB, which mismatches the world PSO when rendering straight to the
-	// window (the Player) — "RTV format does not match PSO" spam. Keep one format everywhere.
-	// HDR10 display output (Player): a 10-bit backbuffer carries the PQ-encoded HDR signal. Plain RGBA8 otherwise.
+	// Must match the World PSO + offscreen RTs (Diligent would default the backbuffer to *_SRGB);
+	// HDR10 output needs a 10-bit backbuffer for the PQ-encoded signal.
 	SCDesc.ColorBufferFormat = m_impl->hdrOutput ? TEX_FORMAT_RGB10A2_UNORM : TEX_FORMAT_RGBA8_UNORM;
+	// 3, not Diligent's default 2: Vulkan MAILBOX with 2 images blocks acquire until vblank.
+	SCDesc.BufferCount = 3;
 	IEngineFactory* engFactory = nullptr;
 	if (m_impl->useD3D12)
 	{
 		auto* pFactory = GetEngineFactoryD3D12(); engFactory = pFactory;
 		EngineD3D12CreateInfo EngineCI;
 #ifdef _DEBUG
-		// GPU validation + DRED are OPT-IN even in Debug: the D3D12 validation layer and DRED
-		// auto-breadcrumbs (a marker before/after every command) cost real per-command time and
-		// can HALVE the frame rate. 99% of Debug runs don't need them — enable ONLY when chasing a
-		// device-removed / GPU fault: set env NUKE_GPU_VALIDATION=1 and rerun (no rebuild). Then the
-		// actual invalid op lands in the console (DrainD3D12DebugMessages) instead of a bare fence assert.
+		// Opt-in even in Debug (the validation layer can halve the frame rate): NUKE_GPU_VALIDATION=1.
 		const char* gpuValEnv = std::getenv("NUKE_GPU_VALIDATION");
 		const bool  wantVal = desc.gpuValidation                                   // config/main.json (works for double-click)
 		                   || (gpuValEnv && gpuValEnv[0] && gpuValEnv[0] != '0');   // or the env var (terminal launches)
 		if (wantVal)
 		{
-			// Validation errors (the CAUSE of a device removal) land in THIS log.
 			EngineCI.SetValidationLevel(VALIDATION_LEVEL_1);
 			cout << "[NukeDiligent]\tD3D12 debug layer ENABLED (gpuValidation) — expect lower FPS" << endl;
 		}
-		// DRED is a SEPARATE opt-in (env NUKE_DRED=1): its auto-breadcrumbs instrument EVERY command
-		// list — and instrumented DXR dispatches (TraceRays / AS builds) intermittently wedge the
-		// queue or remove the device with DXGI_ERROR_ACCESS_DENIED on some drivers (seen on RTX 50xx:
-		// random first-RT-frame removals with an EMPTY DRED report and zero validation messages).
-		// Never tie it to gpuValidation — enable it only when hunting an actual GPU fault.
+		// Separate opt-in (NUKE_DRED=1), never tied to gpuValidation: breadcrumb-instrumented DXR
+		// dispatches wedge the queue / remove the device with ACCESS_DENIED on some drivers.
 		const char* dredEnv = std::getenv("NUKE_DRED");
 		if (dredEnv && dredEnv[0] && dredEnv[0] != '0')
 		{
@@ -445,20 +404,13 @@ int NukeDiligent::init(const WindowDesc& desc)
 			cout << "[NukeDiligent]\tDRED ENABLED (NUKE_DRED) — breadcrumb instrumentation on every command list" << endl;
 		}
 #endif
-		// Editor-class descriptor budgets. The UI commits its SRB on every texture switch
-		// (dynamic vars) and the editor renders EXTRA worlds (asset previews) plus one UI
-		// pass per detached OS window — the library defaults overflow on heavy frames
-		// (window restore = RT resizes + full redraw): "Failed to allocate N dynamic
-		// GPU-visible CBV/SRV/UAV descriptors".
-		// NOTE: the SAMPLER heap is capped at 2048 descriptors TOTAL by D3D12 itself —
-		// it can only be REPARTITIONED (static vs dynamic), never grown. We use few
-		// unique static samplers, so give the dynamic side the bigger share.
+		// Editor-class descriptor budgets; the library defaults overflow on heavy frames.
+		// D3D12 caps the SAMPLER heap at 2048 descriptors TOTAL — it can only be repartitioned, never grown.
 		EngineCI.GPUDescriptorHeapDynamicSize[0] = 131072;   // CBV/SRV/UAV (default 8k)
 		EngineCI.GPUDescriptorHeapSize[0]        = 32768;    // static/mutable CBV/SRV/UAV
 		EngineCI.GPUDescriptorHeapSize[1]        = 512;      // static/mutable samplers
 		EngineCI.GPUDescriptorHeapDynamicSize[1] = 1536;     // dynamic samplers (512+1536 = the 2048 cap)
-		// Hull/domain stages (water near-field tessellation). OPTIONAL: consumers check
-		// GetDeviceInfo().Features.Tessellation and fall back to VS paths.
+		// Hull/domain stages (water tessellation); OPTIONAL — consumers check the feature and fall back.
 		EngineCI.Features.Tessellation = DEVICE_FEATURE_STATE_OPTIONAL;
 		pFactory->CreateDeviceAndContextsD3D12(EngineCI, &m_impl->device, &m_impl->context);
 		if (!m_impl->device) { cout << "[NukeDiligent]\tD3D12 device creation failed" << endl; return 1; }
@@ -467,10 +419,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 	}
 	else if (m_impl->useVulkan)
 	{
-		// VULKAN (task #138): same Diligent API surface, no DXGI anywhere — swap chains,
-		// resizes and presents go through the Vulkan WSI, which is the stack every other
-		// engine runs multi-window on. Shaders stay HLSL: Diligent compiles them to
-		// SPIR-V with the vendored glslang (DXC is only used by the D3D12 RT path).
+		// Vulkan WSI path: no DXGI anywhere; HLSL shaders compile to SPIR-V via the vendored glslang.
 		auto* pFactory = GetEngineFactoryVk(); engFactory = pFactory;
 		EngineVkCreateInfo EngineCI;
 #ifdef _DEBUG
@@ -481,21 +430,14 @@ int NukeDiligent::init(const WindowDesc& desc)
 			cout << "[NukeDiligent]\tVulkan validation layers ENABLED (gpuValidation)" << endl;
 		}
 #endif
-		// Editor-class dynamic budgets, mirroring the D3D12 branch: the UI + preview worlds
-		// + host windows burn through per-frame dynamic memory faster than the defaults.
+		// Editor-class dynamic budgets, mirroring the D3D12 branch.
 		EngineCI.DynamicHeapSize = 32u << 20;
-		// BACKGROUND shader compilation: cache-miss shaders compile on a worker pool in
-		// parallel instead of serializing the boot (glslang is the slow part on Vulkan).
 		EngineCI.Features.AsyncShaderCompilation = DEVICE_FEATURE_STATE_OPTIONAL;
-		// Hardware ray tracing (VK_KHR_ray_tracing_pipeline / ray_query): request it —
-		// unlike D3D12, Vulkan device features must be opted into at creation.
+		// Unlike D3D12, Vulkan device features must be opted into at device creation.
 		EngineCI.Features.RayTracing = DEVICE_FEATURE_STATE_OPTIONAL;
-		// Hull/domain stages (water near-field tessellation) — same opt-in rule.
 		EngineCI.Features.Tessellation = DEVICE_FEATURE_STATE_OPTIONAL;
-		// RT shaders are SM6.x HLSL and need DXC (glslang can't parse them). ONE vendored
-		// dxcompiler.dll (the official release) serves both backends — it emits DXIL for
-		// D3D12 and SPIR-V for Vulkan; point Diligent at it instead of its default
-		// "spv_dxcompiler.dll" name so we don't ship the compiler twice.
+		// RT shaders are SM6.x HLSL and need DXC; point Diligent at the one vendored
+		// dxcompiler.dll (emits both DXIL and SPIR-V) instead of its "spv_dxcompiler.dll" default.
 		EngineCI.pDxCompilerPath = "dxcompiler.dll";
 		pFactory->CreateDeviceAndContextsVk(EngineCI, &m_impl->device, &m_impl->context);
 		if (!m_impl->device) { cout << "[NukeDiligent]\tVulkan device creation failed" << endl; return 1; }
@@ -514,8 +456,8 @@ int NukeDiligent::init(const WindowDesc& desc)
 	g_NukeCompositionSwapChain = false;   // primary done — secondary swap chains stay opaque
 	m_impl->transparent = desc.transparent;   // drives the alpha-0 clear + premultiplied final pass
 
-	// Transparent window: bind the composition swap chain into a DirectComposition visual on
-	// the HWND so its per-pixel alpha shows the desktop (the swap chain alone doesn't compose).
+	// Transparent window: the composition swap chain must be bound into a DComp visual on the
+	// HWND — the swap chain alone does not compose.
 	if (desc.transparent && m_impl->useVulkan)
 		cout << "[NukeDiligent]\twindow transparency is D3D-only (DirectComposition) — opaque on Vulkan" << endl;
 	if (desc.transparent && !m_impl->useVulkan)
@@ -560,20 +502,15 @@ int NukeDiligent::init(const WindowDesc& desc)
 		else
 			cout << "[NukeDiligent]\tDComp device creation failed — window opaque" << endl;
 	}
-	// Shader #include resolver: a MEMORY factory over the sources the engine pushed through
-	// setShaderSource (see RebuildShaderFactory) — the renderer does NO file IO for sources.
 	m_impl->RebuildShaderFactory();
 	// Ray tracing: D3D12 (DXR) or Vulkan (VK_KHR_ray_tracing) + a capable GPU/driver.
-	// The whole RT path is Diligent-API (BLAS/TLAS/SBT); shaders compile through DXC —
-	// DXIL on D3D12, SPIR-V on Vulkan (Diligent picks the target per backend).
 	m_impl->rtSupported = desc.rayTracing &&   // config kill switch: window.rayTracing=false forces the raster path
 	                      (m_impl->useD3D12 || m_impl->useVulkan) && m_impl->device &&
 	                      (m_impl->device->GetAdapterInfo().RayTracing.CapFlags & RAY_TRACING_CAP_FLAG_STANDALONE_SHADERS) != 0;
 	cout << "[NukeDiligent]\tbackend=" << (m_impl->useD3D12 ? "D3D12" : m_impl->useVulkan ? "Vulkan" : "D3D11")
 	     << " rayTracing=" << (m_impl->rtSupported ? "yes" : (desc.rayTracing ? "no" : "off (config)")) << endl;
-	// NOTE: the RT fallback TLAS is built at the TOP OF THE FIRST FRAME, not here — on
-	// Vulkan an acceleration-structure build before the frame loop starts deadlocks in
-	// the upload path (a fence with no submission to signal it). See render().
+	// The RT fallback TLAS is built at the top of the first frame, not here: on Vulkan an
+	// AS build before the frame loop deadlocks in the upload path (fence with no submission).
 
 	if (m_impl->hdrOutput && !m_impl->useVulkan)
 		m_impl->SetupHDROutput();   // HDR10 colour space via DXGI — D3D backends only for now
@@ -588,8 +525,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 	cout << "[NukeDiligent]\tdevice=" << m_impl->device.RawPtr()
 	     << " swapChain=" << m_impl->swapChain.RawPtr() << endl;
 
-	// Launch straight into the requested display mode (window created windowed above; the
-	// swap chain follows the framebuffer on the first frame). Same one path as the runtime API.
+	// Launch straight into the requested display mode; the swap chain follows the framebuffer.
 	m_windowMode = (int)WindowMode::Windowed;
 	if (desc.mode != (int)WindowMode::Windowed)
 		applyWindow(desc);
@@ -609,10 +545,8 @@ int NukeDiligent::render()
 	DrainD3D12DebugMessages(m_impl->device, m_impl->useD3D12);   // real validation errors -> console
 #endif
 
-	// A removed device can't run ANY of the frame below — mapping/creating on it just cascades
-	// ("Failed to create dynamic page", "Buffer already mapped" asserts). Suspend rendering
-	// entirely (events still pump, the reason was already printed once) so the process stays
-	// alive and the console keeps the REAL cause on top instead of post-mortem noise.
+	// A removed device can't run any of the frame below: mapping/creating on it only cascades
+	// asserts. Suspend rendering entirely; events still pump.
 	if (m_impl->DeviceRemoved())
 	{
 		static bool said = false;
@@ -620,25 +554,21 @@ int NukeDiligent::render()
 		return 1;
 	}
 
-	// Centralized GPU lifetime: advance the frame clock and free trash old enough that no in-flight
-	// command list or recorded draw data can still reference it.
+	// GPU lifetime: advance the frame clock, free trash no in-flight command list can reference.
 	++m_impl->frameId;
 	m_impl->PurgeTrash();
-	// Secondary-window swap chains: apply queued creations/resizes NOW, before anything is
-	// recorded — doing it mid-frame under load intermittently wedged the queue.
+	// Queued secondary-swap-chain creations/resizes must run BEFORE anything is recorded.
 	m_impl->ApplyPendingViewportOps();
-	// RT fallback TLAS on the FIRST frame (idempotent): building it at init deadlocks
-	// Vulkan's upload path (no frame in flight to signal the wait fence).
+	// RT fallback TLAS on the first frame (idempotent): building it at init deadlocks Vulkan's upload path.
 	if (m_impl->rtSupported && !m_impl->fallbackTLAS) m_impl->EnsureRTFallback();
 
-	// Frame stats: latch the completed frame's counters for getFrameStats, start fresh.
+	// Latch the completed frame's counters for getFrameStats, start fresh.
 	m_impl->statDrawsOut = m_impl->statDraws;
 	m_impl->statTrisOut  = m_impl->statTris;
 	m_impl->statDraws = 0;
 	m_impl->statTris  = 0;
 
-	// Follow the window: resize the swap chain (and report size to the UI via
-	// width/height) when the framebuffer changes. Skip rendering when minimized.
+	// Follow the window: resize the swap chain when the framebuffer changes; skip when minimized.
 	int fbw = 0, fbh = 0;
 	glfwGetFramebufferSize(m_window, &fbw, &fbh);
 	if (fbw <= 0 || fbh <= 0)
@@ -647,18 +577,16 @@ int NukeDiligent::render()
 	{
 		width  = fbw;
 		height = fbh;
-		// D3D12 removes the device if the swap-chain back buffers are still bound or referenced by
-		// in-flight GPU work when Resize() runs — and a resize DRAG fires this every frame. Unbind +
-		// flush + idle first (same as the secondary-viewport path in NukeDiligent_UI.cpp).
+		// D3D12 removes the device if back buffers are still bound or referenced by in-flight work
+		// when Resize() runs: unbind + flush + idle first.
 		m_impl->context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 		m_impl->context->Flush();
 		m_impl->device->IdleGPU();
 		m_impl->swapChain->Resize((Uint32)fbw, (Uint32)fbh);
 	}
 
-	// Apply deferred MSAA / HDR changes here — between frames, after the previous frame's draw was submitted,
-	// so the RT textures the UI referenced are no longer in any pending draw list (rebuilding mid-frame frees
-	// them and crashes renderDrawLists). Both flip RTV/texture formats, so one rebuild covers both.
+	// Deferred MSAA / HDR: apply BETWEEN frames only — rebuilding mid-frame frees RT textures the
+	// UI's pending draw lists still reference. Both flip RTV formats, so one rebuild covers both.
 	if (m_impl->pendingSamples > 0 || m_impl->pendingHDR >= 0)
 	{
 		bool changed = false;
@@ -671,10 +599,6 @@ int NukeDiligent::render()
 		}
 		m_impl->pendingSamples = -1; m_impl->pendingHDR = -1;
 	}
-	// (Debug/gizmo lines are NOT cleared here: the buffer is reset right after the world
-	// passes below. Lines emitted during onRender draw THIS frame; lines emitted later —
-	// the editor UI's foliage brush ring lives in the viewport ImGui code — survive into
-	// the NEXT frame's camera passes. A frame-start clear silently discarded those.)
 	// Deferred shadow-resolution change (rebuilds the shadow maps; never mid-frame).
 	if (m_impl->pendingShadowRes > 0)
 	{
@@ -687,10 +611,8 @@ int NukeDiligent::render()
 		m_impl->pendingShadowRes = 0;
 	}
 
-	// 0) Clear the backbuffer up front. In the editor it's the UI background (the world
-	//    goes to off-screen RTs); in the Player the world renders straight to it, where
-	//    beginCamera(target 0) overwrites this clear. Either way it must NOT be cleared
-	//    again after onRender, or the Player's world-to-backbuffer would be wiped.
+	// 0) Clear the backbuffer up front. It must NOT be cleared again after onRender, or the
+	//    Player's world-rendered-to-backbuffer would be wiped.
 	ITextureView* pRTV = m_impl->swapChain->GetCurrentBackBufferRTV();
 	ITextureView* pDSV = m_impl->swapChain->GetDepthBufferDSV();
 	const float clearColor[] = { 0.10f, 0.12f, 0.16f, 1.0f };
@@ -698,30 +620,25 @@ int NukeDiligent::render()
 	m_impl->context->ClearRenderTarget(pRTV, clearColor, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	m_impl->context->ClearDepthStencil(pDSV, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
-	// 1) World passes. onRender drives World::Render, which calls beginCamera (binds +
-	//    clears the target) and renderObject — to off-screen RTs and/or the backbuffer.
+	// 1) World passes: onRender drives World::Render (beginCamera + renderObject).
 	for (auto& cb : m_impl->onRender) cb();
 
-	// Debug/gizmo lines were consumed by the camera passes above — reset the buffers NOW so
-	// anything emitted from here on (editor UI overlays, e.g. the foliage brush ring) carries
-	// over and draws in the NEXT frame's passes instead of being dropped.
+	// Reset debug/gizmo buffers HERE, not at frame start: lines emitted later (editor UI
+	// overlays) must survive into the next frame's camera passes.
 	{
 		std::lock_guard<std::mutex> lock(m_impl->debugMutex);
 		m_impl->debugVerts.clear();
 		m_impl->debugVertsDepth.clear();
 	}
 
-	// 2) UI pass: rebind the backbuffer WITHOUT clearing (so a world rendered straight to
-	//    it survives) and draw the UI on top.
+	// 2) UI pass: rebind the backbuffer WITHOUT clearing, then draw the UI on top.
 	m_impl->context->SetRenderTargets(1, &pRTV, pDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	for (auto& cb : m_impl->onGUI) cb();
 
 	if (m_impl->DeviceRemoved()) return 1;   // device lost this frame: skip present, keep the app alive
 	m_impl->swapChain->Present(m_impl->vsync ? 1 : 0);   // SyncInterval 1 = vsync, 0 = uncapped
-	// Secondary windows present AFTER the main chain: their draw commands were recorded in
-	// the frame body; presenting them mid-frame (Present flushes) split the stream between
-	// an RT write and its sampling and tripped the debug layer into removing the device.
-	// VULKAN native viewports: present the per-window swapchains after the main present.
+	// Secondary (Vulkan native viewport) swapchains present AFTER the main chain: Present flushes,
+	// and doing it mid-frame splits an RT write from its sampling and removes the device.
 	for (void* h : m_impl->vpPresentQueue)
 	{
 		auto it = m_impl->uiVpSC.find(h);
@@ -729,9 +646,7 @@ int NukeDiligent::render()
 		it->second->Present(0);
 	}
 	m_impl->vpPresentQueue.clear();
-	// D3D detached windows get their pixels via GDI from the offscreen RTs rendered
-	// during the frame (NO secondary swap chains — see uiViewportRender/BlitHostWindows).
-	// After the main Present keeps the readback maps off the frame's critical path.
+	// D3D detached windows get their pixels via GDI from offscreen RTs (no secondary swap chains).
 	m_impl->BlitHostWindows();
 	m_impl->PollShaderSaves();   // persist finished background compiles into the disk cache
 	return 1;
@@ -758,8 +673,8 @@ void NukeDiligent::requestClose()
 	if (m_window) glfwSetWindowShouldClose(m_window, GLFW_TRUE);
 }
 
-// OUR shader-bytecode cache (Vulkan): key the FULL compile inputs, store the SPIR-V.
-// A hit creates the shader from ByteCode — glslang never runs for it.
+// Creates a shader through the on-disk SPIR-V cache (Vulkan only): the key hashes every
+// compile input; a hit creates the shader from bytecode, a miss compiles and queues a save.
 void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader** pp)
 {
 	if (!useVulkan || !ci.Source)   // only source-based shaders on the slow-compile backend
@@ -791,9 +706,7 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 
 	namespace bfs = boost::filesystem;
 	char hex[24]; snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
-	// Cache next to the EXECUTABLE, not the CWD — a shortcut-launched game has an arbitrary
-	// working directory and would otherwise recompile every shader on every run (and litter
-	// config/ folders wherever it was started from).
+	// Cache next to the EXECUTABLE, not the CWD (a shortcut-launched game has an arbitrary CWD).
 	boost::system::error_code dec;
 	bfs::path cacheRoot = boost::dll::program_location(dec).parent_path();
 	if (dec || cacheRoot.empty()) cacheRoot = ".";
@@ -817,9 +730,7 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 		}
 	}
 
-	// Cache miss: compile in the BACKGROUND (worker pool) when the device supports it —
-	// the batch of shaders created around this one compiles in parallel; the PSO helper
-	// waits for readiness, so nothing downstream ever sees a half-compiled shader.
+	// Cache miss: compile in the background when supported; the PSO helper waits for readiness.
 	ShaderCreateInfo cc = ci;
 	if (device->GetDeviceInfo().Features.AsyncShaderCompilation)
 		cc.CompileFlags |= SHADER_COMPILE_FLAG_ASYNCHRONOUS;
@@ -828,8 +739,8 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 		pendingShaderSaves.emplace_back(RefCntAutoPtr<IShader>(*pp), file.string());
 }
 
-// Write finished cache-miss compiles to disk (called once per frame — the bytecode of an
-// async shader only exists after its worker finishes).
+// Writes finished cache-miss compiles to disk; called once per frame, since an async
+// shader's bytecode only exists after its worker finishes.
 void NukeDiligent::Impl::PollShaderSaves()
 {
 	if (pendingShaderSaves.empty()) return;
@@ -866,8 +777,7 @@ void NukeDiligent::deinit()
 		m_impl->device->IdleGPU();
 	}
 	m_impl->PurgeTrash(true);
-	// DirectComposition (transparent window): release visual -> target -> device before the
-	// swap chain they reference.
+	// DComp release order: visual -> target -> device, all before the swap chain they reference.
 	if (m_impl->dcompVisual) { m_impl->dcompVisual->Release(); m_impl->dcompVisual = nullptr; }
 	if (m_impl->dcompTarget) { m_impl->dcompTarget->Release(); m_impl->dcompTarget = nullptr; }
 	if (m_impl->dcompDevice) { m_impl->dcompDevice->Release(); m_impl->dcompDevice = nullptr; }
@@ -880,9 +790,9 @@ void NukeDiligent::deinit()
 
 void NukeDiligent::update() {}
 
+// Renderer + active backend name (editor status bar).
 char* NukeDiligent::getEngine()
 {
-	// Shown in the editor status bar: renderer + the ACTIVE backend.
 	if (m_impl->useVulkan) return (char*)"Diligent - Vulkan";
 	if (m_impl->useD3D12)  return (char*)"Diligent - D3D12";
 	return (char*)"Diligent - D3D11";
@@ -904,15 +814,15 @@ bool NukeDiligent::isWindowFocused() { return m_window && glfwGetWindowAttrib(m_
 bool NukeDiligent::isWindowMaximized() { return m_window && glfwGetWindowAttrib(m_window, GLFW_MAXIMIZED) != 0; }
 void NukeDiligent::setWindowMaximized(bool m) { if (!m_window) return; if (m) glfwMaximizeWindow(m_window); else glfwRestoreWindow(m_window); }
 
-// Runtime window change (Game.Set* -> iRender::applyWindow). The swap chain follows the new
-// framebuffer size in the render loop (glfwGetFramebufferSize), so we only drive the WINDOW.
+// Applies a runtime window change (mode/size/decoration/opacity). Only the WINDOW is driven —
+// the swap chain follows the new framebuffer size in the render loop.
 void NukeDiligent::applyWindow(const WindowDesc& d)
 {
 	if (!m_window) return;
 	GLFWmonitor* mon = glfwGetPrimaryMonitor();
 	const GLFWvidmode* vm = mon ? glfwGetVideoMode(mon) : nullptr;
 
-	// Leaving windowed: remember the current windowed rect so a later return restores it.
+	// Leaving windowed: remember the rect so a later return restores it.
 	if (m_windowMode == (int)WindowMode::Windowed && d.mode != (int)WindowMode::Windowed)
 		glfwGetWindowPos(m_window, &m_winX, &m_winY), glfwGetWindowSize(m_window, &m_winW, &m_winH);
 
@@ -927,7 +837,7 @@ void NukeDiligent::applyWindow(const WindowDesc& d)
 	}
 	else if (d.mode == (int)WindowMode::BorderlessFullscreen)
 	{
-		// Undecorated window covering the monitor at the DESKTOP resolution (no mode switch).
+		// Undecorated window over the monitor at desktop resolution (no mode switch).
 		int mx = 0, my = 0; if (mon) glfwGetMonitorPos(mon, &mx, &my);
 		glfwSetWindowAttrib(m_window, GLFW_DECORATED, GLFW_FALSE);
 		glfwSetWindowMonitor(m_window, nullptr, mx, my,
@@ -964,8 +874,7 @@ void NukeDiligent::setCursorMode(int mode)
 		default: break;
 	}
 	glfwSetInputMode(m_window, GLFW_CURSOR, glfwMode);
-	// Locked mode: raw motion kills the OS cursor acceleration on the deltas (when the
-	// platform supports it) — the standard FPS-camera configuration.
+	// Locked mode: raw motion drops the OS cursor acceleration from the deltas.
 	if (glfwRawMouseMotionSupported())
 		glfwSetInputMode(m_window, GLFW_RAW_MOUSE_MOTION, mode == 2 ? GLFW_TRUE : GLFW_FALSE);
 	m_cursorMode = mode;
@@ -973,7 +882,7 @@ void NukeDiligent::setCursorMode(int mode)
 int NukeDiligent::getCursorMode() { return m_cursorMode; }
 bool NukeDiligent::isMouseButtonDown(int b) { return m_window && glfwGetMouseButton(m_window, b) == GLFW_PRESS; }
 
-// Desktop/Explorer file-drop -> editor import. One renderer instance, so a file-static callback is fine.
+// Desktop file-drop -> editor import (one renderer instance, so a file-static callback is fine).
 static bst::function<void(const char*)> g_onFileDrop;
 static void GlfwDropCB(GLFWwindow*, int count, const char** paths)
 {

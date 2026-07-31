@@ -2,27 +2,13 @@
 #ifndef NUKEDILIGENT_NATIVE_H
 #define NUKEDILIGENT_NATIVE_H
 
-// ---------------------------------------------------------------------------------------------
-// The NATIVE ESCAPE HATCH of the Diligent renderer: a narrow exported API for modules that
-// CHOOSE to be backend-specific and drive their own GPU passes (the water module). This is the
-// companion-module pattern (NukeTilemapEditor -> NukeTilemap): the client includes this header
-// (plus the vendored DiligentCore headers) and links NukeRenderDiligent's import library.
-//
-// WHAT LIVES HERE ON PURPOSE (generic renderer capabilities, not water):
-//   - the per-camera/per-frame state snapshot (device, targets, matrices, engine resources)
-//   - the disk-cached shader/PSO factories (includeEpoch-aware — setShaderSource keys them)
-//   - the GPU lifetime manager (Trash) and batch flushing around raw pass work
-//   - pipeline hook points (camera begin / post-resolve) for module-owned passes
-//   - the RT volume-attenuation input (tiny POD the ray shaders consume)
-// Everything ELSE about water — sims, draws, post — lives in NukeWater.
-//
-// Threading: every call is MAIN-THREAD only (the render thread), same as iRender draws.
-// ---------------------------------------------------------------------------------------------
+// Native escape hatch of the Diligent renderer: a narrow exported API for backend-specific
+// modules that drive their own GPU passes. Link NukeRenderDiligent's import library.
+// All calls are main-thread (render thread) only.
 
 #include <cstdint>
 
-// Bare Diligent interface includes — the consumer adds the DiligentCore interface dirs to
-// its include path (see NukeWater/CMakeLists.txt for the canonical list).
+// The consumer must add the DiligentCore interface dirs to its include path.
 #include "RenderDevice.h"
 #include "DeviceContext.h"
 #include "PipelineState.h"
@@ -38,9 +24,8 @@ namespace nuke { struct NukeLight; }
 
 namespace nukediligent {
 
-// Per-call state snapshot. Pointers are owned by the renderer and valid for the CURRENT
-// frame/camera only — never cache them across frames (the device pointer is the exception:
-// cache it to DETECT renderer swaps and rebuild your resources).
+// Per-call state snapshot. Renderer-owned pointers, valid for the current frame/camera only —
+// never cache them (except `device`, cached to detect a renderer swap).
 struct Frame
 {
 	Diligent::IRenderDevice*  device = nullptr;
@@ -86,37 +71,33 @@ struct Frame
 // Fill `out` with the current state. Returns false before init / after shutdown.
 NUKEDLG_API bool GetFrame(Frame& out);
 
-// A pushed shader source by name (setShaderSource map: engine loose shaders + every module's
-// pushes). Modules with their own embed tables use this as the fallback for SHARED shaders
-// (the fullscreen post.vs and friends). Returns false when the name is unknown.
+// Look up a pushed shader source by name (engine loose shaders + module pushes); the fallback
+// for shared shaders such as post.vs. Returns false when the name is unknown.
 NUKEDLG_API bool GetShaderSource(const char* name, std::string& out);
 
-// Disk-cached shader compilation (the cache keys on source + includeEpoch, so setShaderSource
-// pushes invalidate dependents correctly). Same helpers the renderer uses internally.
+// Disk-cached shader/PSO compilation. Cache keys on source + includeEpoch, so setShaderSource
+// pushes invalidate dependents.
 NUKEDLG_API void CreateShaderCached(Diligent::ShaderCreateInfo& sci, Diligent::IShader** out);
 NUKEDLG_API void CreateGraphicsPSOCached(Diligent::GraphicsPipelineStateCreateInfo& ci,
                                          Diligent::IPipelineState** out);
 
-// GPU lifetime manager: NEVER Release() a live device object inline — hand it here (deferred
-// destruction after the GPU is done with it).
+// Deferred destruction. Never Release() a live device object inline — hand it here.
 NUKEDLG_API void Trash(Diligent::IDeviceObject* obj);
 
-// Flush the renderer's pending sprite batches (call BEFORE unbinding the camera targets for
-// raw compute/offscreen work mid-pass — pending batches belong to the pre-water scene).
+// Flush pending sprite batches. Call before unbinding the camera targets for raw
+// compute/offscreen work mid-pass.
 NUKEDLG_API void FlushBatches();
 
-// Stats + state-cache poke: report `tris` drawn by a module pass and invalidate the
-// renderer's instancing bind cache (call after raw SetPipelineState/Draw work).
+// Report `tris` drawn by a module pass and invalidate the instancing bind cache; call after
+// raw SetPipelineState/Draw work.
 NUKEDLG_API void NoteDraw(int tris);
 
-// Post scratch RTV (HDR, single-sample, screen-sized): index 0/1 ping-pong shared with the
-// post chain — valid for module passes that run INSIDE the hook points below.
+// Post scratch RTV (HDR, single-sample, screen-sized), index 0/1 ping-pong shared with the post
+// chain. Only valid for module passes running inside the hook points below.
 NUKEDLG_API Diligent::ITextureView* GetPostScratchRTV(int idx, int w, int h);
 
-// Pipeline hook points. `user` is passed back verbatim. Pass null to unregister.
-//   onCameraBegin: start of every camera pass (reset per-camera module state).
-//   onCameraPost:  after the MSAA resolve, before the user post chain — return a replacement
-//                  scene SRV (your pass output) or null to leave the scene untouched.
+// Pipeline hook points; `user` is passed back verbatim. onCameraBegin runs at the start of every
+// camera pass; onCameraPost runs after the MSAA resolve and returns a replacement scene SRV or null.
 struct WaterHooks
 {
 	void* user = nullptr;
@@ -125,8 +106,8 @@ struct WaterHooks
 };
 NUKEDLG_API void SetWaterHooks(const WaterHooks* hooks);
 
-// RT volume attenuation input (the ray shaders swallow radiance crossing a water surface):
-// level = world Y, on = 0/1 this frame, fade = 1/opacityDepth, scatter/absorb per channel.
+// RT volume attenuation input consumed by the ray shaders: level = world Y, on = 0/1 this
+// frame, fade = 1/opacityDepth, scatter/absorb per channel.
 NUKEDLG_API void SetRTWaterState(float level, float on, float fade,
                                  const float scatter[3], const float absorb[3]);
 

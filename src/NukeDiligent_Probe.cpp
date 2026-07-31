@@ -1,13 +1,12 @@
 #include "NukeDiligentImpl.h"
 
 
-// (Re)create a probe cube's GPU resources at the CURRENT scene format (SceneFmt) so capture into it matches
-// the geometry PSOs' RTV format. Rebuild-safe (releases prior objects -> no Diligent overwrite assert).
+// (Re)create a probe cube's GPU resources at the current scene format, so capture matches the
+// geometry PSOs' RTV format. Rebuild-safe.
 void NukeDiligent::Impl::BuildCube(CubeRT& c, int res)
 {
 	res = res < 16 ? 16 : (res > 1024 ? 1024 : res);
-	// A rebuild (HDR toggle / res change) can land mid-frame while the world PSOs still sample the old
-	// cube SRV — park everything first (centralized lifetime rule).
+	// A rebuild can land mid-frame while world PSOs still sample the old cube SRV — park, never Release inline.
 	Trash(c.color); Trash(c.depth); Trash(c.dsv); Trash(c.msColor); Trash(c.msDepth);
 	for (auto& v : c.faceRTV) Trash(v);
 	c.color.Release(); c.depth.Release(); c.dsv.Release(); c.msColor.Release(); c.msDepth.Release();
@@ -35,9 +34,8 @@ void NukeDiligent::Impl::BuildCube(CubeRT& c, int res)
 	device->CreateTexture(dd, nullptr, &c.depth);
 	if (c.depth) c.dsv = c.depth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
 
-	// MSAA intermediates: the geometry/sky PSOs are MSAA-only when MSAA is on — capture
-	// renders here and RESOLVES into the cube face (single-sample direct rendering with an
-	// MSAA PSO device-losts Vulkan).
+	// MSAA intermediates: capture renders here and resolves into the cube face — an MSAA PSO
+	// drawing straight into the single-sample face RTV is a Vulkan device-lost.
 	if (samples > 1)
 	{
 		TextureDesc md; md.Name = "Probe MS color"; md.Type = RESOURCE_DIM_TEX_2D;
@@ -82,9 +80,7 @@ void NukeDiligent::beginCubeFace(uint64_t cube, int face, const float pos[3], fl
 	m_impl->curView = float4x4(R.x,U.x,F.x,0, R.y,U.y,F.y,0, R.z,U.z,F.z,0, -dot(P,R),-dot(P,U),-dot(P,F),1);
 	m_impl->curProj = float4x4::Projection(1.5707963f, 1.0f, nearZ, farZ, false);   // 90deg, square
 	m_impl->curCamPos[0] = P.x; m_impl->curCamPos[1] = P.y; m_impl->curCamPos[2] = P.z;
-	// MSAA on: sky/world PSOs are MULTISAMPLED — render the face into the MS intermediate
-	// and resolve into the cube slice in endCubeFace. Rendering an MSAA PSO into the
-	// single-sample face RTV is a Vulkan render-pass incompatibility (DEVICE_LOST).
+	// MSAA on: render into the MS intermediate, resolved into the cube slice by endCubeFace.
 	const bool ms = c.msColor && c.msDepth;
 	ITextureView* rtv = ms ? c.msColor->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET) : c.faceRTV[face].RawPtr();
 	ITextureView* dsv = ms ? c.msDepth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL) : c.dsv.RawPtr();
@@ -108,7 +104,6 @@ void NukeDiligent::endCubeFace(uint64_t cube, int face)
 	auto it = m_impl->cubes.find(cube);
 	if (it == m_impl->cubes.end() || face < 0 || face > 5) return;
 	Impl::CubeRT& c = it->second;
-	// MSAA capture: resolve the multisampled face into this cube slice.
 	if (c.msColor && c.color)
 	{
 		ResolveTextureSubresourceAttribs ra;

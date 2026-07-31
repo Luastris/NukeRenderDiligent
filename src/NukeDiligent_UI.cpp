@@ -1,9 +1,8 @@
 #include "NukeDiligentImpl.h"
 
 
-// Per-texture SRB (MUTABLE variable, set ONCE at creation): committing it costs no
-// dynamic GPU descriptors, unlike a DYNAMIC variable which allocated fresh ones on
-// every CommitShaderResources — dozens per frame per window, bleeding the heap dry.
+// Get-or-create the cached SRB for a UI texture view. The texture is a MUTABLE variable set
+// once at creation, so committing it allocates no dynamic GPU descriptors.
 IShaderResourceBinding* NukeDiligent::Impl::UISRBFor(ITextureView* view)
 {
 	UISRBEntry& e = uiSRBCache[view];
@@ -18,9 +17,7 @@ IShaderResourceBinding* NukeDiligent::Impl::UISRBFor(ITextureView* view)
 	return e.srb;
 }
 
-// Shared UI draw body: upload the lists, then draw them into the given target.
-// Used by renderDrawLists (main window / bound RT) and uiViewportRender (a detached
-// OS window's own swap chain).
+// Upload the UI draw lists and draw them into the given render target view.
 void NukeDiligent::Impl::DrawUILists(ITextureView* uirtv, Uint32 surfW, Uint32 surfH, const NukeUIDrawData& data)
 {
 	if (!uiPSO || !uirtv || data.listCount == 0) return;
@@ -35,7 +32,7 @@ void NukeDiligent::Impl::DrawUILists(ITextureView* uirtv, Uint32 surfW, Uint32 s
 
 	if (!uiVB || uiVBSize < totalVtx)
 	{
-		Trash(uiVB);   // grows MID-FRAME (main window drew, a bigger secondary window follows)
+		Trash(uiVB);   // may grow mid-frame; never release inline
 		uiVB.Release();
 		while (uiVBSize < totalVtx) uiVBSize = uiVBSize ? uiVBSize * 2 : 4096;
 		BufferDesc bd;
@@ -131,9 +128,7 @@ void NukeDiligent::Impl::DrawUILists(ITextureView* uirtv, Uint32 surfW, Uint32 s
 		globalVtx += l.vtxCount;
 	}
 
-	// LRU purge: drop SRBs of textures not drawn for a while (resized RTs leave stale
-	// views behind — the SRB's strong ref must not keep them alive forever). Parked, not
-	// freed inline (centralized lifetime rule).
+	// LRU purge: an SRB's strong ref would otherwise keep stale views of resized RTs alive.
 	if ((uiFrame & 511) == 0)
 		for (auto it = uiSRBCache.begin(); it != uiSRBCache.end(); )
 		{
@@ -144,8 +139,6 @@ void NukeDiligent::Impl::DrawUILists(ITextureView* uirtv, Uint32 surfW, Uint32 s
 
 void NukeDiligent::renderDrawLists(const NukeUIDrawData& data)
 {
-	// Target: an explicit RT (bindRenderTarget -> runtime UI into the viewport/camera RT) or the
-	// backbuffer (editor UI). No clear — the UI composites over whatever's already there.
 	ITextureView* uirtv = m_impl->uiRTV ? m_impl->uiRTV : m_impl->swapChain->GetCurrentBackBufferRTV();
 	const Uint32 surfW = (m_impl->uiRTV && m_impl->uiTW) ? m_impl->uiTW : m_impl->swapChain->GetDesc().Width;
 	const Uint32 surfH = (m_impl->uiRTV && m_impl->uiTH) ? m_impl->uiTH : m_impl->swapChain->GetDesc().Height;
@@ -159,16 +152,14 @@ void* NukeDiligent::nativeWindow()
 	return m_window;
 }
 
-// Applied at the TOP of render(), before anything is recorded: create queued swap chains and
-// resize mismatched ones. Never mid-frame — see the Impl field comment.
+// Create queued secondary swap chains and resize mismatched ones. MUST run at the top of
+// render(), before anything is recorded — never mid-frame.
 void NukeDiligent::Impl::ApplyPendingViewportOps()
 {
-	++uiVpFrameNo;   // multi-window interleave clock (uiViewportRender) — ticks EVERY frame
+	++uiVpFrameNo;   // multi-window interleave clock; ticks every frame
 	if (uiVpPending.empty() || !device) return;
-	// AT MOST ONE heavy DXGI op (secondary-chain create/resize) per frame: opening several
-	// detached windows in the same frame (e.g. session restore) created chains back-to-back
-	// and DXGI answered with ACCESS_DENIED device removal. Skipped windows simply re-queue
-	// through uiViewportRender's size-mismatch check next frame.
+	// At most ONE swap-chain create/resize per frame: back-to-back DXGI ops return ACCESS_DENIED
+	// device removal. Skipped windows re-queue next frame.
 	bool heavyOpDone = false;
 	for (auto& kv : uiVpPending)
 	{
@@ -176,12 +167,9 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 		void* handle = kv.first;
 		const int w = kv.second.first, h = kv.second.second;
 		if (w < 8 || h < 8) continue;
-		// imgui DESTROYS/RECREATES platform windows (viewport merge, DPI) — a queued op can
-		// outlive its HWND, and any DXGI call on a dead window is ACCESS_DENIED + device
-		// removal. Validate first; purge state for windows that are gone.
+		// A queued op can outlive its HWND; any DXGI call on a dead window is ACCESS_DENIED + device removal.
 		if (!::IsWindow((HWND)handle)) { uiVpSC.erase(handle); uiVpStable.erase(handle); continue; }
-		// A failed creation must NOT retry every frame (repeated DXGI failures escalate to
-		// device removal) — cool down before trying that window again.
+		// Cool down after a failed creation: repeated DXGI failures escalate to device removal.
 		{
 			auto cd = uiVpCooldown.find(handle);
 			if (cd != uiVpCooldown.end())
@@ -190,25 +178,19 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 				uiVpCooldown.erase(cd);
 			}
 		}
-		// Experiment gate (NUKE_VP_NORESIZE=1): never resize secondary chains — present
-		// stretched forever. Used to isolate the ACCESS_DENIED device removal to the
-		// secondary-resize path.
+		// NUKE_VP_NORESIZE=1: never resize secondary chains, present stretched instead.
 		static const bool noResize = []{ const char* e = std::getenv("NUKE_VP_NORESIZE"); return e && *e == '1'; }();
 		RefCntAutoPtr<ISwapChain>& sc = uiVpSC[handle];
 		if (sc && noResize) continue;
 		if (!sc)
 		{
-			// Same color format as the main swap chain (the UI PSO was built for it);
-			// no depth — the UI never depth-tests.
+			// Color format must match the main swap chain — the UI PSO was built for it. No depth.
 			SwapChainDesc scd;
 			scd.ColorBufferFormat = swapChain->GetDesc().ColorBufferFormat;
 			scd.DepthBufferFormat = TEX_FORMAT_UNKNOWN;
 			scd.Width = (Uint32)w; scd.Height = (Uint32)h;
-			// THE ROOT of two weeks of "device removed" asserts: SwapChainDesc defaults to
-			// IsPrimary = true, and a PRIMARY swap chain's Present() runs FinishFrame() +
-			// ReleaseStaleResources() — with a secondary window open that happened TWICE per
-			// frame, corrupting the frame-resource lifetime bookkeeping. Secondary windows
-			// are NOT primary.
+			// Secondary chains must NOT be primary: a primary Present() runs FinishFrame() +
+			// ReleaseStaleResources(), which must happen exactly once per frame.
 			scd.IsPrimary = False;
 			Win32NativeWindow win{ handle };
 			if (useVulkan)
@@ -220,27 +202,18 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 			std::cout << "[NukeDiligent]	vp chain CREATE " << handle << " " << w << "x" << h
 			          << (sc ? " ok" : " FAILED") << std::endl;
 			if (!sc) { uiVpSC.erase(handle); uiVpCooldown[handle] = 120; }   // back off ~2s, don't hammer DXGI
-			// GRACE: skip this window's draw+present for a few frames — imgui is still
-			// adjusting the freshly created OS window (pos/style/DPI), and presenting into
-			// it mid-adjustment races DXGI into ACCESS_DENIED (the open-time flake).
-			else uiVpGrace[handle] = 3;
+			else uiVpGrace[handle] = 3;   // skip draw+present while imgui still adjusts the new OS window
 			heavyOpDone = true;
 		}
 		else if ((int)sc->GetDesc().Width != w || (int)sc->GetDesc().Height != h)
 		{
-			// DEBOUNCED (see uiVpStable): a live drag asks for a new size every frame, and a
-			// per-frame recreate/resize storm starves the main swap chain's frame-latency
-			// wait. Act only after the size holds still for a few frames.
+			// Debounced: a per-frame resize storm during a live drag starves the main swap chain's latency wait.
 			auto& st = uiVpStable[handle];
 			if (st.first.first != w || st.first.second != h) { st.first = { w, h }; st.second = 1; continue; }
 			if (++st.second < 5) continue;   // ~5 frames unchanged = the drag settled
 			st.second = 0;
-			// RESIZE via Diligent's own path: SwapChainD3D12::Resize internally unbinds the
-			// back buffers from the framebuffer, clears its RTVs, idles the GPU and resizes
-			// (or recreates) the DXGI chain — the ONE sequence DXGI accepts. Recreating the
-			// whole ISwapChain from the factory instead leaves the old chain's deferred
-			// buffers alive on the HWND and CreateSwapChainForHwnd dies with ACCESS_DENIED
-			// (device removal) — the failure mode this replaced.
+			// Must resize via ISwapChain::Resize (unbinds back buffers, idles the GPU, resizes the
+			// DXGI chain); recreating the chain from the factory instead fails with ACCESS_DENIED.
 			context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 			std::cout << "[NukeDiligent]	vp chain RESIZE " << handle << " " << sc->GetDesc().Width << "x"
 			          << sc->GetDesc().Height << " -> " << w << "x" << h << std::endl;
@@ -253,11 +226,8 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 	uiVpPending.clear();
 }
 
-// A detached window's frame: render its UI into an OFFSCREEN texture and copy it to a
-// staging ring; the pixels reach the window via GDI AFTER the main present
-// (Impl::BlitHostWindows). NO swap chain is ever created for the window, so the whole
-// class of secondary-swapchain DXGI races (create/resize/present vs a heavy frame -
-// a month of ACCESS_DENIED device removals) is gone BY CONSTRUCTION.
+// Render a detached window's UI into an offscreen texture and copy it to a staging ring;
+// BlitHostWindows pushes the pixels to the window via GDI after the main present.
 void NukeDiligent::uiViewportRender(void* nativeHandle, int w, int h, const NukeUIDrawData& data)
 {
 	if (!nativeHandle || w < 8 || h < 8 || !m_impl->device) return;
@@ -266,8 +236,6 @@ void NukeDiligent::uiViewportRender(void* nativeHandle, int w, int h, const Nuke
 	Impl::HostBlit& hb = m_impl->uiHostBlits[nativeHandle];
 	if (!hb.rt || hb.w != w || hb.h != h)
 	{
-		// Plain textures: a resize is create-new/park-old through the central GPU trash -
-		// no DXGI, no debounce, no grace frames.
 		if (hb.rt) m_impl->Trash(hb.rt);
 		hb.rt.Release();
 		for (auto& s : hb.staging) { if (s) m_impl->Trash(s); s.Release(); }
@@ -309,9 +277,8 @@ void NukeDiligent::uiViewportRender(void* nativeHandle, int w, int h, const Nuke
 	m_impl->uiHostBlitQueue.push_back(nativeHandle);
 }
 
-// VULKAN native viewports: render this window's UI into ITS OWN swapchain. Creation and
-// resizes are deferred to the next frame's top (ApplyPendingViewportOps) with the same
-// debounce/grace defenses; the present is queued after the main present.
+// Vulkan native viewports: render a window's UI into its own swapchain. Creation/resize is
+// deferred to ApplyPendingViewportOps; the present is queued after the main present.
 void NukeDiligent::Impl::ViewportRenderSwapchain(void* nativeHandle, int w, int h, const NukeUIDrawData& data)
 {
 	auto it = uiVpSC.find(nativeHandle);
@@ -338,8 +305,8 @@ void NukeDiligent::Impl::ViewportRenderSwapchain(void* nativeHandle, int w, int 
 	vpPresentQueue.push_back(nativeHandle);     // presented AFTER the main Present
 }
 
-// After the main Present: map the freshest GPU-COMPLETED staging of each host window
-// (DO_NOT_WAIT - never stalls the frame) and push the pixels to the window with GDI.
+// Map the freshest GPU-completed staging of each host window and push its pixels via GDI.
+// Must run after the main Present; maps with DO_NOT_WAIT so it never stalls the frame.
 void NukeDiligent::Impl::BlitHostWindows()
 {
 	if (uiHostBlitQueue.empty()) return;
@@ -349,8 +316,7 @@ void NukeDiligent::Impl::BlitHostWindows()
 		if (it == uiHostBlits.end()) continue;
 		HostBlit& hb = it->second;
 
-		// Newest-first, fall back to older ring slots - whichever the GPU has finished.
-		// Nothing ready = the window keeps last frame's image.
+		// Newest-first over the ring; nothing ready = the window keeps last frame's image.
 		int mappedSlot = -1;
 		MappedTextureSubresource msr{};
 		for (int back = 0; back < 3 && mappedSlot < 0; ++back)
@@ -403,7 +369,6 @@ void NukeDiligent::Impl::BlitHostWindows()
 }
 void NukeDiligent::uiViewportDestroy(void* nativeHandle)
 {
-	// GDI-blit host resources (the current host path): park textures in the GPU trash.
 	{
 		auto hb = m_impl->uiHostBlits.find(nativeHandle);
 		if (hb != m_impl->uiHostBlits.end())
@@ -415,11 +380,7 @@ void NukeDiligent::uiViewportDestroy(void* nativeHandle)
 	}
 	auto it = m_impl->uiVpSC.find(nativeHandle);
 	if (it == m_impl->uiVpSC.end()) return;
-	// The GPU may still be reading this swap chain's back buffers (frames in flight) —
-	// PARK the swap chain in the centralized GPU trash instead of a mid-frame IdleGPU:
-	// it stays alive for kTrashFrames, by which point every present that referenced it
-	// has completed. NOTE imgui also RECREATES platform windows on viewport merge/DPI
-	// changes, not just on user close.
+	// Park the swap chain in the GPU trash — the GPU may still be reading its back buffers.
 	std::cout << "[NukeDiligent]	vp chain DESTROY " << nativeHandle << std::endl;
 	m_impl->Trash(it->second);
 	m_impl->uiVpSC.erase(it);
@@ -434,11 +395,8 @@ void NukeDiligent::getFrameStats(int& drawCalls, int& triangles)
 	triangles = m_impl->statTrisOut;
 }
 
-// ---- Plugin export (boost::dll, unified plugin model) ----
-// An ordinary NUKEModule exported as "plugin", like every other plugin. What makes it a
-// renderer is metadata: provides()="render" + phase()=PHASE_BOOT. The loader enables it
-// during bootstrap and registers queryService() (the iRender*) in the service registry;
-// the host then grabs it via GetService<iRender>() and drives init/window itself.
+// Plugin export: a NUKEModule whose provides()="render" + phase()=PHASE_BOOT make the loader
+// register queryService() (the iRender*) in the service registry during bootstrap.
 class NukeDiligentModule : public NUKEModule
 {
 public:
@@ -464,9 +422,7 @@ public:
 	void Settings() override {}
 	void Shutdown() override
 	{
-		// Full renderer teardown lives HERE (not in the host): the loader revoked the
-		// "render" service already, and UnloadModules shuts boot providers down LAST,
-		// after every runtime plugin that might still touch the renderer is gone.
+		// Teardown belongs here: boot providers are unloaded last, after every plugin that could touch the renderer.
 		if (renderer) renderer->deinit();
 		delete renderer;
 		renderer = nullptr;

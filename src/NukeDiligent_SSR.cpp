@@ -1,8 +1,8 @@
 #include "NukeDiligentImpl.h"
 
 
-// G-buffer targets for the SSR prepass: RGBA16F colour (octN.xy, rough, metal) + D32 depth, both 1x (single
-// sample) and shader-readable. Resized to the current camera target.
+// Make the G-buffer set for w*h current: RGBA16F (octN.xy, rough, metal) + velocity + object id
+// + D32 depth, all single-sample and shader-readable. Sets are cached per size.
 void NukeDiligent::Impl::EnsureGBuffer(int w, int h)
 {
 	if (w <= 0 || h <= 0) return;
@@ -12,8 +12,7 @@ void NukeDiligent::Impl::EnsureGBuffer(int w, int h)
 	auto it = gbufCache.find(key);
 	if (it == gbufCache.end())
 	{
-		// Miss: build a fresh set for this size. Nothing is released — other sizes stay
-		// cached, so no in-use buffer is freed mid-frame (that was the device-removed race).
+		// Build a fresh set; never release the other sizes here — freeing an in-use buffer mid-frame removes the device.
 		GBufferSet s;
 		TextureDesc cd; cd.Name = "GBuffer"; cd.Type = RESOURCE_DIM_TEX_2D; cd.Width = (Uint32)w; cd.Height = (Uint32)h;
 		cd.Format = TEX_FORMAT_RGBA16_FLOAT; cd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
@@ -25,9 +24,7 @@ void NukeDiligent::Impl::EnsureGBuffer(int w, int h)
 		device->CreateTexture(vd, nullptr, &s.vel);
 		if (s.vel) { s.velRTV = s.vel->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); s.velSRV = s.vel->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
 
-		// Generic per-OBJECT id: one flat value per draw (pivot hash, written by gbuffer.vs).
-		// The G-buffer carries NO effect semantics — consumers (musicvis note tint; outlines /
-		// per-object masks later) derive their own meaning from the id.
+		// Generic per-object id: one flat value per draw (pivot hash from gbuffer.vs); consumers assign it meaning.
 		TextureDesc nd; nd.Name = "GBuffer ObjectId"; nd.Type = RESOURCE_DIM_TEX_2D; nd.Width = (Uint32)w; nd.Height = (Uint32)h;
 		nd.Format = TEX_FORMAT_R8_UNORM; nd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
 		device->CreateTexture(nd, nullptr, &s.objId);
@@ -45,7 +42,6 @@ void NukeDiligent::Impl::EnsureGBuffer(int w, int h)
 	set.lastUsed = ++gbufFrameCtr;
 	gbufCurKey = key;
 
-	// Repoint the live members at the active set — consumers (SSR/RT/Post) read these fields.
 	gbufColor = set.color;  gbufDepth = set.depth;  gbufVel = set.vel;  gbufObjId = set.objId;
 	gbufRTV = set.rtv; gbufSRV = set.srv; gbufDSV = set.dsv; gbufDepthSRV = set.depthSRV;
 	gbufVelRTV = set.velRTV; gbufVelSRV = set.velSRV;
@@ -55,9 +51,7 @@ void NukeDiligent::Impl::EnsureGBuffer(int w, int h)
 	EvictGBufferCache();
 }
 
-// Bound the cache (main size + preview size + a little slack for drag-resize transients).
-// Eviction only drops the RefCntAutoPtrs; Diligent frees the underlying D3D12 memory after
-// the frame fence, so evicting a size used a frame ago is safe. The active set is never evicted.
+// Drop least-recently-used G-buffer sets down to a fixed cap. The active set is never evicted.
 void NukeDiligent::Impl::EvictGBufferCache()
 {
 	const size_t CAP = 4;
@@ -70,16 +64,15 @@ void NukeDiligent::Impl::EvictGBufferCache()
 			if (kv.second.lastUsed < lru) { lru = kv.second.lastUsed; lruKey = kv.first; found = true; }
 		}
 		if (!found) break;
-		// Route the eviction through the trash: under a drag-resize an evicted size can have been
-		// used only a frame or two ago, and its SRVs may still sit in recorded draw data.
+		// Evict via the trash: an evicted size's SRVs may still sit in recorded draw data.
 		auto it = gbufCache.find(lruKey);
 		Trash(it->second.color); Trash(it->second.depth); Trash(it->second.vel); Trash(it->second.objId);
 		gbufCache.erase(it);
 	}
 }
 
-// G-buffer prepass pipeline: world.vs (shares worldCB) + gbuffer.ps (shares worldMatCB). Single-sample, depth
-// write on; outputs the packed surface buffer. Rebuild-safe.
+// Build the G-buffer prepass PSOs (plain + instanced). Single-sample, depth write on.
+// Returns true when the plain PSO is ready.
 bool NukeDiligent::Impl::BuildGBufferPipe()
 {
 	gbufPSO.Release(); gbufSRB.Release(); gbufMRVar = nullptr;
@@ -125,8 +118,8 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	gbufMRVar  = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
 	gbufNrmVar = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
 
-	// INSTANCED twin (7.1): per-instance world rows; the CB then carries the current and
-	// previous camera view*proj only (gbuffer.vs.hlsl NUKE_INSTANCED — camera-only velocity).
+	// Instanced twin: per-instance world rows; the CB carries current + previous camera view*proj
+	// only, so instanced velocity is camera-only (gbuffer.vs.hlsl NUKE_INSTANCED).
 	gbufPSOInst.Release(); gbufSRBInst.Release(); gbufMRVarInst = nullptr; gbufNrmVarInst = nullptr;
 	{
 		const std::string vsI = "#define NUKE_INSTANCED 1\n" + vsSrc;
@@ -155,7 +148,7 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 				if (auto* m = gbufPSOInst->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB")) m->Set(worldMatCB);
 				if (auto* b = gbufPSOInst->GetStaticVariableByName(SHADER_TYPE_VERTEX, "BendCB")) b->Set(bendCB);   // depth/velocity must bend like the lit pass (7.4)
 				gbufPSOInst->CreateShaderResourceBinding(&gbufSRBInst, true);
-				// VULKAN: cbuffers may reflect MUTABLE — bind BendCB via the SRB too (7.4)
+				// Vulkan: cbuffers may reflect MUTABLE — bind BendCB via the SRB too.
 				if (auto* b = gbufSRBInst->GetVariableByName(SHADER_TYPE_VERTEX, "BendCB")) b->Set(bendCB);
 				gbufMRVarInst  = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
 				gbufNrmVarInst = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
@@ -165,15 +158,14 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	return true;
 }
 
-// Screen-space reflections pass: ray-march the prepass G-buffer/depth, blend onto the chain colour. Falls back
-// to a passthrough (handled by the caller) when no prepass ran.
+// Screen-space reflections: ray-march the prepass G-buffer/depth from srcSRV into dstRTV.
 void NukeDiligent::Impl::RunSSR(PostPipe& pp, ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, const std::vector<float>& params)
 {
 	{
 		struct SSRData { float4x4 view, proj, invProj, invView; float res[4]; };
 		MapHelper<SSRData> cb(context, ssrCB, MAP_WRITE, MAP_FLAG_DISCARD);
-		cb->view = curView; cb->proj = curProjNoJitter; cb->invProj = curProjNoJitter.Inverse();   // unjittered — matches the unjittered gbuffer depth (TAA jitter must not leak into SSR)
-		cb->invView = curView.Inverse();   // view -> WORLD (musicvis reconstructs world positions for its note hash)
+		cb->view = curView; cb->proj = curProjNoJitter; cb->invProj = curProjNoJitter.Inverse();   // unjittered: must match the gbuffer depth
+		cb->invView = curView.Inverse();   // view -> world
 		cb->res[0] = (float)w; cb->res[1] = (float)h; cb->res[2] = w ? 1.0f / w : 0.0f; cb->res[3] = h ? 1.0f / h : 0.0f;
 	}
 	{
@@ -187,21 +179,19 @@ void NukeDiligent::Impl::RunSSR(PostPipe& pp, ITextureView* srcSRV, ITextureView
 	if (pp.srcVar)   pp.srcVar->Set(srcSRV);
 	if (pp.gbufVar)  pp.gbufVar->Set(gbufSRV);
 	if (pp.depthVar) pp.depthVar->Set(gbufDepthSRV);
-	if (pp.objIdVar && gbufObjIdSRV) pp.objIdVar->Set(gbufObjIdSRV);   // musicvis: generic per-object id
+	if (pp.objIdVar && gbufObjIdSRV) pp.objIdVar->Set(gbufObjIdSRV);
 	context->SetPipelineState(pp.pso);
 	context->CommitShaderResources(pp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
 	context->Draw(da);
 }
 
-// Temporal AA resolve: reproject the per-camera history by the current (unjittered) depth + prev view/proj, clamp
-// to the local colour neighbourhood, blend, and copy the result back into the history for next frame.
+// Temporal AA resolve: reproject the per-camera history, neighbourhood-clamp, blend into dstTex,
+// then copy the result back into the history for next frame.
 void NukeDiligent::Impl::RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params)
 {
 	TAAState& st = taaStates[curTarget];
-	// The history must MATCH the resolve target's format (it is COPIED from dstTex each
-	// frame; a cross-format CopyTextureRegion is invalid in D3D12) — the target can be
-	// RGBA8 (scene, HDR off) or RGBA16F (chain scratch), so follow it, don't hardcode.
+	// History format must follow dstTex: it is copied from it, and cross-format CopyTexture is invalid in D3D12.
 	const TEXTURE_FORMAT histFmt = dstTex->GetDesc().Format;
 	if (!st.hist || st.w != w || st.h != h || st.hist->GetDesc().Format != histFmt)
 	{
@@ -240,8 +230,7 @@ void NukeDiligent::Impl::RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* ds
 	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
 	context->Draw(da);
 
-	// Copy the resolved result into the history for next frame; remember this frame's (unjittered) view/proj.
-	// dstTex is still bound as the render target — unbind explicitly or Diligent nags every frame.
+	// Unbind before the copy: dstTex is still bound as the render target.
 	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 	CopyTextureAttribs cp; cp.pSrcTexture = dstTex; cp.pDstTexture = st.hist;
 	cp.SrcTextureTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
@@ -250,7 +239,7 @@ void NukeDiligent::Impl::RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* ds
 	st.prevView = curView; st.prevProj = curProjNoJitter; st.valid = true;
 }
 
-// --- SSR G-buffer prepass (single-sample): normal/roughness/metalness + depth, before the colour pass --------
+// Begin the single-sample G-buffer prepass (normal/roughness/metalness + depth) for `cam`.
 void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 {
 	++m_impl->passSerial;   // invalidate the per-draw redundancy gates (this pass maps the shared CBs itself)
@@ -260,10 +249,10 @@ void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 	if (!m_impl->CameraSize(cam, w, h)) return;
 	m_impl->EnsureGBuffer(w, h);
 	if (!m_impl->gbufRTV || !m_impl->gbufDSV) return;
-	m_impl->curTarget = cam.target;   // TAA per-camera state (taaStates[curTarget]) keyed correctly during the prepass
+	m_impl->curTarget = cam.target;   // keys the per-camera TAA state during the prepass
 	m_impl->SetCameraViewProj(cam, w, h);
 	IDeviceContext* ctx = m_impl->context;
-	ITextureView* rtvs[3] = { m_impl->gbufRTV, m_impl->gbufVelRTV, m_impl->gbufObjIdRTV };   // MRT: gbuffer + velocity + object id
+	ITextureView* rtvs[3] = { m_impl->gbufRTV, m_impl->gbufVelRTV, m_impl->gbufObjIdRTV };
 	Uint32 nrt = 1;
 	if (m_impl->gbufVelRTV)  nrt = 2;
 	if (m_impl->gbufVelRTV && m_impl->gbufObjIdRTV) nrt = 3;   // slots must be contiguous (PSO declares 3)
@@ -284,7 +273,7 @@ void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float po
 	if (!m_impl->gbufActive || !m_impl->gbufPSO) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
-	++m_impl->statDraws;                              // frame stats (status bar)
+	++m_impl->statDraws;
 	m_impl->statTris += mesh ? mesh->numVerts / 3 : 0;
 	Impl::MeshGPU& g = *gp;
 
@@ -293,8 +282,7 @@ void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float po
 	};
 	float4x4 world = build(pos, quat, scale);
 	float4x4 wvp   = world * m_impl->curView * m_impl->curProj;   // prepass is UNjittered
-	// Previous-frame clip: prev object transform * previous camera (from this camera's TAA state). Falls back to
-	// the current transforms (zero velocity) when there's no prev transform / no history yet.
+	// Previous-frame clip = prev object transform * previous camera; falls back to current (zero velocity).
 	Impl::TAAState& tst = m_impl->taaStates[m_impl->curTarget];
 	float4x4 prevWorld = (prevPos && prevQuat && prevScale) ? build(prevPos, prevQuat, prevScale) : world;
 	float4x4 prevWVP   = tst.valid ? (prevWorld * tst.prevView * tst.prevProj) : wvp;
@@ -327,9 +315,8 @@ void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float po
 	ctx->Draw(da);
 }
 
-// Instanced g-buffer draw (7.1): [first, first+count) of `instBuf` into the prepass. The CB
-// carries the CURRENT and PREVIOUS camera view*proj only — instance velocity is camera-only
-// (static instances get exact motion vectors; per-instance previous transforms are not stored).
+// Draw [first, first+count) of `instBuf` into the prepass. The CB carries current + previous
+// camera view*proj only, so instance velocity is camera-only.
 void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count)
 {
 	if (!m_impl->gbufActive || !m_impl->gbufPSOInst || count <= 0) return;

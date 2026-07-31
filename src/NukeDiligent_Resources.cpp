@@ -1,7 +1,7 @@
 #include "NukeDiligentImpl.h"
 
 
-// ---- centralized GPU-resource lifetime manager (see the header block for THE rule) ----------------
+// Centralized GPU-resource lifetime manager: park objects here, never Release() them inline.
 void NukeDiligent::Impl::Trash(IObject* o)
 {
 	if (!o) return;
@@ -43,9 +43,7 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 	if (!t) return nullptr;
 	if (t->renderTexture)   // sample a RenderTexture = the camera's render-target color view
 	{
-		// Feedback guard: never sample the RT we're currently rendering INTO (an object that displays the
-		// RT, caught in that camera's own view, would bind it as SRV while it's the RTV -> Diligent drops
-		// the render target and the whole pass renders nothing but the clear color).
+		// Feedback guard: binding the RT we render into as an SRV makes Diligent drop the render target.
 		if (t->rtId != 0 && t->rtId == curTarget) return nullptr;
 		auto rit = rts.find(t->rtId);
 		return rit != rts.end() ? rit->second.srv : nullptr;
@@ -118,10 +116,7 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 			TextureData data; data.pSubResources = &sub; data.NumSubresources = 1;
 			device->CreateTexture(td, &data, &tex);
 		}
-		// NEVER cache a failed upload. A transient CreateTexture failure (e.g. GPU-memory pressure while a
-		// huge inspector preview is resident) would otherwise blank this texture PERMANENTLY on every
-		// consumer until the editor restarts. Return null now and retry next frame — the cache only ever
-		// holds a live SRV, so a valid texture always self-heals.
+		// Never cache a failed upload: the cache must only ever hold a live SRV, so it self-heals on retry.
 		if (!tex)
 		{
 			std::cout << "[NukeDiligent]\tGetTexSRV upload FAILED (" << t->width << "x" << t->height
@@ -174,9 +169,8 @@ NukeDiligent::Impl::RT NukeDiligent::Impl::MakeRT(int w, int h)
 	return rt;
 }
 
-// (Re)create the HDR intermediate used when a camera renders to target 0 (the Player's backbuffer path):
-// geometry -> this HDR target (MS if enabled) -> resolve -> HDR single -> post pass -> the swap-chain backbuffer.
-// Reuses MakeRT (its unused `post` LDR texture is harmless; the post pass writes the real backbuffer instead).
+// (Re)create the HDR intermediate for cameras rendering to target 0: geometry -> HDR target
+// (MS if enabled) -> resolve -> post pass -> swap-chain backbuffer.
 void NukeDiligent::Impl::EnsureBackbufferMS(int w, int h)
 {
 	if (w <= 0 || h <= 0) return;
@@ -197,9 +191,7 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 			          << mesh->numVerts << ") — skipping" << std::endl;
 			return nullptr;
 		}
-		// Build (and cache) GPU vertex buffers for this mesh: positions + normals + uv.
-		// DEFAULT usage (not immutable): dynamic meshes (skinned instances, procedural)
-		// re-upload in place below when Mesh::version changes.
+		// USAGE_DEFAULT, not immutable: dynamic meshes re-upload in place when Mesh::version changes.
 		MeshGPU g; g.numVerts = mesh->numVerts; g.version = mesh->version;
 		const Uint64 sz3 = (Uint64)mesh->numVerts * 3 * sizeof(float);
 		const Uint64 sz2 = (Uint64)mesh->numVerts * 2 * sizeof(float);
@@ -212,9 +204,8 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 		const float* uvSrc = mesh->uvArray;
 		if (!uvSrc) { zeroUV.assign((size_t)mesh->numVerts * 2, 0.0f); uvSrc = zeroUV.data(); }   // mesh has no UVs
 		bd.Size = sz2; bd.Name = "mesh uv"; BufferData udat{uvSrc, sz2}; device->CreateBuffer(bd, &udat, &g.uv);
-		// RT wind bend (Mesh::rtBendArray, foliage merged chunks): compute inputs + the BENT
-		// position buffer the BLAS builds over. A separate structured copy of the positions
-		// keeps the vertex buffer's bind flags untouched (VB+RT combo stays as-is).
+		// RT wind bend: compute inputs + the bent position buffer the BLAS builds over. The separate
+		// structured copy of the positions keeps the vertex buffer's bind flags untouched.
 		if (rtSupported && mesh->rtBendArray && mesh->rtPivotArray)
 		{
 			const Uint64 sz4 = (Uint64)mesh->numVerts * 4 * sizeof(float);
@@ -267,18 +258,15 @@ void NukeDiligent::bindRenderTarget(uint64_t id)
 	if (id == 0) { m_impl->uiRTV = nullptr; m_impl->uiTW = m_impl->uiTH = 0; return; }
 	auto it = m_impl->rts.find(id);
 	if (it == m_impl->rts.end()) { m_impl->uiRTV = nullptr; m_impl->uiTW = m_impl->uiTH = 0; return; }
-	// Runtime UI composites over the DISPLAYED image = the LDR post output (rt.srv shows it),
-	// written by the camera's post pass before the GUI flushes. The HDR color target (rt.rtv,
-	// RGBA16F) would mismatch the UI PSO's RGBA8 format — D3D12 silently discards every draw
-	// (invisible HUD + a per-draw validation warning).
+	// UI must composite over the LDR post output: the RGBA16F HDR target mismatches the UI PSO's
+	// RGBA8 format and D3D12 silently discards every draw.
 	m_impl->uiRTV = it->second.postRTV ? it->second.postRTV : it->second.rtv;
 	m_impl->uiTW = (Uint32)it->second.w; m_impl->uiTH = (Uint32)it->second.h;
 }
 void NukeDiligent::invalidateTexture(Texture* t)   // re-uploaded on next GetTexSRV
 {
 	if (!t) return;
-	// The old SRV pointer may still sit in UI draw data recorded this frame (thumbnails, GUI images)
-	// and in per-frame bindless tables — park, don't free inline.
+	// The old SRV may still sit in this frame's recorded UI draw data — park, don't free inline.
 	auto it = m_impl->texCache.find(t);
 	if (it != m_impl->texCache.end()) { m_impl->Trash(it->second); m_impl->texCache.erase(it); }
 	auto at = m_impl->animTex.find(t);
@@ -300,13 +288,12 @@ void NukeDiligent::invalidateMesh(Mesh* m)
 		m_impl->Trash(it->second.posBent); m_impl->Trash(it->second.blasScratch);
 		m_impl->meshCache.erase(it);
 	}
-	// The BLAS references the OLD pos buffer's GPU memory — after the buffers go, a cached BLAS would
-	// make the TLAS trace freed memory (device removed). Rebuilt lazily from the new buffers.
+	// The BLAS references the old pos buffer's memory: keeping it would make the TLAS trace freed memory.
 	auto bit = m_impl->blasCache.find(m);
 	if (bit != m_impl->blasCache.end()) { m_impl->Trash(bit->second); m_impl->blasCache.erase(bit); }
 }
 
-// ---- Neutral UI seam: generic 2D draw (no ImGui types) ----
+// Neutral UI seam: generic 2D draw, no ImGui types.
 
 uint64_t NukeDiligent::createTexture2D(const void* rgba, int width, int height)
 {
@@ -325,8 +312,6 @@ uint64_t NukeDiligent::createTexture2D(const void* rgba, int width, int height)
 	m_impl->device->CreateTexture(Desc, &init, &tex);
 	if (!tex)
 	{
-		// Transient GPU-memory pressure (boot-time uploads, parallel tooling): callers
-		// treat 0 as "retry later", so say WHY a frame degraded instead of dying silently.
 		std::cout << "[NukeDiligent]\tcreateTexture2D FAILED (" << width << "x" << height
 		          << ") — GPU resource pressure; UI retries next frame." << std::endl;
 		return 0;
@@ -339,8 +324,7 @@ uint64_t NukeDiligent::createTexture2D(const void* rgba, int width, int height)
 
 void NukeDiligent::destroyTexture2D(uint64_t handle)
 {
-	// Centralized lifetime: the view pointer may still sit in UI draw data recorded this frame (any
-	// window, incl. detached OS viewports) — park the texture + its cached SRB, never free inline.
+	// The view may still sit in this frame's UI draw data — park the texture + its cached SRB.
 	auto sit = m_impl->uiSRBCache.find(reinterpret_cast<ITextureView*>(handle));
 	if (sit != m_impl->uiSRBCache.end()) { m_impl->Trash(sit->second.srb); m_impl->uiSRBCache.erase(sit); }
 	auto it = m_impl->textures.find(handle);
@@ -361,9 +345,7 @@ void NukeDiligent::resizeRenderTarget(uint64_t id, int w, int h)
 	auto it = m_impl->rts.find(id);
 	if (it == m_impl->rts.end()) return;
 	if (it->second.w == w && it->second.h == h) return;
-	// Resize happens MID-FRAME (a panel resizing during the UI pass): the old post SRV may already be
-	// recorded in this frame's draw lists, and this frame's world pass wrote into the old RTV. Park
-	// everything; drop the old SRV's cached UI SRB (keyed by the now-parked view pointer).
+	// Resizes land mid-frame: park the old targets and drop the cached UI SRB keyed by the old SRV.
 	Impl::RT old = it->second;
 	auto sit = m_impl->uiSRBCache.find(old.srv);
 	if (sit != m_impl->uiSRBCache.end()) { m_impl->Trash(sit->second.srb); m_impl->uiSRBCache.erase(sit); }
@@ -377,9 +359,8 @@ uint64_t NukeDiligent::getRenderTargetTexture(uint64_t id)
 	return (it == m_impl->rts.end()) ? 0 : reinterpret_cast<uint64_t>(it->second.srv);
 }
 
-// Staging readback of a target (screenshot / pixel verification — see irender.h). Copies the
-// LDR image (backbuffer or the RT's post output) into a fresh staging texture, idles the GPU
-// and maps it. Handles the two LDR layouts we ever produce (RGBA8/BGRA8, incl. sRGB views).
+// Read back the LDR image of `rtId` (0 = backbuffer) into `rgba`, sized w*h. Handles RGBA8 and
+// BGRA8 layouts including sRGB views. Returns false when the target is not readable.
 bool NukeDiligent::captureTarget(uint64_t rtId, int& w, int& h, std::vector<uint8_t>& rgba)
 {
 	if (!m_impl->device || !m_impl->context) return false;

@@ -7,8 +7,14 @@ project — the engine core contains zero graphics code.
 
 ## Features
 
-- D3D12 (D3D11 fallback), HLSL compiled at runtime through DXC (SM 6.5 — the vendored
-  `dxcompiler.dll`/`dxil.dll` deploy next to the exe).
+- Three backends from one HLSL source: **Vulkan** (the editor's default — native ImGui
+  multi-viewport, hardware RT via `VK_KHR_ray_tracing_pipeline`, own SPIR-V disk cache
+  `config/shadercache_vk/`), **D3D12** (the packaged-game default — RT, DComp transparency,
+  HDR10) and **D3D11** (legacy fallback, no RT). Regular shaders go through glslang on
+  Vulkan; SM 6.x shaders compile through the ONE vendored DXC on both backends
+  (`dxcompiler.dll`/`dxil.dll` deploy next to the exe) — DXIL for D3D12, SPIR-V for Vulkan.
+  Switching the editor off Vulkan is not recommended (see the
+  [root README](https://github.com/Luastris/NukeEngine-Eco)).
 - PBR metallic-roughness pipeline: full material maps, lights + PCF shadow mapping
   (dir/point/spot), transparency with correct ordering, frustum culling.
 - Sky/environment + IBL, reflection probes with box-projection parallax.
