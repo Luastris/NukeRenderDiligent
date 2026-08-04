@@ -155,6 +155,37 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 			}
 		}
 	}
+
+	// Skinned twin (gbuffer.vs.hlsl NUKE_SKINNED): stream 3 = previous-frame skinned positions
+	// from skin.cs — velocity is the TRUE pose delta, not the rigid-transform approximation.
+	gbufPSOSkin.Release(); gbufSRBSkin.Release(); gbufMRVarSkin = nullptr; gbufNrmVarSkin = nullptr;
+	{
+		const std::string vsS = "#define NUKE_SKINNED 1\n" + vsSrc;
+		const std::string psS = "#define NUKE_SKINNED 1\n" + psSrc;
+		RefCntAutoPtr<IShader> vss, pss;
+		sci.Desc = {"GBuffer VS (skin)", SHADER_TYPE_VERTEX, true}; sci.Source = vsS.c_str(); CreateShaderCached(sci, &vss);
+		sci.Desc = {"GBuffer PS (skin)", SHADER_TYPE_PIXEL, true};  sci.Source = psS.c_str(); CreateShaderCached(sci, &pss);
+		if (vss && pss)
+		{
+			LayoutElement layoutS[] = {
+				{0, 0, 3, VT_FLOAT32}, {1, 1, 3, VT_FLOAT32}, {2, 2, 2, VT_FLOAT32},
+				{3, 3, 3, VT_FLOAT32},   // previous-frame skinned position
+			};
+			gp.InputLayout.LayoutElements = layoutS;
+			gp.InputLayout.NumElements    = 4;
+			ci.PSODesc.Name = "GBuffer PSO (skin)";
+			ci.pVS = vss; ci.pPS = pss;
+			CreateGraphicsPipelineStateCached(ci, &gbufPSOSkin);
+			if (gbufPSOSkin)
+			{
+				if (auto* c = gbufPSOSkin->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))    c->Set(worldCB);
+				if (auto* m = gbufPSOSkin->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB")) m->Set(worldMatCB);
+				gbufPSOSkin->CreateShaderResourceBinding(&gbufSRBSkin, true);
+				gbufMRVarSkin  = gbufSRBSkin->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
+				gbufNrmVarSkin = gbufSRBSkin->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
+			}
+		}
+	}
 	return true;
 }
 
@@ -243,6 +274,9 @@ void NukeDiligent::Impl::RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* ds
 void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 {
 	++m_impl->passSerial;   // invalidate the per-draw redundancy gates (this pass maps the shared CBs itself)
+	// The prepass runs BEFORE beginCamera: latch the LOD anchor here too, or the prepass
+	// selects LODs against the PREVIOUS camera and mismatches the beauty pass geometry.
+	m_impl->lodCamPos[0] = cam.camPos[0]; m_impl->lodCamPos[1] = cam.camPos[1]; m_impl->lodCamPos[2] = cam.camPos[2];
 	m_impl->gbufActive = false;
 	if (!m_impl->gbufPSO) return;
 	int w = 0, h = 0;
@@ -270,11 +304,49 @@ void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
                                        const float prevPos[3], const float prevQuat[4], const float prevScale[3])
 {
-	if (!m_impl->gbufActive || !m_impl->gbufPSO) return;
+	if (!mesh) return;
+	uint32_t first = 0, count = 0;
+	m_impl->LodRange(mesh, m_impl->SelectLod(mesh, pos, scale), first, count);
+	RenderGBufferRange(mesh, mat, pos, quat, scale, prevPos, prevQuat, prevScale, first, count);
+}
+
+void NukeDiligent::renderGBufferObjectMulti(Mesh* mesh, Material* const* mats, int matCount,
+                                            const float pos[3], const float quat[4], const float scale[3],
+                                            const float prevPos[3], const float prevQuat[4], const float prevScale[3],
+                                            int blendPass)
+{
+	if (!mesh) return;
+	if (mesh->numIndices <= 0 || mesh->sections.empty())
+	{
+		Material* m = matCount > 0 ? mats[0] : nullptr;
+		const int bm = m ? m->blendMode : 0;
+		if (blendPass == 0 && bm != 0) return;
+		if (blendPass == 1 && bm == 0) return;
+		renderGBufferObject(mesh, m, pos, quat, scale, prevPos, prevQuat, prevScale);
+		return;
+	}
+	MeshLOD L = mesh->Lod(m_impl->SelectLod(mesh, pos, scale));
+	for (int s = 0; s < L.sectionCount; ++s)
+	{
+		MeshSection sec = mesh->Section(L.firstSection + s);
+		Material* m = (sec.slot >= 0 && sec.slot < matCount && mats[sec.slot]) ? mats[sec.slot]
+		            : (matCount > 0 ? mats[0] : nullptr);
+		const int bm = m ? m->blendMode : 0;
+		if (blendPass == 0 && bm != 0) continue;
+		if (blendPass == 1 && bm == 0) continue;
+		RenderGBufferRange(mesh, m, pos, quat, scale, prevPos, prevQuat, prevScale, sec.firstIndex, sec.indexCount);
+	}
+}
+
+void NukeDiligent::RenderGBufferRange(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
+                                      const float prevPos[3], const float prevQuat[4], const float prevScale[3],
+                                      uint32_t firstIndex, uint32_t indexCount)
+{
+	if (!m_impl->gbufActive || !m_impl->gbufPSO || indexCount == 0) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
 	++m_impl->statDraws;
-	m_impl->statTris += mesh ? mesh->numVerts / 3 : 0;
+	m_impl->statTris += (int)indexCount / 3;
 	Impl::MeshGPU& g = *gp;
 
 	auto build = [](const float p[3], const float q[4], const float s[3]) {
@@ -301,18 +373,51 @@ void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float po
 		float prm2[4] = { mrsrv ? 1.0f : 0.0f, 0, 0, 1.0f };   // g_Params2 (hasMR.x)
 		memcpy(p + 32, prm2, sizeof(float) * 4);
 	}
-	if (m_impl->gbufMRVar)
-		m_impl->gbufMRVar->Set(mrsrv ? mrsrv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
-	if (m_impl->gbufNrmVar)
-		m_impl->gbufNrmVar->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	// GPU-skinned instance: prev-position stream + the NUKE_SKINNED pipeline (true MVs).
+	const bool skinnedDraw = g.skinned && g.skinPosPrev && m_impl->gbufPSOSkin && m_impl->gbufSRBSkin;
+	if (skinnedDraw)
+	{
+		if (m_impl->gbufMRVarSkin)
+			m_impl->gbufMRVarSkin->Set(mrsrv ? mrsrv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+		if (m_impl->gbufNrmVarSkin)
+			m_impl->gbufNrmVarSkin->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	}
+	else
+	{
+		if (m_impl->gbufMRVar)
+			m_impl->gbufMRVar->Set(mrsrv ? mrsrv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+		if (m_impl->gbufNrmVar)
+			m_impl->gbufNrmVar->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	}
 
 	IDeviceContext* ctx = m_impl->context;
-	IBuffer* vbs[] = { g.pos, g.nrm, g.uv }; Uint64 offs[] = { 0, 0, 0 };
-	ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
-	ctx->SetPipelineState(m_impl->gbufPSO);
-	ctx->CommitShaderResources(m_impl->gbufSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	DrawAttribs da{ (Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES };
-	ctx->Draw(da);
+	if (skinnedDraw)
+	{
+		IBuffer* vbs[] = { g.pos, g.nrm, g.uv, g.skinPosPrev }; Uint64 offs[] = { 0, 0, 0, 0 };
+		ctx->SetVertexBuffers(0, 4, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+		ctx->SetPipelineState(m_impl->gbufPSOSkin);
+		ctx->CommitShaderResources(m_impl->gbufSRBSkin, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	}
+	else
+	{
+		IBuffer* vbs[] = { g.pos, g.nrm, g.uv }; Uint64 offs[] = { 0, 0, 0 };
+		ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+		ctx->SetPipelineState(m_impl->gbufPSO);
+		ctx->CommitShaderResources(m_impl->gbufSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	}
+	if (g.idx)
+	{
+		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawIndexedAttribs da{ (Uint32)indexCount, VT_UINT32, DRAW_FLAG_VERIFY_STATES };
+		da.FirstIndexLocation = (Uint32)firstIndex;
+		ctx->DrawIndexed(da);
+	}
+	else
+	{
+		DrawAttribs da{ (Uint32)indexCount, DRAW_FLAG_VERIFY_STATES };
+		da.StartVertexLocation = (Uint32)firstIndex;
+		ctx->Draw(da);
+	}
 }
 
 // Draw [first, first+count) of `instBuf` into the prepass. The CB carries current + previous
@@ -326,7 +431,7 @@ void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t in
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
 	++m_impl->statDraws;
-	m_impl->statTris += mesh ? (mesh->numVerts / 3) * count : 0;
+	m_impl->statTris += mesh ? mesh->TriCount() * count : 0;
 	Impl::MeshGPU& g = *gp;
 
 	float4x4 vp = m_impl->curView * m_impl->curProj;   // prepass is UNjittered
@@ -362,10 +467,25 @@ void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t in
 	ctx->SetVertexBuffers(0, 4, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	ctx->SetPipelineState(m_impl->gbufPSOInst);
 	ctx->CommitShaderResources(m_impl->gbufSRBInst, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	DrawAttribs da{ (Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES };
-	da.NumInstances          = (Uint32)count;
-	da.FirstInstanceLocation = (Uint32)first;
-	ctx->Draw(da);
+	if (g.idx)
+	{
+		// LOD0 range only: the whole IB also carries the appended LOD shells.
+		uint32_t l0First = 0, l0Count = 0;
+		m_impl->LodRange(mesh, 0, l0First, l0Count);
+		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawIndexedAttribs da{ (Uint32)l0Count, VT_UINT32, DRAW_FLAG_VERIFY_STATES };
+		da.FirstIndexLocation    = (Uint32)l0First;
+		da.NumInstances          = (Uint32)count;
+		da.FirstInstanceLocation = (Uint32)first;
+		ctx->DrawIndexed(da);
+	}
+	else
+	{
+		DrawAttribs da{ (Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES };
+		da.NumInstances          = (Uint32)count;
+		da.FirstInstanceLocation = (Uint32)first;
+		ctx->Draw(da);
+	}
 }
 
 void NukeDiligent::endGBufferPass() { /* gbufActive stays set so endCamera's SSR pass can sample it; beginCamera rebinds the colour target */ }

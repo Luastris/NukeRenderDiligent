@@ -158,6 +158,48 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 		}
 	}
 
+	// GPU skinning compute (skin.cs): morphs + LBS into the skinned instance's buffers.
+	// Not RT-gated — every skinned character uses it; per-instance SRBs bind the streams.
+	{
+		std::string cs = shaderSource("skin.cs");
+		if (!cs.empty())
+		{
+			ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+			sci.pShaderSourceStreamFactory = shaderFactory;
+			sci.Desc = {"Skin CS", SHADER_TYPE_COMPUTE, true};
+			sci.Source = cs.c_str();
+			RefCntAutoPtr<IShader> csh; CreateShaderCached(sci, &csh);
+			if (csh)
+			{
+				BufferDesc cpb; cpb.Name = "SkinCS Params"; cpb.Size = sizeof(uint32_t) * 4;
+				cpb.Usage = USAGE_DYNAMIC; cpb.BindFlags = BIND_UNIFORM_BUFFER; cpb.CPUAccessFlags = CPU_ACCESS_WRITE;
+				device->CreateBuffer(cpb, nullptr, &skinCSParamsCB);
+				ComputePipelineStateCreateInfo cci; cci.PSODesc.Name = "Skin PSO";
+				ShaderResourceVariableDesc cvars[] = {
+					{SHADER_TYPE_COMPUTE, "g_Palette",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_BindPos",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_BindNrm",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_BoneIdx",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_BoneWgt",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_MorphDelta",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_MorphWeight", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_PosOut",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_NrmOut",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_PosPrev",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+				};
+				cci.PSODesc.ResourceLayout.Variables = cvars; cci.PSODesc.ResourceLayout.NumVariables = 10;
+				cci.pCS = csh;
+				device->CreateComputePipelineState(cci, &skinCSPSO);
+				if (skinCSPSO)
+				{
+					if (auto* v = skinCSPSO->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "SkinCSParams")) v->Set(skinCSParamsCB);
+					skinCSPSO->CreateShaderResourceBinding(&skinCSSRB, true);
+				}
+				cout << "[NukeDiligent]	skin CS " << (skinCSPSO && skinCSSRB ? "ready" : "FAILED") << endl;
+			}
+		}
+	}
+
 	// 1x1 white fallback texture (bound when a material has no texture).
 	uint32_t white = 0xFFFFFFFFu;
 	TextureDesc wd; wd.Type = RESOURCE_DIM_TEX_2D; wd.Width = 1; wd.Height = 1;
@@ -211,6 +253,18 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	CreateSpriteResources();   // 2D sprite quad pipeline (SceneFmt + MSAA -> rebuild with them)
 	CreateDecalResources();    // screen-space decal pipeline (SceneFmt + MSAA)
 	CreatePostResources();     // final tonemap / post-process pass
+	const TEXTURE_FORMAT fmt0 = SceneFmt();
+	skyStamp.stamp(samples, fmt0); debugStamp.stamp(samples, fmt0); spriteStamp.stamp(samples, fmt0);
+	decalStamp.stamp(samples, fmt0); outlineStamp.stamp(samples, fmt0);
+	// The renderer's own pipelines join the same warm-up pump the modules use: everything built
+	// after this point (materials arriving with a world, an MSAA change) lands off the draw path.
+	{
+		WarmEntry e;
+		e.name = "NukeDiligent";
+		e.fn = [](void* u) { return ((Impl*)u)->WarmEnginePipelines(); };
+		e.user = this;
+		warmups.push_back(e);
+	}
 }
 
 // Build the selection-outline pipelines: mask (mesh -> RGBA8, alpha=1) and edge (fullscreen
@@ -545,27 +599,69 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	return true;
 }
 
+// Registers a world pipeline for a shader pair. The build itself is left to the warm-up pump:
+// a material arriving with a world load must not compile inside the frame that loads it. Until
+// it is ready the draw uses the default world pipeline, so the object is shaded, not missing.
 uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg)
 {
 	WorldPipe wp;
-	wp.vsSrc = vsSrc; wp.psSrc = psSrc; wp.dbg = dbg;   // kept so setMSAA can rebuild this pipeline
-	if (!BuildWorldPipe(wp, vsSrc, psSrc, dbg)) return 0;
+	wp.vsSrc = vsSrc; wp.psSrc = psSrc; wp.dbg = dbg;   // kept so the warm-up can (re)build it
+	// The default pipeline is the fallback for everything else, so it cannot be deferred.
+	const bool isDefault = (defaultWorldHandle == 0);
+	if (isDefault)
+	{
+		if (!BuildWorldPipe(wp, vsSrc, psSrc, dbg)) return 0;
+		wp.builtSamples = samples; wp.builtFmt = SceneFmt();
+	}
 	uint64_t h = nextShaderHandle++;
 	worldPipes[h] = std::move(wp);
 	return h;
 }
 
-// Rebuild everything whose PSO/texture sample count depends on `samples`: world pipelines (in
-// place), sky/debug/sprite/decal/outline PSOs, the MS backbuffer and every render target.
+// Builds one stale pipeline set per call and returns false to be resumed next frame. Driven by
+// the warm-up pump — nothing here may run from a draw.
+bool NukeDiligent::Impl::WarmEnginePipelines()
+{
+	const TEXTURE_FORMAT fmt = SceneFmt();
+	for (auto& kv : worldPipes)
+	{
+		WorldPipe& wp = kv.second;
+		if (wp.buildFailed || (wp.builtSamples == samples && wp.builtFmt == fmt)) continue;
+		if (!BuildWorldPipe(wp, wp.vsSrc, wp.psSrc, wp.dbg.c_str()))
+		{
+			wp.buildFailed = true;   // latch: the draw keeps falling back to the default pipe
+			std::cout << "[NukeDiligent]\tworld pipeline FAILED: " << wp.dbg << std::endl;
+			continue;
+		}
+		wp.builtSamples = samples; wp.builtFmt = fmt;
+		return false;   // one pipeline per frame
+	}
+	if (!skyStamp.current(samples, fmt))     { CreateSkyResources();    skyStamp.stamp(samples, fmt);     return false; }
+	if (!debugStamp.current(samples, fmt))   { CreateDebugResources();  debugStamp.stamp(samples, fmt);   return false; }
+	if (!spriteStamp.current(samples, fmt))  { CreateSpriteResources(); spriteStamp.stamp(samples, fmt);  return false; }
+	if (!decalStamp.current(samples, fmt))   { CreateDecalResources();  decalStamp.stamp(samples, fmt);   return false; }
+	if (!outlineStamp.current(samples, fmt)) { BuildOutlinePipelines(); outlineStamp.stamp(samples, fmt); return false; }
+	return true;
+}
+
+// Sample count or scene format changed. The targets follow immediately — they define what the
+// passes render into — while every pipeline built against the old pair is marked stale and
+// rebuilt by the warm-up over the next frames. Draws skip what is not current yet, so the
+// change costs a moment of things fading back in instead of a frozen frame.
 void NukeDiligent::Impl::RebuildForMSAA()
 {
-	for (auto& kv : worldPipes)
-		BuildWorldPipe(kv.second, kv.second.vsSrc, kv.second.psSrc, kv.second.dbg.c_str());
-	CreateSkyResources();
-	CreateDebugResources();
-	CreateSpriteResources();   // sprite PSO sample count / SceneFmt depends on samples+HDR
-	CreateDecalResources();    // decal PSO sample count / SceneFmt depends on samples+HDR
-	BuildOutlinePipelines();
+	skyStamp = debugStamp = spriteStamp = decalStamp = outlineStamp = PipeStamp{};
+	// The default world pipeline is everyone's fallback: it is rebuilt here, not deferred.
+	auto dit = worldPipes.find(defaultWorldHandle);
+	if (dit != worldPipes.end())
+	{
+		WorldPipe& wp = dit->second;
+		if (BuildWorldPipe(wp, wp.vsSrc, wp.psSrc, wp.dbg.c_str()))
+		{
+			wp.builtSamples = samples; wp.builtFmt = SceneFmt();
+		}
+	}
+	for (WarmEntry& e : warmups) e.done = false;   // every builder gets another look
 	TrashRT(backbufferMS);
 	backbufferMS = RT{};   // recreated on next target-0 camera
 	for (auto& kv : rts)

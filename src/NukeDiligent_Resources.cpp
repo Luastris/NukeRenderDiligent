@@ -198,12 +198,39 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 		BufferDesc bd; bd.BindFlags = BIND_VERTEX_BUFFER; bd.Usage = USAGE_DEFAULT;
 		// Positions double as BLAS geometry under D3D12 ray tracing -> they need BIND_RAY_TRACING too.
 		BufferDesc pbd = bd; if (rtSupported) pbd.BindFlags = BIND_VERTEX_BUFFER | BIND_RAY_TRACING;
+		// GPU-skinned INSTANCE: pos/nrm are compute OUTPUTS (structured UAV that still binds as
+		// the draw VB / BLAS input), plus the previous-frame positions for TAA velocity.
+		g.skinned = skinRecs.count(mesh) != 0;
+		if (g.skinned)
+		{
+			pbd.Mode = BUFFER_MODE_STRUCTURED; pbd.ElementByteStride = sizeof(float);
+			pbd.BindFlags = BIND_VERTEX_BUFFER | BIND_UNORDERED_ACCESS | BIND_SHADER_RESOURCE
+			              | (rtSupported ? BIND_RAY_TRACING : BIND_NONE);
+			bd.Mode = BUFFER_MODE_STRUCTURED; bd.ElementByteStride = sizeof(float);
+			bd.BindFlags = BIND_VERTEX_BUFFER | BIND_UNORDERED_ACCESS | BIND_SHADER_RESOURCE;
+		}
 		pbd.Size = sz3; pbd.Name = "mesh pos"; BufferData pdat{mesh->vertexArray, sz3}; device->CreateBuffer(pbd, &pdat, &g.pos);
 		bd.Size = sz3; bd.Name = "mesh nrm"; BufferData ndat{mesh->normalArray, sz3}; device->CreateBuffer(bd, &ndat, &g.nrm);
+		if (g.skinned)
+		{
+			BufferDesc ppd = bd; ppd.Name = "skin prev pos";
+			BufferData ppdat{mesh->vertexArray, sz3};   // first frame: prev == bind
+			device->CreateBuffer(ppd, &ppdat, &g.skinPosPrev);
+			bd.Mode = BUFFER_MODE_UNDEFINED; bd.ElementByteStride = 0; bd.BindFlags = BIND_VERTEX_BUFFER;   // uv below stays a plain VB
+		}
 		std::vector<float> zeroUV;
 		const float* uvSrc = mesh->uvArray;
 		if (!uvSrc) { zeroUV.assign((size_t)mesh->numVerts * 2, 0.0f); uvSrc = zeroUV.data(); }   // mesh has no UVs
 		bd.Size = sz2; bd.Name = "mesh uv"; BufferData udat{uvSrc, sz2}; device->CreateBuffer(bd, &udat, &g.uv);
+		if (mesh->indexArray && mesh->numIndices > 0)   // v4 indexed mesh: index buffer (BLAS reads it too)
+		{
+			BufferDesc ib; ib.Usage = USAGE_DEFAULT; ib.Name = "mesh idx";
+			ib.BindFlags = rtSupported ? (BIND_INDEX_BUFFER | BIND_RAY_TRACING) : BIND_INDEX_BUFFER;
+			ib.Size = (Uint64)mesh->numIndices * sizeof(uint32_t);
+			BufferData idat{mesh->indexArray, ib.Size};
+			device->CreateBuffer(ib, &idat, &g.idx);
+			g.numIndices = mesh->numIndices;
+		}
 		// RT wind bend: compute inputs + the bent position buffer the BLAS builds over. The separate
 		// structured copy of the positions keeps the vertex buffer's bind flags untouched.
 		if (rtSupported && mesh->rtBendArray && mesh->rtPivotArray)
@@ -230,12 +257,22 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 	if (!g.pos || !g.nrm || !g.uv) return nullptr;
 	if (g.version != mesh->version)
 	{
-		if (g.numVerts != mesh->numVerts)   // topology changed: rebuild from scratch
+		if (g.numVerts != mesh->numVerts || g.numIndices != mesh->numIndices)   // topology changed: rebuild from scratch
 		{
-			Trash(g.pos); Trash(g.nrm); Trash(g.uv);   // this frame's earlier draws may reference them
+			// Park EVERYTHING the erase would inline-release — this frame's earlier draws
+			// (and in-flight BLAS builds) may still reference the buffers.
+			Trash(g.pos); Trash(g.nrm); Trash(g.uv); Trash(g.idx);
+			Trash(g.bendSrc); Trash(g.bendData); Trash(g.bendPivot); Trash(g.posBent); Trash(g.blasScratch);
+			Trash(g.skinPosPrev); Trash(g.skinSrcPos); Trash(g.skinSrcNrm);
+			Trash(g.skinIdxBuf); Trash(g.skinWgtBuf); Trash(g.skinMorph);
 			meshCache.erase(it);
 			auto bit = blasCache.find(mesh);           // BLAS built over the OLD pos buffer -> stale + dangling
 			if (bit != blasCache.end()) { Trash(bit->second); blasCache.erase(bit); }
+			for (auto sit = blasSectionCache.lower_bound({mesh, 0ull});
+			     sit != blasSectionCache.end() && sit->first.first == mesh; )
+			{ Trash(sit->second); sit = blasSectionCache.erase(sit); }
+			// RT attribute-pool slices were unrolled for the OLD topology.
+			meshNrmByteOffset.erase(mesh); meshUVByteOffset.erase(mesh); meshPosByteOffset.erase(mesh);
 			return GetMeshGPU(mesh);
 		}
 		const Uint64 sz3 = (Uint64)mesh->numVerts * 3 * sizeof(float);
@@ -253,6 +290,207 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 	}
 	return &g;
 }
+
+// Lazy static compute inputs for a skin SOURCE mesh: structured bind streams + packed bone
+// indices/weights + concatenated morph deltas ([pos 3n][nrm 3n] per target).
+void NukeDiligent::Impl::EnsureSkinInputs(Mesh* source, MeshGPU& gs)
+{
+	if (gs.skinSrcPos || !source->boneIndex || !source->boneWeight || source->numVerts <= 0) return;
+	const int n = source->numVerts;
+	const Uint64 sz3 = (Uint64)n * 3 * sizeof(float);
+	BufferDesc sb; sb.Usage = USAGE_DEFAULT; sb.Mode = BUFFER_MODE_STRUCTURED;
+	sb.BindFlags = BIND_SHADER_RESOURCE;
+	sb.ElementByteStride = sizeof(float);
+	sb.Size = sz3; sb.Name = "skin src pos"; BufferData pd{source->vertexArray, sz3}; device->CreateBuffer(sb, &pd, &gs.skinSrcPos);
+	sb.Name = "skin src nrm"; BufferData nd2{source->normalArray, sz3}; device->CreateBuffer(sb, &nd2, &gs.skinSrcNrm);
+	std::vector<uint32_t> packed((size_t)n * 2);
+	for (int v = 0; v < n; ++v)
+	{
+		const unsigned short* b = source->boneIndex + (size_t)v * 4;
+		packed[(size_t)v * 2 + 0] = (uint32_t)b[0] | ((uint32_t)b[1] << 16);
+		packed[(size_t)v * 2 + 1] = (uint32_t)b[2] | ((uint32_t)b[3] << 16);
+	}
+	sb.ElementByteStride = sizeof(uint32_t) * 2; sb.Size = (Uint64)n * 2 * sizeof(uint32_t);
+	sb.Name = "skin bone idx"; BufferData id2{packed.data(), sb.Size}; device->CreateBuffer(sb, &id2, &gs.skinIdxBuf);
+	sb.ElementByteStride = sizeof(float) * 4; sb.Size = (Uint64)n * 4 * sizeof(float);
+	sb.Name = "skin bone wgt"; BufferData wd2{source->boneWeight, sb.Size}; device->CreateBuffer(sb, &wd2, &gs.skinWgtBuf);
+	gs.skinMorphCount = (int)source->morphs.size();
+	{
+		const size_t per = (size_t)n * 6;
+		std::vector<float> md(per * source->morphs.size(), 0.0f);
+		if (md.empty()) md.resize(6, 0.0f);   // the SRB always binds a valid buffer
+		for (size_t t = 0; t < source->morphs.size(); ++t)
+		{
+			const Mesh::MorphTarget& mt = source->morphs[t];
+			if (mt.posDelta.size() == (size_t)n * 3) memcpy(md.data() + t * per, mt.posDelta.data(), sizeof(float) * 3 * n);
+			if (mt.nrmDelta.size() == (size_t)n * 3) memcpy(md.data() + t * per + (size_t)n * 3, mt.nrmDelta.data(), sizeof(float) * 3 * n);
+		}
+		sb.ElementByteStride = sizeof(float); sb.Size = (Uint64)md.size() * sizeof(float);
+		sb.Name = "skin morph deltas"; BufferData mdd{md.data(), sb.Size}; device->CreateBuffer(sb, &mdd, &gs.skinMorph);
+	}
+}
+
+// Rebuild every cached BLAS range of a skinned instance over its freshly posed positions.
+void NukeDiligent::Impl::RebuildSkinBLAS(Mesh* instance, MeshGPU& gi)
+{
+	if (!rtSupported || !gi.idx) return;
+	for (auto it = blasSectionCache.lower_bound({instance, 0ull});
+	     it != blasSectionCache.end() && it->first.first == instance; ++it)
+	{
+		IBottomLevelAS* blas = it->second;
+		const uint32_t first = (uint32_t)(it->first.second >> 32);
+		const uint32_t count = (uint32_t)(it->first.second & 0xFFFFFFFFull);
+		if (!blas || count < 3) continue;
+		BLASBuildTriangleData td;
+		td.GeometryName         = "geo";
+		td.pVertexBuffer        = gi.pos;
+		td.VertexStride         = 3 * sizeof(float);
+		td.VertexCount          = (Uint32)gi.numVerts;
+		td.VertexValueType      = VT_FLOAT32;
+		td.VertexComponentCount = 3;
+		td.pIndexBuffer         = gi.idx;
+		td.IndexOffset          = (Uint64)first * sizeof(uint32_t);
+		td.IndexType            = VT_UINT32;
+		td.PrimitiveCount       = (Uint32)(count / 3);
+		td.Flags                = instance->rtAlphaTested ? RAYTRACING_GEOMETRY_FLAG_NONE : RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+		RefCntAutoPtr<IBuffer> scratch;
+		BufferDesc sbd; sbd.Name = "skin BLAS scratch"; sbd.Usage = USAGE_DEFAULT; sbd.BindFlags = BIND_RAY_TRACING;
+		sbd.Size = blas->GetScratchBufferSizes().Build;
+		device->CreateBuffer(sbd, nullptr, &scratch);
+		if (!scratch) continue;
+		BuildBLASAttribs ba;
+		ba.pBLAS                  = blas;
+		ba.pTriangleData          = &td;
+		ba.TriangleDataCount      = 1;
+		ba.pScratchBuffer         = scratch;
+		ba.Update                 = false;   // full rebuild (pose deltas exceed refit guarantees)
+		ba.BLASTransitionMode     = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ba.GeometryTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ba.ScratchBufferTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		context->BuildBLAS(ba);
+		Trash(scratch);   // the build may still be in flight — parked, not freed inline
+	}
+}
+
+bool NukeDiligent::gpuSkin() { return m_impl->skinCSPSO && m_impl->skinCSSRB; }
+
+void NukeDiligent::setSkinPalette(Mesh* instance, Mesh* source, const float* palette16, int boneCount,
+                                  const float* morphWeights, int morphCount)
+{
+	Impl& im = *m_impl;
+	if (!im.skinCSPSO || !im.skinCSSRB || !instance || !source || !palette16 || boneCount <= 0) return;
+	auto recIt = im.skinRecs.find(instance);
+	if (recIt == im.skinRecs.end())
+	{
+		// A pre-skin cache (edit-mode bind-pose draws) lacks the UAV outputs — rebuild it.
+		if (im.meshCache.count(instance)) invalidateMesh(instance);
+		recIt = im.skinRecs.emplace(instance, Impl::SkinRec{}).first;
+	}
+	Impl::SkinRec& rec = recIt->second;
+	rec.src = source;
+	Impl::MeshGPU* gi = im.GetMeshGPU(instance);
+	Impl::MeshGPU* gs = im.GetMeshGPU(source);
+	if (!gi || !gs || !gi->skinned || !gi->skinPosPrev) return;
+	im.EnsureSkinInputs(source, *gs);
+	if (!gs->skinSrcPos || !gs->skinIdxBuf || !gs->skinWgtBuf || !gs->skinMorph) return;
+
+	if (boneCount > rec.boneCap || !rec.palette)
+	{
+		im.Trash(rec.palette);
+		BufferDesc pb; pb.Name = "skin palette"; pb.Usage = USAGE_DYNAMIC; pb.CPUAccessFlags = CPU_ACCESS_WRITE;
+		pb.Mode = BUFFER_MODE_STRUCTURED; pb.ElementByteStride = sizeof(float) * 4;
+		pb.BindFlags = BIND_SHADER_RESOURCE;
+		pb.Size = (Uint64)boneCount * 16 * sizeof(float);
+		im.device->CreateBuffer(pb, nullptr, &rec.palette);
+		rec.boneCap = boneCount;
+	}
+	if (!rec.palette) return;
+	{
+		MapHelper<float> mp(im.context, rec.palette, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (mp == nullptr) return;
+		memcpy(mp, palette16, sizeof(float) * 16 * boneCount);
+	}
+	const int mw = morphCount > 0 ? morphCount : 1;
+	if (mw > rec.morphCap || !rec.morphW)
+	{
+		im.Trash(rec.morphW);
+		BufferDesc mb; mb.Name = "skin morph weights"; mb.Usage = USAGE_DYNAMIC; mb.CPUAccessFlags = CPU_ACCESS_WRITE;
+		mb.Mode = BUFFER_MODE_STRUCTURED; mb.ElementByteStride = sizeof(float);
+		mb.BindFlags = BIND_SHADER_RESOURCE;
+		mb.Size = (Uint64)mw * sizeof(float);
+		im.device->CreateBuffer(mb, nullptr, &rec.morphW);
+		rec.morphCap = mw;
+	}
+	if (!rec.morphW) return;
+	{
+		MapHelper<float> mp(im.context, rec.morphW, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (mp == nullptr) return;
+		if (morphWeights && morphCount > 0) memcpy(mp, morphWeights, sizeof(float) * morphCount);
+		else mp[0] = 0.0f;
+	}
+	{
+		MapHelper<Uint32> pc(im.context, im.skinCSParamsCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (pc == nullptr) return;
+		pc[0] = (Uint32)source->numVerts;
+		pc[1] = (Uint32)boneCount;
+		pc[2] = (Uint32)(morphCount < gs->skinMorphCount ? morphCount : gs->skinMorphCount);
+		pc[3] = 0;
+	}
+	auto bind = [&](const char* nm, IDeviceObject* o)
+	{ if (auto* v = im.skinCSSRB->GetVariableByName(SHADER_TYPE_COMPUTE, nm)) v->Set(o); };
+	bind("g_Palette",     rec.palette->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
+	bind("g_BindPos",     gs->skinSrcPos->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
+	bind("g_BindNrm",     gs->skinSrcNrm->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
+	bind("g_BoneIdx",     gs->skinIdxBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
+	bind("g_BoneWgt",     gs->skinWgtBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
+	bind("g_MorphDelta",  gs->skinMorph->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
+	bind("g_MorphWeight", rec.morphW->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
+	bind("g_PosOut",      gi->pos->GetDefaultView(BUFFER_VIEW_UNORDERED_ACCESS));
+	bind("g_NrmOut",      gi->nrm->GetDefaultView(BUFFER_VIEW_UNORDERED_ACCESS));
+	bind("g_PosPrev",     gi->skinPosPrev->GetDefaultView(BUFFER_VIEW_UNORDERED_ACCESS));
+	im.context->SetPipelineState(im.skinCSPSO);
+	im.context->CommitShaderResources(im.skinCSSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DispatchComputeAttribs da((Uint32)((source->numVerts + 63) / 64), 1, 1);
+	im.context->DispatchCompute(da);
+	im.RebuildSkinBLAS(instance, *gi);
+}
+
+int NukeDiligent::Impl::SelectLod(Mesh* mesh, const float pos[3], const float scale[3])
+{
+	if (!mesh || mesh->lods.size() < 2) return 0;
+	mesh->EnsureBounds();
+	if (!mesh->boundsValid) return 0;
+	const float ex = mesh->aabbMax[0] - mesh->aabbMin[0];
+	const float ey = mesh->aabbMax[1] - mesh->aabbMin[1];
+	const float ez = mesh->aabbMax[2] - mesh->aabbMin[2];
+	float smax = std::fabs(scale[0]);
+	if (std::fabs(scale[1]) > smax) smax = std::fabs(scale[1]);
+	if (std::fabs(scale[2]) > smax) smax = std::fabs(scale[2]);
+	const float diam = std::sqrt(ex * ex + ey * ey + ez * ez) * smax;
+	const float dx = pos[0] - lodCamPos[0], dy = pos[1] - lodCamPos[1], dz = pos[2] - lodCamPos[2];
+	const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+	const float cov = diam / (dist > 0.01f ? dist : 0.01f);   // ~ screen coverage fraction
+	int l = 0;
+	for (int k = 1; k < (int)mesh->lods.size(); ++k)
+		if (cov < mesh->lods[k].screenSize) l = k;   // thresholds descend: deepest passing level wins
+	return l;
+}
+
+void NukeDiligent::Impl::LodRange(Mesh* mesh, int lod, uint32_t& first, uint32_t& count)
+{
+	if (!mesh) { first = count = 0; return; }
+	if (mesh->numIndices <= 0 || mesh->sections.empty())
+	{
+		first = 0;
+		count = (uint32_t)(mesh->numIndices > 0 ? mesh->numIndices : mesh->numVerts);
+		return;
+	}
+	MeshLOD L = mesh->Lod(lod);
+	first = mesh->Section(L.firstSection).firstIndex;
+	count = 0;
+	for (int s = 0; s < L.sectionCount; ++s) count += mesh->Section(L.firstSection + s).indexCount;
+}
+
 void NukeDiligent::bindRenderTarget(uint64_t id)
 {
 	if (id == 0) { m_impl->uiRTV = nullptr; m_impl->uiTW = m_impl->uiTH = 0; return; }
@@ -284,13 +522,30 @@ void NukeDiligent::invalidateMesh(Mesh* m)
 	if (it != m_impl->meshCache.end())
 	{
 		m_impl->Trash(it->second.pos); m_impl->Trash(it->second.nrm); m_impl->Trash(it->second.uv);
+		m_impl->Trash(it->second.idx);
 		m_impl->Trash(it->second.bendSrc); m_impl->Trash(it->second.bendData); m_impl->Trash(it->second.bendPivot);
 		m_impl->Trash(it->second.posBent); m_impl->Trash(it->second.blasScratch);
+		m_impl->Trash(it->second.skinPosPrev);
+		m_impl->Trash(it->second.skinSrcPos); m_impl->Trash(it->second.skinSrcNrm);
+		m_impl->Trash(it->second.skinIdxBuf); m_impl->Trash(it->second.skinWgtBuf); m_impl->Trash(it->second.skinMorph);
 		m_impl->meshCache.erase(it);
 	}
 	// The BLAS references the old pos buffer's memory: keeping it would make the TLAS trace freed memory.
 	auto bit = m_impl->blasCache.find(m);
 	if (bit != m_impl->blasCache.end()) { m_impl->Trash(bit->second); m_impl->blasCache.erase(bit); }
+	for (auto sit = m_impl->blasSectionCache.lower_bound({m, 0ull});
+	     sit != m_impl->blasSectionCache.end() && sit->first.first == m; )
+	{ m_impl->Trash(sit->second); sit = m_impl->blasSectionCache.erase(sit); }
+	// RT attribute-pool slices go stale with the mesh (a freed Mesh* address can be reused).
+	m_impl->meshNrmByteOffset.erase(m); m_impl->meshUVByteOffset.erase(m); m_impl->meshPosByteOffset.erase(m);
+	// GPU-skin state (instance record + per-frame buffers).
+	auto skIt = m_impl->skinRecs.find(m);
+	if (skIt != m_impl->skinRecs.end())
+	{
+		m_impl->Trash(skIt->second.palette);
+		m_impl->Trash(skIt->second.morphW);
+		m_impl->skinRecs.erase(skIt);
+	}
 }
 
 // Neutral UI seam: generic 2D draw, no ImGui types.

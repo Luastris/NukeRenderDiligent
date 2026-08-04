@@ -132,6 +132,65 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
 	return blas;
 }
 
+// Get-or-build a BLAS over an INDEX-BUFFER RANGE of a v4 indexed mesh (a material section, or
+// the whole LOD0). Positions stay the shared vertex buffer; the range picks the triangles.
+IBottomLevelAS* NukeDiligent::Impl::GetMeshBLASRange(Mesh* mesh, uint32_t firstIndex, uint32_t indexCount)
+{
+	const std::pair<Mesh*, uint64_t> key(mesh, ((uint64_t)firstIndex << 32) | indexCount);
+	auto it = blasSectionCache.find(key);
+	if (it != blasSectionCache.end()) return it->second;
+	MeshGPU* gp = GetMeshGPU(mesh);
+	if (!gp || !gp->pos || !gp->idx || indexCount < 3) { blasSectionCache[key] = {}; return nullptr; }
+
+	BLASTriangleDesc tri;
+	tri.GeometryName         = "geo";
+	tri.MaxVertexCount       = (Uint32)gp->numVerts;
+	tri.VertexValueType      = VT_FLOAT32;
+	tri.VertexComponentCount = 3;
+	tri.MaxPrimitiveCount    = (Uint32)(indexCount / 3);
+	tri.IndexType            = VT_UINT32;
+
+	BottomLevelASDesc desc;
+	desc.Name          = "Mesh BLAS range";
+	desc.pTriangles    = &tri;
+	desc.TriangleCount = 1;
+	desc.Flags         = RAYTRACING_BUILD_AS_PREFER_FAST_TRACE;
+	RefCntAutoPtr<IBottomLevelAS> blas;
+	device->CreateBLAS(desc, &blas);
+	if (!blas) { blasSectionCache[key] = {}; return nullptr; }
+
+	RefCntAutoPtr<IBuffer> scratch;
+	BufferDesc sbd; sbd.Name = "BLAS scratch"; sbd.Usage = USAGE_DEFAULT; sbd.BindFlags = BIND_RAY_TRACING;
+	sbd.Size = blas->GetScratchBufferSizes().Build;
+	device->CreateBuffer(sbd, nullptr, &scratch);
+
+	BLASBuildTriangleData td;
+	td.GeometryName         = "geo";
+	td.pVertexBuffer        = gp->pos;
+	td.VertexStride         = 3 * sizeof(float);
+	td.VertexCount          = (Uint32)gp->numVerts;
+	td.VertexValueType      = VT_FLOAT32;
+	td.VertexComponentCount = 3;
+	td.pIndexBuffer         = gp->idx;
+	td.IndexOffset          = (Uint64)firstIndex * sizeof(uint32_t);   // 4-aligned by construction
+	td.IndexType            = VT_UINT32;
+	td.PrimitiveCount       = (Uint32)(indexCount / 3);
+	td.Flags                = mesh->rtAlphaTested ? RAYTRACING_GEOMETRY_FLAG_NONE : RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+
+	BuildBLASAttribs ba;
+	ba.pBLAS                  = blas;
+	ba.pTriangleData          = &td;
+	ba.TriangleDataCount      = 1;
+	ba.pScratchBuffer         = scratch;
+	ba.BLASTransitionMode     = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	ba.GeometryTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	ba.ScratchBufferTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	context->BuildBLAS(ba);
+
+	blasSectionCache[key] = blas;
+	return blas;
+}
+
 // Build the empty TLAS bound to g_TLAS when there is no scene TLAS, so the shader resource
 // is always valid; all ray queries against it miss. Built once.
 void NukeDiligent::Impl::EnsureRTFallback()
@@ -181,32 +240,99 @@ void NukeDiligent::beginRTScene()
 
 void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections, bool castShadows)
 {
-	if (!m_impl->rtSupported) return;
-	IBottomLevelAS* blas = m_impl->GetMeshBLAS(mesh);
+	if (!m_impl->rtSupported || !mesh) return;
+	// Rays trace LOD0 (full quality); soup meshes resolve to (0, numVerts).
+	uint32_t first = 0, count = 0;
+	m_impl->LodRange(mesh, 0, first, count);
+	AddRTInstanceRange(mesh, mat, pos, quat, scale, inReflections, castShadows, first, count);
+}
+
+void NukeDiligent::addRTInstanceMulti(Mesh* mesh, Material* const* mats, int matCount,
+                                      const float pos[3], const float quat[4], const float scale[3],
+                                      bool inReflections, bool castShadows)
+{
+	if (!m_impl->rtSupported || !mesh) return;
+	if (mesh->numIndices <= 0 || mesh->sections.empty())
+	{
+		addRTInstance(mesh, matCount > 0 ? mats[0] : nullptr, pos, quat, scale, inReflections, castShadows);
+		return;
+	}
+	MeshLOD L = mesh->Lod(0);
+	for (int s = 0; s < L.sectionCount; ++s)
+	{
+		MeshSection sec = mesh->Section(L.firstSection + s);
+		Material* m = (sec.slot >= 0 && sec.slot < matCount && mats[sec.slot]) ? mats[sec.slot]
+		            : (matCount > 0 ? mats[0] : nullptr);
+		if (m && m->blendMode != 0) continue;   // transparent sections stay out of the TLAS (matches the raster gather)
+		const bool secCs = castShadows && (!m || m->castShadows);   // per-SECTION shadow gate
+		if (!inReflections && !secCs) continue;
+		AddRTInstanceRange(mesh, m, pos, quat, scale, inReflections, secCs, sec.firstIndex, sec.indexCount);
+	}
+}
+
+void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
+                                      const float pos[3], const float quat[4], const float scale[3],
+                                      bool inReflections, bool castShadows,
+                                      uint32_t firstIndex, uint32_t indexCount)
+{
+	const bool indexed = mesh->numIndices > 0 && mesh->indexArray != nullptr;
+	IBottomLevelAS* blas = indexed ? m_impl->GetMeshBLASRange(mesh, firstIndex, indexCount)
+	                               : m_impl->GetMeshBLAS(mesh);
 	if (Impl::MeshGPU* gpb = m_impl->GetMeshGPU(mesh))
 	{
 		if (gpb->posBent) m_impl->rtBendMeshes.push_back(mesh);   // NukeBend + BLAS refit this frame
 		if (mesh->rtDynamic) m_impl->rtDynMeshes.push_back(mesh); // engine rewrote the verts -> BLAS rebuild
 	}
-	if (!blas || !mesh->normalArray || mesh->numVerts < 3) return;
+	if (!blas || !mesh->normalArray || mesh->numVerts < 3 || indexCount < 3) return;
 
 	uint32_t nrmOff, uvOff, posOff;
 	auto nit = m_impl->meshNrmByteOffset.find(mesh);
 	if (nit == m_impl->meshNrmByteOffset.end())
 	{
+		// Indexed meshes UNROLL per IB entry (entry == triangle corner) so the shaders'
+		// PrimitiveIndex()*3 addressing keeps working; soup appends its per-vertex arrays 1:1.
+		const int entries = indexed ? mesh->numIndices : mesh->numVerts;
 		nrmOff = (uint32_t)(m_impl->allNrmCPU.size() * sizeof(float));
-		m_impl->allNrmCPU.insert(m_impl->allNrmCPU.end(), mesh->normalArray, mesh->normalArray + (size_t)mesh->numVerts * 3);
+		m_impl->allNrmCPU.reserve(m_impl->allNrmCPU.size() + (size_t)entries * 3);
+		for (int e = 0; e < entries; ++e)
+		{
+			const uint32_t v = indexed ? mesh->indexArray[e] : (uint32_t)e;
+			m_impl->allNrmCPU.push_back(mesh->normalArray[(size_t)v * 3 + 0]);
+			m_impl->allNrmCPU.push_back(mesh->normalArray[(size_t)v * 3 + 1]);
+			m_impl->allNrmCPU.push_back(mesh->normalArray[(size_t)v * 3 + 2]);
+		}
 		m_impl->meshNrmByteOffset[mesh] = nrmOff;
 		uvOff = (uint32_t)(m_impl->allUVCPU.size() * sizeof(float));
-		if (mesh->uvArray) m_impl->allUVCPU.insert(m_impl->allUVCPU.end(), mesh->uvArray, mesh->uvArray + (size_t)mesh->numVerts * 2);
-		else               m_impl->allUVCPU.insert(m_impl->allUVCPU.end(), (size_t)mesh->numVerts * 2, 0.0f);
+		if (mesh->uvArray)
+		{
+			m_impl->allUVCPU.reserve(m_impl->allUVCPU.size() + (size_t)entries * 2);
+			for (int e = 0; e < entries; ++e)
+			{
+				const uint32_t v = indexed ? mesh->indexArray[e] : (uint32_t)e;
+				m_impl->allUVCPU.push_back(mesh->uvArray[(size_t)v * 2 + 0]);
+				m_impl->allUVCPU.push_back(mesh->uvArray[(size_t)v * 2 + 1]);
+			}
+		}
+		else m_impl->allUVCPU.insert(m_impl->allUVCPU.end(), (size_t)entries * 2, 0.0f);
 		m_impl->meshUVByteOffset[mesh] = uvOff;
 		posOff = (uint32_t)(m_impl->allPosCPU.size() * sizeof(float));
-		m_impl->allPosCPU.insert(m_impl->allPosCPU.end(), mesh->vertexArray, mesh->vertexArray + (size_t)mesh->numVerts * 3);
+		m_impl->allPosCPU.reserve(m_impl->allPosCPU.size() + (size_t)entries * 3);
+		for (int e = 0; e < entries; ++e)
+		{
+			const uint32_t v = indexed ? mesh->indexArray[e] : (uint32_t)e;
+			m_impl->allPosCPU.push_back(mesh->vertexArray[(size_t)v * 3 + 0]);
+			m_impl->allPosCPU.push_back(mesh->vertexArray[(size_t)v * 3 + 1]);
+			m_impl->allPosCPU.push_back(mesh->vertexArray[(size_t)v * 3 + 2]);
+		}
 		m_impl->meshPosByteOffset[mesh] = posOff;
 		m_impl->allNrmDirty = true;
 	}
 	else { nrmOff = nit->second; uvOff = m_impl->meshUVByteOffset[mesh]; posOff = m_impl->meshPosByteOffset[mesh]; }
+	// This instance's slice of the pools: a section BLAS numbers its primitives from 0, so the
+	// per-instance offsets start at the range's first triangle corner.
+	nrmOff += firstIndex * 3 * sizeof(float);
+	uvOff  += firstIndex * 2 * sizeof(float);
+	posOff += firstIndex * 3 * sizeof(float);
 
 	// Register a texture in the bindless map array; 0xFFFFFFFF when absent or the table is full.
 	auto slotFor = [&](Texture* t) -> uint32_t {

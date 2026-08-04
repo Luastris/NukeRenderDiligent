@@ -222,6 +222,7 @@ int NukeDiligent::shadowPassCount() { return m_impl->numShadowSlots + m_impl->nu
 
 void NukeDiligent::beginShadowPass(int pass)
 {
+	m_impl->GpuPass("shadow");   // every cascade/cube face sums into one number
 	++m_impl->passSerial;   // invalidate the per-draw redundancy gates (shared CBs re-map per pass)
 	if (pass < 0 || pass >= m_impl->numShadowSlots + m_impl->numCubes * 6) return;
 	IDeviceContext* ctx = m_impl->context;
@@ -247,10 +248,40 @@ void NukeDiligent::beginShadowPass(int pass)
 
 void NukeDiligent::renderShadowObject(Mesh* mesh, const float pos[3], const float quat[4], const float scale[3], Material* mat)
 {
-	if (!m_impl->shadowPSO) return;
+	if (!mesh) return;
+	uint32_t first = 0, count = 0;
+	m_impl->LodRange(mesh, m_impl->SelectLod(mesh, pos, scale), first, count);
+	RenderShadowRange(mesh, mat, pos, quat, scale, first, count);
+}
+
+void NukeDiligent::renderShadowObjectMulti(Mesh* mesh, Material* const* mats, int matCount,
+                                           const float pos[3], const float quat[4], const float scale[3])
+{
+	if (!mesh) return;
+	if (mesh->numIndices <= 0 || mesh->sections.empty())
+	{
+		renderShadowObject(mesh, pos, quat, scale, matCount > 0 ? mats[0] : nullptr);
+		return;
+	}
+	MeshLOD L = mesh->Lod(m_impl->SelectLod(mesh, pos, scale));
+	for (int s = 0; s < L.sectionCount; ++s)
+	{
+		MeshSection sec = mesh->Section(L.firstSection + s);
+		Material* m = (sec.slot >= 0 && sec.slot < matCount && mats[sec.slot]) ? mats[sec.slot]
+		            : (matCount > 0 ? mats[0] : nullptr);
+		if (m && !m->castShadows) continue;   // per-section cast gate
+		RenderShadowRange(mesh, m, pos, quat, scale, sec.firstIndex, sec.indexCount);
+	}
+}
+
+void NukeDiligent::RenderShadowRange(Mesh* mesh, Material* mat,
+                                     const float pos[3], const float quat[4], const float scale[3],
+                                     uint32_t firstIndex, uint32_t indexCount)
+{
+	if (!m_impl->shadowPSO || indexCount == 0) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh); if (!gp) return;
 	++m_impl->statDraws;                              // frame stats (status bar)
-	m_impl->statTris += mesh ? mesh->numVerts / 3 : 0;
+	m_impl->statTris += (int)indexCount / 3;
 	Impl::MeshGPU& g = *gp;
 	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
 	               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
@@ -276,8 +307,19 @@ void NukeDiligent::renderShadowObject(Mesh* mesh, const float pos[3], const floa
 	ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	ctx->SetPipelineState(m_impl->shadowPSO);
 	ctx->CommitShaderResources(m_impl->shadowSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
-	ctx->Draw(da);
+	if (g.idx)
+	{
+		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawIndexedAttribs da{(Uint32)indexCount, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
+		da.FirstIndexLocation = (Uint32)firstIndex;
+		ctx->DrawIndexed(da);
+	}
+	else
+	{
+		DrawAttribs da{(Uint32)indexCount, DRAW_FLAG_VERIFY_STATES};
+		da.StartVertexLocation = (Uint32)firstIndex;
+		ctx->Draw(da);
+	}
 }
 
 // Draw the [first, first+count) range of `instBuf` into the current shadow slice. The CB carries
@@ -290,7 +332,7 @@ void NukeDiligent::renderShadowInstanced(Mesh* mesh, uint64_t instBuf, int first
 	if (first < 0 || first + count > bit->second.count) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh); if (!gp) return;
 	++m_impl->statDraws;
-	m_impl->statTris += mesh ? (mesh->numVerts / 3) * count : 0;
+	m_impl->statTris += mesh ? mesh->TriCount() * count : 0;
 	Impl::MeshGPU& g = *gp;
 
 	ITextureView* base = (mat && mat->diff) ? m_impl->GetTexSRV(mat->diff) : nullptr;
@@ -314,10 +356,25 @@ void NukeDiligent::renderShadowInstanced(Mesh* mesh, uint64_t instBuf, int first
 	ctx->SetVertexBuffers(0, 4, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	ctx->SetPipelineState(m_impl->shadowPSOInst);
 	ctx->CommitShaderResources(m_impl->shadowSRBInst, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
-	da.NumInstances          = (Uint32)count;
-	da.FirstInstanceLocation = (Uint32)first;
-	ctx->Draw(da);
+	if (g.idx)
+	{
+		// LOD0 range only: the whole IB also carries the appended LOD shells.
+		uint32_t l0First = 0, l0Count = 0;
+		m_impl->LodRange(mesh, 0, l0First, l0Count);
+		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawIndexedAttribs da{(Uint32)l0Count, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
+		da.FirstIndexLocation    = (Uint32)l0First;
+		da.NumInstances          = (Uint32)count;
+		da.FirstInstanceLocation = (Uint32)first;
+		ctx->DrawIndexed(da);
+	}
+	else
+	{
+		DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
+		da.NumInstances          = (Uint32)count;
+		da.FirstInstanceLocation = (Uint32)first;
+		ctx->Draw(da);
+	}
 }
 
 void NukeDiligent::endShadowPass() { /* the next beginCamera rebinds the camera targets */ }
@@ -325,7 +382,9 @@ void NukeDiligent::endShadowPass() { /* the next beginCamera rebinds the camera 
 void NukeDiligent::setShadowSettings(int resolution, float distance, float depthBias, float normalBias, float softness)
 {
 	int res = resolution < 256 ? 256 : (resolution > 8192 ? 8192 : resolution);
-	if (res != m_impl->shadowRes) m_impl->pendingShadowRes = res;   // applied at render() top (rebuilds the maps)
+	// LAST writer this frame wins (the apply site skips a rebuild when it matches the current
+	// res) — a first-differing-writer pending would let two worlds oscillate the map forever.
+	m_impl->pendingShadowRes = res;
 	m_impl->shadowDistance   = distance > 1.0f ? distance : 1.0f;
 	m_impl->shadowDepthBias  = depthBias;
 	m_impl->shadowNormalBias = normalBias;

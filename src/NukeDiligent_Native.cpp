@@ -66,6 +66,34 @@ void CreateGraphicsPSOCached(Diligent::GraphicsPipelineStateCreateInfo& ci, Dili
 	if (NukeDiligent::nativeImpl && out) NukeDiligent::nativeImpl->CreateGraphicsPipelineStateCached(ci, out);
 }
 
+void AddPipelineWarmup(const char* name, WarmupFn fn, void* user)
+{
+	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;
+	if (!d || !fn) return;
+	for (auto& e : d->warmups) if (e.user == user && e.fn == fn) return;   // idempotent
+	NukeDiligent::Impl::WarmEntry e;
+	e.name = name ? name : "pipelines"; e.fn = fn; e.user = user;
+	d->warmups.push_back(e);
+}
+
+void RearmPipelineWarmup(void* user)
+{
+	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;
+	if (!d) return;
+	for (auto& e : d->warmups) if (e.user == user) e.done = false;
+}
+
+void RemovePipelineWarmup(void* user)
+{
+	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;
+	if (!d) return;
+	for (size_t i = 0; i < d->warmups.size(); )
+	{
+		if (d->warmups[i].user == user) d->warmups.erase(d->warmups.begin() + i);
+		else ++i;
+	}
+}
+
 void Trash(Diligent::IDeviceObject* obj)
 {
 	if (NukeDiligent::nativeImpl && obj) NukeDiligent::nativeImpl->Trash(obj);
@@ -116,11 +144,11 @@ void SetRTWaterState(float level, float on, float fade, const float scatter[3], 
 // frames later as meters-below-level. One capture in flight.
 
 static const int   kBottomCapN    = 128;     // must equal WaterBody::kDepthN (the fetch guard)
-static const float kBottomCapNear = 0.1f;
-static const float kBottomCapFar  = 120.0f;  // 50 up + up to ~60 below the level
 static const float kBottomCapEye  = 50.0f;   // ortho eye height above the reference level
+static const float kBottomCapFar  = 120.0f;  // the level plus ~70 m of depth below it
 
-void NukeDiligent::beginWaterBottomPass(const float pos[3], const float quat[4], float sizeX, float sizeZ)
+void NukeDiligent::beginWaterBottomPass(const float pos[3], const float quat[4], float sizeX, float sizeZ,
+                                        float aboveY)
 {
 	Impl* d = m_impl;
 	if (d->capPending >= 0 || d->capActive) return;   // one capture in flight
@@ -149,11 +177,17 @@ void NukeDiligent::beginWaterBottomPass(const float pos[3], const float quat[4],
 		ax.y, az.y, dn.y, 0.0f,
 		ax.z, az.z, dn.z, 0.0f,
 		-dot(eye, ax), -dot(eye, az), -dot(eye, dn), 1.0f);
-	float4x4 proj = float4x4::Ortho(std::max(sizeX, 1.0f), std::max(sizeZ, 1.0f), kBottomCapNear, kBottomCapFar, false);
+	// The near plane decides how much of the world ABOVE the reference level takes part.
+	// aboveY = 0 clips at the level itself: the result is the bottom of the water column only,
+	// so nothing hanging in the air can be mistaken for a shoal. A positive aboveY lets terrain
+	// that rises out of the water through, which the consumers that read this as raw height need.
+	const float capNear = std::max(kBottomCapEye - std::max(aboveY, 0.0f), 0.05f);
+	float4x4 proj = float4x4::Ortho(std::max(sizeX, 1.0f), std::max(sizeZ, 1.0f), capNear, kBottomCapFar, false);
 	++d->passSerial;
 	d->curShadowVP = view * proj;
 	d->capLevel = pos[1];
 	d->capEyeY  = eye.y;
+	d->capNear  = capNear;
 
 	IDeviceContext* ctx = d->context;
 	ITextureView* dsv = d->capDepth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
@@ -198,7 +232,7 @@ bool NukeDiligent::fetchWaterBottom(float* out, int n)
 			if (z >= 0.9999f) d2 = 60.0f;   // nothing under this texel: deep
 			else
 			{
-				const float worldY = d->capEyeY - (kBottomCapNear + z * (kBottomCapFar - kBottomCapNear));
+				const float worldY = d->capEyeY - (d->capNear + z * (kBottomCapFar - d->capNear));
 				d2 = d->capLevel - worldY;
 			}
 			// -40 floor: consumers reuse this as raw terrain, so hills above the reference must survive.

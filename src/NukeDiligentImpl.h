@@ -91,9 +91,20 @@ struct NukeDiligent::Impl
 		wait(ci.pVS); wait(ci.pPS); wait(ci.pGS); wait(ci.pHS); wait(ci.pDS);
 		device->CreateGraphicsPipelineState(ci, pp);
 	}
-	// Async cache misses: SPIR-V grabbed and written to disk once the worker finishes.
+	// Async cache misses: bytecode grabbed and written to disk once the worker finishes.
 	std::vector<std::pair<Diligent::RefCntAutoPtr<Diligent::IShader>, std::string>> pendingShaderSaves;
 	void PollShaderSaves();
+
+	// Pipeline warm-up. Everything that owns pipelines registers a builder here instead of
+	// compiling on the draw path: the loop runs the pending ones under a per-frame time budget,
+	// so a cold cache costs a few frames of a missing effect rather than one long freeze. A
+	// builder returns true when it is done and false to be called again next frame.
+	struct WarmEntry { std::string name; bool (*fn)(void*) = nullptr; void* user = nullptr; bool done = false; };
+	std::vector<WarmEntry> warmups;
+	uint32_t                 warmSamples = 0;
+	Diligent::TEXTURE_FORMAT warmFmt = Diligent::TEX_FORMAT_UNKNOWN;
+	double                   warmBudgetMs = 3.0;   // per frame, across all builders
+	void PumpPipelineWarmup();
 	bool                          vsync    = true;    // main-present sync interval (1 = vsync, 0 = uncapped)
 	// DirectComposition objects for a TRANSPARENT window. IUnknown* keeps <dcomp.h> out of this
 	// header (typed use lives in NukeDiligent.cpp).
@@ -125,6 +136,34 @@ struct NukeDiligent::Impl
 	// Frame statistics (editor status bar); latched at the start of the next frame.
 	int statDraws = 0, statTris = 0;
 	int statDrawsOut = 0, statTrisOut = 0;
+
+	// ---- GPU pass timings ------------------------------------------------------------------
+	// Duration queries (two timestamps) around each pass. The GPU is frames behind, so results
+	// are read from a ring N frames later and never block; each resolved scope is reported to the
+	// engine profiler as "gpu.<name>", which is what the status bar and scripts read.
+	struct GpuScope
+	{
+		RefCntAutoPtr<IQuery> query;
+		std::string           name;
+		bool                  open = false;
+	};
+	static const int      kGpuRing = 4;
+	std::vector<GpuScope> gpuRing[kGpuRing];
+	bool                  outlineOpen = false;   // selection-outline mask is accepting meshes
+	int                   gpuCur   = 0;
+	int                   gpuOpen  = -1;  // index of the pass currently being timed, -1 = none
+	size_t                gpuUsed  = 0;   // scopes handed out this frame
+	bool                  gpuTimers = false;   // device reports duration-query support
+	void GpuFrame();                 // frame boundary: resolve the oldest ring, rotate
+	void GpuPass(const char* name);  // start timing a pass (closes the previous one)
+	void GpuPassEnd();
+	// RAII helper for a pass body that must close at the end of a scope.
+	struct GpuMark
+	{
+		Impl* im;
+		GpuMark(Impl* i, const char* n) : im(i) { if (im) im->GpuPass(n); }
+		~GpuMark() { if (im) im->GpuPassEnd(); }
+	};
 	RefCntAutoPtr<IBuffer>                uiVB, uiIB, uiCB;
 	int uiVBSize = 0;
 	int uiIBSize = 0;
@@ -276,6 +315,25 @@ struct NukeDiligent::Impl
 
 	// --- Ray tracing (D3D12) ---------------------------------------------------------------------------------
 	std::unordered_map<Mesh*, RefCntAutoPtr<IBottomLevelAS>> blasCache;   // BLAS per mesh (built once, reused)
+	// v4 indexed meshes: BLAS per IB range (a section, or the whole LOD0). Key packs
+	// firstIndex AND indexCount — a whole-LOD0 range and its first section share firstIndex 0.
+	std::map<std::pair<Mesh*, uint64_t>, RefCntAutoPtr<IBottomLevelAS>> blasSectionCache;
+	IBottomLevelAS* GetMeshBLASRange(Mesh* mesh, uint32_t firstIndex, uint32_t indexCount);
+
+	// --- GPU skinning (stage 3) ---------------------------------------------------------
+	struct MeshGPU;   // declared below with the mesh cache
+	RefCntAutoPtr<IPipelineState>         skinCSPSO;
+	RefCntAutoPtr<IShaderResourceBinding> skinCSSRB;    // one SRB, all-dynamic vars rebound per dispatch
+	RefCntAutoPtr<IBuffer>                skinCSParamsCB;
+	struct SkinRec
+	{
+		Mesh* src = nullptr;
+		RefCntAutoPtr<IBuffer> palette, morphW;   // per-frame uploads (dynamic, grow-on-demand)
+		int boneCap = 0, morphCap = 0;
+	};
+	std::map<Mesh*, SkinRec> skinRecs;            // skinned INSTANCE mesh -> its skin state
+	void EnsureSkinInputs(Mesh* source, MeshGPU& gs);   // lazy static compute inputs on the source
+	void RebuildSkinBLAS(Mesh* instance, MeshGPU& gi);  // refit all cached BLAS ranges over the posed verts
 	RefCntAutoPtr<ITopLevelAS>         tlas;                  // scene TLAS (rebuilt per frame)
 	RefCntAutoPtr<IBuffer>             tlasScratch, tlasInstanceBuf;
 	Uint32                             tlasMaxInstances = 0;
@@ -411,9 +469,38 @@ struct NukeDiligent::Impl
 		IDeviceObject* lastBind[11]  = {};
 		IDeviceObject* lastBindI[11] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
+		// What this pipeline was built for. Stale or never-built pipes are skipped by the draw
+		// and rebuilt by the warm-up; the draw falls back to the default world pipeline.
+		Uint8          builtSamples = 0;
+		TEXTURE_FORMAT builtFmt = TEX_FORMAT_UNKNOWN;
+		bool           buildFailed = false;   // latched: a broken shader is not retried every frame
 	};
 	std::unordered_map<uint64_t, WorldPipe> worldPipes;   // shader handle -> pipeline
 	uint64_t                              defaultWorldHandle = 0;   // builtin "world" pipeline
+	// Sample count / scene format an auxiliary pipeline set was built for. Same contract as
+	// WorldPipe: the draw skips a stale set, the warm-up rebuilds one set per frame.
+	struct PipeStamp
+	{
+		Uint8          s = 0;
+		TEXTURE_FORMAT f = TEX_FORMAT_UNKNOWN;
+		bool current(Uint8 s2, TEXTURE_FORMAT f2) const { return s == s2 && f == f2; }
+		void stamp(Uint8 s2, TEXTURE_FORMAT f2) { s = s2; f = f2; }
+	};
+	PipeStamp skyStamp, debugStamp, spriteStamp, decalStamp, outlineStamp;
+	bool WarmEnginePipelines();   // renderer's own entry in the warm-up pump
+	// The pipeline for a shader handle, or the default one while that shader's pipeline is
+	// still being built (or was built for another sample count / scene format). Null only when
+	// even the default is not usable.
+	WorldPipe* PipeFor(uint64_t h)
+	{
+		const TEXTURE_FORMAT fmt = SceneFmt();
+		auto ok = [&](WorldPipe& w) { return w.pso && w.builtSamples == samples && w.builtFmt == fmt; };
+		auto it = worldPipes.find(h);
+		if (it != worldPipes.end() && ok(it->second)) return &it->second;
+		auto d = worldPipes.find(defaultWorldHandle);
+		if (d != worldPipes.end() && ok(d->second)) return &d->second;
+		return nullptr;
+	}
 
 	// Per-draw redundancy gates: the shared dynamic CBs (worldCB/worldMatCB/drawFlagsCB) only re-map
 	// when their content changes WITHIN a pass. Every pass begin bumps passSerial and invalidates all
@@ -436,6 +523,11 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IShaderResourceBinding> gbufSRBInst;
 	IShaderResourceVariable*              gbufMRVarInst = nullptr;
 	IShaderResourceVariable*              gbufNrmVarInst = nullptr;
+	// Skinned twin (NUKE_SKINNED): stream 3 = previous-frame skinned positions -> true MVs.
+	RefCntAutoPtr<IPipelineState>         gbufPSOSkin;
+	RefCntAutoPtr<IShaderResourceBinding> gbufSRBSkin;
+	IShaderResourceVariable*              gbufMRVarSkin = nullptr;
+	IShaderResourceVariable*              gbufNrmVarSkin = nullptr;
 	bool warnedNoInstPipe = false;   // one-shot log: material shader without an instanced variant
 	uint64_t                              nextShaderHandle   = 1;   // handles handed to the engine
 	RefCntAutoPtr<IBuffer>                worldCB;     // VS: WVP + World   (shared)
@@ -481,7 +573,7 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<ITexture> capDepth, capStaging;
 	int   capPending = -1;
 	bool  capActive = false;
-	float capLevel = 0.0f, capEyeY = 0.0f;
+	float capLevel = 0.0f, capEyeY = 0.0f, capNear = 0.0f;
 	std::vector<NukeLight>                lights;      // scene lights (setLights); empty -> default sun
 
 	// --- Shadow maps (directional + spot share a 2D array; one slice per shadow-casting light) -----
@@ -610,11 +702,25 @@ struct NukeDiligent::Impl
 	bool     BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg);
 	void     RebuildForMSAA();   // rebuild all sample-count-dependent pipelines + targets after `samples` changes
 	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; int version = 0;
+	                 RefCntAutoPtr<IBuffer> idx; int numIndices = 0;   // v4 indexed meshes (null = soup)
 	                 // RT wind bend: NukeBend compute inputs + the BENT position buffer the BLAS builds over.
-	                 RefCntAutoPtr<IBuffer> bendSrc, bendData, bendPivot, posBent, blasScratch; };
+	                 RefCntAutoPtr<IBuffer> bendSrc, bendData, bendPivot, posBent, blasScratch;
+	                 // GPU skinning: skinned INSTANCE = UAV-writable pos/nrm (pos doubles as the
+	                 // draw VB + BLAS input) + previous-frame positions (TAA velocity);
+	                 // SOURCE mesh = static compute inputs, built lazily on first setSkinPalette.
+	                 bool skinned = false;
+	                 RefCntAutoPtr<IBuffer> skinPosPrev;
+	                 RefCntAutoPtr<IBuffer> skinSrcPos, skinSrcNrm, skinIdxBuf, skinWgtBuf, skinMorph;
+	                 int skinMorphCount = 0; };
 	std::unordered_map<Mesh*, MeshGPU>          meshCache;
 	MeshGPU* GetMeshGPU(Mesh* mesh);   // get-or-build a mesh's GPU vertex buffers; re-uploads in
 	                                   // place when Mesh::version changed (skinned/procedural)
+	// Active LOD by approximate screen coverage (bounding-sphere diameter / camera distance),
+	// against MeshLOD::screenSize thresholds. Uses the last beginCamera position.
+	int  SelectLod(Mesh* mesh, const float pos[3], const float scale[3]);
+	// The contiguous index (or soup vertex) range covering ALL sections of `lod`.
+	void LodRange(Mesh* mesh, int lod, uint32_t& first, uint32_t& count);
+	float lodCamPos[3] = { 0, 0, 0 };   // latched in beginCamera (shadow/probe passes reuse it)
 	std::unordered_map<Texture*, RefCntAutoPtr<ITexture>> texCache;   // engine Texture -> GPU texture
 	std::unordered_map<Texture*, std::vector<RefCntAutoPtr<ITexture>>> animTex;   // GIF: one Texture2D per frame
 	float4x4 curView, curProj;   // set in beginCamera, used in renderObject
@@ -649,6 +755,10 @@ struct NukeDiligent::Impl
 	// resize once the size settles; meanwhile the old buffers present stretched.
 	std::map<void*, std::pair<std::pair<int, int>, int>> uiVpStable;
 	std::map<void*, int> uiVpCooldown;   // frames to skip a window after a FAILED chain creation
+	// A resize the driver REFUSED (the chain kept its size — e.g. Vulkan clamping to the
+	// surface's current extent). Retrying it every frame is an infinite resize loop, so the
+	// target is remembered and skipped until a different one is asked for.
+	std::map<void*, std::pair<int, int>> uiVpRefused;
 	std::map<void*, int> uiVpGrace;      // frames to skip draw+present right after a resize (diag)
 	// Secondary presents are DEFERRED to after the MAIN Present: presenting mid-frame splits the
 	// command stream between a preview RT's write and its SRV sampling, which the D3D12 debug layer

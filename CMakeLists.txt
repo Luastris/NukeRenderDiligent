@@ -53,6 +53,7 @@ add_library(NukeRenderDiligent SHARED
     src/NukeDiligent_RT.cpp
     src/NukeDiligent_Sprite.cpp
     src/NukeDiligent_Decal.cpp
+    src/NukeDiligent_Profile.cpp
     src/NukeDiligent_Native.cpp
 )
 
@@ -73,11 +74,15 @@ target_include_directories(NukeRenderDiligent PRIVATE
 )
 
 # glfw import lib (vcpkg). Debug build links the debug import lib.
+# + NukeEngine.lib: Mesh v4 helpers (TriCount/Section/Lod/EnsureBounds) are exported class
+# members — the renderer now links the engine import lib like every other module.
 target_link_directories(NukeRenderDiligent PRIVATE
     "${VCPKG_INSTALLED}/$<$<CONFIG:Debug>:debug/>lib"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/x64/$<CONFIG>"
 )
 
 target_link_libraries(NukeRenderDiligent PRIVATE
+    NukeEngine
     Diligent-GraphicsEngineD3D11-static
     Diligent-GraphicsEngineD3D12-static
     Diligent-GraphicsEngineVk-static

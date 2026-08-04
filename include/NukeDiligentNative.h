@@ -81,6 +81,19 @@ NUKEDLG_API void CreateShaderCached(Diligent::ShaderCreateInfo& sci, Diligent::I
 NUKEDLG_API void CreateGraphicsPSOCached(Diligent::GraphicsPipelineStateCreateInfo& ci,
                                          Diligent::IPipelineState** out);
 
+// Pipeline warm-up. Register every pipeline builder here instead of compiling on the draw path:
+// the renderer runs the pending ones once per frame under a shared time budget, so a cold shader
+// cache costs a few frames of a missing effect rather than one long freeze, and it re-arms them
+// when the sample count or the scene format changes. `fn` returns true when its pipelines are
+// ready and false to be called again next frame; it must be able to stop half-way and resume.
+// Unregister before the owner dies.
+typedef bool (*WarmupFn)(void* user);
+NUKEDLG_API void AddPipelineWarmup(const char* name, WarmupFn fn, void* user);
+// Ask for a finished builder to be called again — a feature turned on at runtime needs
+// pipelines that were not worth compiling before.
+NUKEDLG_API void RearmPipelineWarmup(void* user);
+NUKEDLG_API void RemovePipelineWarmup(void* user);
+
 // Deferred destruction. Never Release() a live device object inline — hand it here.
 NUKEDLG_API void Trash(Diligent::IDeviceObject* obj);
 

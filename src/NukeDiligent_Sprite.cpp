@@ -214,7 +214,8 @@ void NukeDiligent::drawSpriteRunLit(Texture* tex, Texture* normal, const float* 
 // are still bound — i.e. before the MSAA resolve.
 void NukeDiligent::Impl::FlushSprites()
 {
-	if (!spritePSO || spriteBatchVerts.empty()) { spriteBatchVerts.clear(); spriteBatchTex = nullptr; spriteBatchOpen = false; return; }
+	if (!spritePSO || !spriteStamp.current(samples, SceneFmt()) || spriteBatchVerts.empty())
+	{ spriteBatchVerts.clear(); spriteBatchTex = nullptr; spriteBatchOpen = false; return; }
 	// The sprite PSO needs a D32 depth buffer; outside a camera pass the bound target has none.
 	if (!cameraPassActive) { spriteBatchVerts.clear(); spriteBatchTex = nullptr; spriteBatchOpen = false; return; }
 	ITextureView* srv = spriteBatchTex ? GetTexSRV(spriteBatchTex)

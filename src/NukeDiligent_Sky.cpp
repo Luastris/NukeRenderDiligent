@@ -54,7 +54,9 @@ void NukeDiligent::Impl::CreateSkyResources()
 
 void NukeDiligent::Impl::DrawSky()
 {
-	if (!skyPSO || sky.mode != 1) return;
+	// Stale after an MSAA/format change until the warm-up rebuilds it — skipping beats a
+	// pipeline that does not match the target.
+	if (!skyPSO || !skyStamp.current(samples, SceneFmt()) || sky.mode != 1) return;
 	float4x4 invVP = (curView * curProj).Inverse();
 	ITextureView* starSRV = sky.starsTex ? GetTexSRV(sky.starsTex) : nullptr;
 	ITextureView* moonSRV = (sky.moonTex && sky.moonAmount > 0.0f) ? GetTexSRV(sky.moonTex) : nullptr;

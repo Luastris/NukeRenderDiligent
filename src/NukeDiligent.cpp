@@ -562,6 +562,8 @@ int NukeDiligent::render()
 	// RT fallback TLAS on the first frame (idempotent): building it at init deadlocks Vulkan's upload path.
 	if (m_impl->rtSupported && !m_impl->fallbackTLAS) m_impl->EnsureRTFallback();
 
+	m_impl->GpuFrame();   // resolve the GPU timings of an earlier frame, rotate the query ring
+
 	// Latch the completed frame's counters for getFrameStats, start fresh.
 	m_impl->statDrawsOut = m_impl->statDraws;
 	m_impl->statTrisOut  = m_impl->statTris;
@@ -633,7 +635,10 @@ int NukeDiligent::render()
 
 	// 2) UI pass: rebind the backbuffer WITHOUT clearing, then draw the UI on top.
 	m_impl->context->SetRenderTargets(1, &pRTV, pDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	for (auto& cb : m_impl->onGUI) cb();
+	{
+		Impl::GpuMark mk(m_impl, "ui");
+		for (auto& cb : m_impl->onGUI) cb();
+	}
 
 	if (m_impl->DeviceRemoved()) return 1;   // device lost this frame: skip present, keep the app alive
 	m_impl->swapChain->Present(m_impl->vsync ? 1 : 0);   // SyncInterval 1 = vsync, 0 = uncapped
@@ -648,7 +653,8 @@ int NukeDiligent::render()
 	m_impl->vpPresentQueue.clear();
 	// D3D detached windows get their pixels via GDI from offscreen RTs (no secondary swap chains).
 	m_impl->BlitHostWindows();
-	m_impl->PollShaderSaves();   // persist finished background compiles into the disk cache
+	m_impl->PumpPipelineWarmup();   // build a slice of the pending pipelines, off the draw path
+	m_impl->PollShaderSaves();      // persist finished background compiles into the disk cache
 	return 1;
 }
 
@@ -673,11 +679,13 @@ void NukeDiligent::requestClose()
 	if (m_window) glfwSetWindowShouldClose(m_window, GLFW_TRUE);
 }
 
-// Creates a shader through the on-disk SPIR-V cache (Vulkan only): the key hashes every
-// compile input; a hit creates the shader from bytecode, a miss compiles and queues a save.
+// Creates a shader through the on-disk bytecode cache: the key hashes every compile input, a
+// hit creates the shader from bytecode, a miss compiles and queues a save. Every backend gets
+// one — bytecode is portable across drivers, and a shipped game that recompiles its whole
+// shader set on each launch stalls exactly where it must not.
 void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader** pp)
 {
-	if (!useVulkan || !ci.Source)   // only source-based shaders on the slow-compile backend
+	if (!ci.Source)   // bytecode already in hand: nothing to cache
 	{
 		device->CreateShader(ci, pp);
 		return;
@@ -710,8 +718,10 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 	boost::system::error_code dec;
 	bfs::path cacheRoot = boost::dll::program_location(dec).parent_path();
 	if (dec || cacheRoot.empty()) cacheRoot = ".";
-	const bfs::path dir = cacheRoot / "config" / "shadercache_vk";
-	const bfs::path file = dir / (std::string(hex) + ".spv");
+	// Per backend: SPIR-V and DXBC/DXIL are different products of the same source.
+	const char* backendTag = useVulkan ? "vk" : (useD3D12 ? "d3d12" : "d3d11");
+	const bfs::path dir = cacheRoot / "config" / (std::string("shadercache_") + backendTag);
+	const bfs::path file = dir / (std::string(hex) + ".bin");
 
 	boost::system::error_code ec;
 	if (bfs::exists(file, ec))
@@ -737,6 +747,28 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 	device->CreateShader(cc, pp);
 	if (*pp)
 		pendingShaderSaves.emplace_back(RefCntAutoPtr<IShader>(*pp), file.string());
+}
+
+// Runs pending pipeline builders under a time budget. Called once per frame after the passes,
+// so the sample count and scene format of the pass just drawn are the ones the pipelines are
+// built for, and the next frame can already use them. A change of either retires every
+// pipeline built against the old pair and re-arms the builders.
+void NukeDiligent::Impl::PumpPipelineWarmup()
+{
+	if (warmups.empty()) return;
+	const TEXTURE_FORMAT fmt = SceneFmt();
+	if (samples != warmSamples || fmt != warmFmt)
+	{
+		warmSamples = samples; warmFmt = fmt;
+		for (WarmEntry& e : warmups) e.done = false;
+	}
+	const double t0 = glfwGetTime();
+	for (WarmEntry& e : warmups)
+	{
+		if (e.done || !e.fn) continue;
+		e.done = e.fn(e.user);
+		if ((glfwGetTime() - t0) * 1000.0 >= warmBudgetMs) break;   // the rest waits a frame
+	}
 }
 
 // Writes finished cache-miss compiles to disk; called once per frame, since an async

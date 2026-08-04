@@ -59,11 +59,49 @@ bool NukeDiligent::Impl::CameraSize(const NukeCameraDesc& cam, int& w, int& h)
 void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
                                 const float pos[3], const float quat[4], const float scale[3])
 {
-	if (m_impl->worldPipes.empty()) return;
+	if (!mesh) return;
+	// One material for the whole mesh: the active LOD is one contiguous IB range = one draw.
+	uint32_t first = 0, count = 0;
+	m_impl->LodRange(mesh, m_impl->SelectLod(mesh, pos, scale), first, count);
+	RenderObjectRange(mesh, mat, pos, quat, scale, first, count);
+}
+
+void NukeDiligent::renderObjectMulti(Mesh* mesh, Material* const* mats, int matCount,
+                                     const float pos[3], const float quat[4], const float scale[3],
+                                     int blendPass)
+{
+	if (!mesh) return;
+	if (mesh->numIndices <= 0 || mesh->sections.empty())   // slot-less mesh: plain draw with slot 0
+	{
+		Material* m = matCount > 0 ? mats[0] : nullptr;
+		const int bm = m ? m->blendMode : 0;
+		if (blendPass == 0 && bm != 0) return;
+		if (blendPass == 1 && bm == 0) return;
+		renderObject(mesh, m, pos, quat, scale);
+		return;
+	}
+	MeshLOD L = mesh->Lod(m_impl->SelectLod(mesh, pos, scale));
+	for (int s = 0; s < L.sectionCount; ++s)
+	{
+		MeshSection sec = mesh->Section(L.firstSection + s);
+		Material* m = (sec.slot >= 0 && sec.slot < matCount && mats[sec.slot]) ? mats[sec.slot]
+		            : (matCount > 0 ? mats[0] : nullptr);
+		const int bm = m ? m->blendMode : 0;
+		if (blendPass == 0 && bm != 0) continue;
+		if (blendPass == 1 && bm == 0) continue;
+		RenderObjectRange(mesh, m, pos, quat, scale, sec.firstIndex, sec.indexCount);
+	}
+}
+
+void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
+                                     const float pos[3], const float quat[4], const float scale[3],
+                                     uint32_t firstIndex, uint32_t indexCount)
+{
+	if (m_impl->worldPipes.empty() || indexCount == 0) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
 	++m_impl->statDraws;                              // frame stats (status bar)
-	m_impl->statTris += mesh ? mesh->numVerts / 3 : 0;
+	m_impl->statTris += (int)indexCount / 3;
 	Impl::MeshGPU& g = *gp;
 
 	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
@@ -100,10 +138,9 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	}
 	uint64_t h = (mat && mat->shader && mat->shader->rendererHandle) ? mat->shader->rendererHandle
 	                                                                  : m_impl->defaultWorldHandle;
-	auto pit = m_impl->worldPipes.find(h);
-	if (pit == m_impl->worldPipes.end()) pit = m_impl->worldPipes.find(m_impl->defaultWorldHandle);
-	if (pit == m_impl->worldPipes.end()) return;
-	Impl::WorldPipe& wp = pit->second;
+	Impl::WorldPipe* pipe = m_impl->PipeFor(h);
+	if (!pipe) return;
+	Impl::WorldPipe& wp = *pipe;
 
 	// Gated on the material changing; dynamic CBs recycle per frame, so the gate is pass-scoped.
 	if (m_impl->matCBFor != mat || m_impl->matCBPass != m_impl->passSerial)
@@ -164,64 +201,105 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	else if (mat) { if (mat->blendMode == 1 && wp.psoBlend) pso = wp.psoBlend; else if (mat->blendMode == 2 && wp.psoAdd) pso = wp.psoAdd; }
 	ctx->SetPipelineState(pso);
 	ctx->CommitShaderResources(wp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
-	ctx->Draw(da);
+	if (g.idx)
+	{
+		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawIndexedAttribs da{(Uint32)indexCount, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
+		da.FirstIndexLocation = (Uint32)firstIndex;
+		ctx->DrawIndexed(da);
+	}
+	else
+	{
+		DrawAttribs da{(Uint32)indexCount, DRAW_FLAG_VERIFY_STATES};
+		da.StartVertexLocation = (Uint32)firstIndex;
+		ctx->Draw(da);
+	}
 }
 
-void NukeDiligent::renderSelectionOutline(Mesh* mesh, const float pos[3], const float quat[4], const float scale[3])
+void NukeDiligent::selectionOutlineBegin()
 {
 	if (!m_impl->outlineMaskPSO || !m_impl->outlineEdgePSO || !m_impl->curRTV) return;
+	if (!m_impl->outlineStamp.current(m_impl->samples, m_impl->SceneFmt())) return;   // rebuilding
+	m_impl->EnsureOutlineMask(m_impl->curRTW, m_impl->curRTH);
+	if (!m_impl->outlineMaskRTV || !m_impl->outlineMaskSRV) return;
+	const float zero[4] = { 0, 0, 0, 0 };
+	m_impl->context->SetRenderTargets(1, &m_impl->outlineMaskRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	m_impl->context->ClearRenderTarget(m_impl->outlineMaskRTV, zero, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	m_impl->outlineOpen = true;
+}
+
+// One mesh into the open mask (alpha = 1 over the object). LOD0 only: the outline follows the
+// silhouette the camera sees, and the IB carries the coarser shells after it.
+void NukeDiligent::selectionOutlineAdd(Mesh* mesh, const float pos[3], const float quat[4], const float scale[3])
+{
+	if (!m_impl->outlineOpen || !mesh) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
 	Impl::MeshGPU& g = *gp;
-	m_impl->EnsureOutlineMask(m_impl->curRTW, m_impl->curRTH);
-	if (!m_impl->outlineMaskRTV || !m_impl->outlineMaskSRV) return;
-
 	IDeviceContext* ctx = m_impl->context;
 
-	// pass 1: mesh -> mask RT (alpha = 1 over the object)
-	{
-		float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
-		               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
-		               * float4x4::Translation(pos[0], pos[1], pos[2]);
-		float4x4 wvp = world * m_impl->curView * m_impl->curProj;
-		struct CBData { float4x4 wvp; float4x4 world; };
-		{ MapHelper<CBData> cb(ctx, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD); cb->wvp = wvp; cb->world = world; }
+	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
+	               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
+	               * float4x4::Translation(pos[0], pos[1], pos[2]);
+	float4x4 wvp = world * m_impl->curView * m_impl->curProj;
+	struct CBData { float4x4 wvp; float4x4 world; };
+	{ MapHelper<CBData> cb(ctx, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD); cb->wvp = wvp; cb->world = world; }
 
-		const float zero[4] = { 0, 0, 0, 0 };
-		ctx->SetRenderTargets(1, &m_impl->outlineMaskRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-		ctx->ClearRenderTarget(m_impl->outlineMaskRTV, zero, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-		IBuffer* vbs[]  = { g.pos, g.nrm, g.uv };
-		Uint64   offs[] = { 0, 0, 0 };
-		ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
-		ctx->SetPipelineState(m_impl->outlineMaskPSO);
-		ctx->CommitShaderResources(m_impl->outlineMaskSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	IBuffer* vbs[]  = { g.pos, g.nrm, g.uv };
+	Uint64   offs[] = { 0, 0, 0 };
+	ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	ctx->SetPipelineState(m_impl->outlineMaskPSO);
+	ctx->CommitShaderResources(m_impl->outlineMaskSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	if (g.idx)
+	{
+		uint32_t l0First = 0, l0Count = 0;
+		m_impl->LodRange(mesh, 0, l0First, l0Count);
+		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawIndexedAttribs da{(Uint32)l0Count, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
+		da.FirstIndexLocation = (Uint32)l0First;
+		ctx->DrawIndexed(da);
+	}
+	else
+	{
 		DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
 		ctx->Draw(da);
 	}
+}
 
-	// pass 2: fullscreen edge-detect over the mask -> border into the camera RT
+void NukeDiligent::selectionOutlineEnd()
+{
+	if (!m_impl->outlineOpen) return;
+	m_impl->outlineOpen = false;
+	IDeviceContext* ctx = m_impl->context;
+
+	// Fullscreen edge-detect over the accumulated mask -> border into the camera RT.
+	struct EdgeData { float texel[4]; };
 	{
-		struct EdgeData { float texel[4]; };
-		{
-			MapHelper<EdgeData> cb(ctx, m_impl->outlineEdgeCB, MAP_WRITE, MAP_FLAG_DISCARD);
-			cb->texel[0] = (m_impl->curRTW > 0) ? 1.0f / m_impl->curRTW : 0.0f;
-			cb->texel[1] = (m_impl->curRTH > 0) ? 1.0f / m_impl->curRTH : 0.0f;
-			cb->texel[2] = 2.0f;   // outline thickness in pixels (constant on screen)
-			cb->texel[3] = 0.0f;
-		}
-		ctx->SetRenderTargets(1, &m_impl->curRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-		ctx->SetVertexBuffers(0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
-		if (m_impl->outlineEdgeMaskVar) m_impl->outlineEdgeMaskVar->Set(m_impl->outlineMaskSRV);
-		ctx->SetPipelineState(m_impl->outlineEdgePSO);
-		ctx->CommitShaderResources(m_impl->outlineEdgeSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-		DrawAttribs fs{3, DRAW_FLAG_VERIFY_STATES};
-		ctx->Draw(fs);
+		MapHelper<EdgeData> cb(ctx, m_impl->outlineEdgeCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		cb->texel[0] = (m_impl->curRTW > 0) ? 1.0f / m_impl->curRTW : 0.0f;
+		cb->texel[1] = (m_impl->curRTH > 0) ? 1.0f / m_impl->curRTH : 0.0f;
+		cb->texel[2] = 2.0f;   // outline thickness in pixels (constant on screen)
+		cb->texel[3] = 0.0f;
 	}
+	ctx->SetRenderTargets(1, &m_impl->curRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ctx->SetVertexBuffers(0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	if (m_impl->outlineEdgeMaskVar) m_impl->outlineEdgeMaskVar->Set(m_impl->outlineMaskSRV);
+	ctx->SetPipelineState(m_impl->outlineEdgePSO);
+	ctx->CommitShaderResources(m_impl->outlineEdgeSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs fs{3, DRAW_FLAG_VERIFY_STATES};
+	ctx->Draw(fs);
 
 	// Must restore the camera targets WITH depth: endCamera's flushes use D32 PSOs, and a
 	// depth-less binding (DSV = UNKNOWN) makes every later draw mismatch and skip depth testing.
 	ctx->SetRenderTargets(1, &m_impl->curRTV, m_impl->curDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+}
+
+// Single-mesh convenience: the batched path with one entry.
+void NukeDiligent::renderSelectionOutline(Mesh* mesh, const float pos[3], const float quat[4], const float scale[3])
+{
+	selectionOutlineBegin();
+	selectionOutlineAdd(mesh, pos, quat, scale);
+	selectionOutlineEnd();
 }
 
 // Fill the world FrameCB (camera pos, ambient, lights, shadow params, sky IBL, reflection probe).
@@ -284,8 +362,12 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 
 void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 {
+	m_impl->GpuPass("scene");   // geometry of this camera, up to the post chain in endCamera
 	++m_impl->passSerial;   // invalidate the per-draw redundancy gates (shared CBs re-map per pass)
 	m_impl->curTarget = cam.target;   // feedback guard: GetTexSRV won't sample the RT we draw into
+	// LOD anchor: mesh LOD selection measures distance from the camera drawing the frame
+	// (shadow/probe passes reuse the latest camera, not the light).
+	m_impl->lodCamPos[0] = cam.camPos[0]; m_impl->lodCamPos[1] = cam.camPos[1]; m_impl->lodCamPos[2] = cam.camPos[2];
 	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
 	m_impl->curPostSrc = nullptr; m_impl->curPostDst = nullptr;
 	const bool ms = m_impl->samples > 1;
@@ -435,6 +517,7 @@ void NukeDiligent::Impl::DrawDebugLines(bool toBackbuffer)
 	IPipelineState* pso = toBackbuffer ? debugPSOBB : debugPSO;
 	IShaderResourceBinding* srb = toBackbuffer ? debugSRBBB : debugSRB;
 	if (!pso) return;
+	if (!toBackbuffer && !debugStamp.current(samples, SceneFmt())) return;   // rebuilding
 	std::vector<float> verts;
 	{
 		std::lock_guard<std::mutex> lock(debugMutex);
@@ -559,6 +642,7 @@ void NukeDiligent::endCamera()
 		ra.Format = m_impl->SceneFmt();
 		m_impl->context->ResolveTextureSubresource(m_impl->curResolveSrc, m_impl->curResolveDst, ra);
 	}
+	m_impl->GpuPass("post");   // resolve is done; from here the frame is fullscreen work
 	// 1.5) Module post hook — after the resolve, BEFORE the user chain: its output is scene content.
 	ITextureView* chainSrc = m_impl->curPostSrc;
 	{
@@ -629,6 +713,7 @@ void NukeDiligent::endCamera()
 		chainSrc = srcSRV;
 	}
 	// 3) Final tonemap/encode into the output (RT's post texture, or the backbuffer for target 0).
+	m_impl->GpuPass("tonemap");
 	if (chainSrc && m_impl->curPostDst)
 	{
 		m_impl->RunPostPass(chainSrc, m_impl->curPostDst, m_impl->curRTW, m_impl->curRTH, m_impl->curTarget == 0);
@@ -639,6 +724,7 @@ void NukeDiligent::endCamera()
 		m_impl->FlushScreenPost(m_impl->curTarget == 0);   // AfterPost screen-space canvas sprites (crisp HUD)
 	}
 
+	m_impl->GpuPassEnd();
 	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;
 	m_impl->curPostSrc = nullptr; m_impl->curPostDst = nullptr;
 	m_impl->curTarget = 0;
@@ -748,7 +834,7 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
 	++m_impl->statDraws;
-	m_impl->statTris += mesh ? (mesh->numVerts / 3) * count : 0;
+	m_impl->statTris += mesh ? mesh->TriCount() * count : 0;
 	Impl::MeshGPU& g = *gp;
 
 	// Identical for every instanced draw of the pass: map once, and again if a plain draw overwrote it.
@@ -784,20 +870,19 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	// A shader without an instanced variant falls back to the default world instanced pipeline.
 	uint64_t h = (mat && mat->shader && mat->shader->rendererHandle) ? mat->shader->rendererHandle
 	                                                                  : m_impl->defaultWorldHandle;
-	auto pit = m_impl->worldPipes.find(h);
-	if (pit == m_impl->worldPipes.end()) pit = m_impl->worldPipes.find(m_impl->defaultWorldHandle);
-	if (pit == m_impl->worldPipes.end()) return;
-	if (!pit->second.psoInst)
+	Impl::WorldPipe* pipe = m_impl->PipeFor(h);
+	if (!pipe) return;
+	if (!pipe->psoInst)
 	{
 		if (!m_impl->warnedNoInstPipe)
 		{
 			m_impl->warnedNoInstPipe = true;
 			cout << "[NukeDiligent]\tmaterial shader has no instanced variant (handle NUKE_INSTANCED in its source) — default world shading used" << endl;
 		}
-		pit = m_impl->worldPipes.find(m_impl->defaultWorldHandle);
-		if (pit == m_impl->worldPipes.end() || !pit->second.psoInst) return;
+		pipe = m_impl->PipeFor(m_impl->defaultWorldHandle);
+		if (!pipe || !pipe->psoInst) return;
 	}
-	Impl::WorldPipe& wp = pit->second;
+	Impl::WorldPipe& wp = *pipe;
 
 	// Per-draw flags + material CB — gated on the material changing (see renderObject).
 	if (m_impl->matCBFor != mat || m_impl->matCBPass != m_impl->passSerial)
@@ -860,8 +945,23 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 		m_impl->lastInstBind = { gp, instBuf, (void*)pso, m_impl->passSerial };
 	}
 	ctx->CommitShaderResources(wp.srbInst, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
-	da.NumInstances          = (Uint32)count;
-	da.FirstInstanceLocation = (Uint32)first;
-	ctx->Draw(da);
+	if (g.idx)
+	{
+		// LOD0 range only: the whole IB also carries the appended LOD shells.
+		uint32_t l0First = 0, l0Count = 0;
+		m_impl->LodRange(mesh, 0, l0First, l0Count);
+		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawIndexedAttribs da{(Uint32)l0Count, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
+		da.FirstIndexLocation    = (Uint32)l0First;
+		da.NumInstances          = (Uint32)count;
+		da.FirstInstanceLocation = (Uint32)first;
+		ctx->DrawIndexed(da);
+	}
+	else
+	{
+		DrawAttribs da{(Uint32)g.numVerts, DRAW_FLAG_VERIFY_STATES};
+		da.NumInstances          = (Uint32)count;
+		da.FirstInstanceLocation = (Uint32)first;
+		ctx->Draw(da);
+	}
 }

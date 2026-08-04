@@ -25,7 +25,27 @@ public:
 	int  render() override;
 	void renderObject(Mesh* mesh, Material* mat,
 	                  const float pos[3], const float quat[4], const float scale[3]) override;
+	// Mesh v2 sectioned multi-material draws (see irender.h for the slot/blendPass contract).
+	void renderObjectMulti(Mesh* mesh, Material* const* mats, int matCount,
+	                       const float pos[3], const float quat[4], const float scale[3],
+	                       int blendPass = -1) override;
+	void renderShadowObjectMulti(Mesh* mesh, Material* const* mats, int matCount,
+	                             const float pos[3], const float quat[4], const float scale[3]) override;
+	void renderGBufferObjectMulti(Mesh* mesh, Material* const* mats, int matCount,
+	                              const float pos[3], const float quat[4], const float scale[3],
+	                              const float prevPos[3], const float prevQuat[4], const float prevScale[3],
+	                              int blendPass = 0) override;
+	void addRTInstanceMulti(Mesh* mesh, Material* const* mats, int matCount,
+	                        const float pos[3], const float quat[4], const float scale[3],
+	                        bool inReflections, bool castShadows) override;
+	// GPU skinning (Anim/Mesh v2 stage 3)
+	bool gpuSkin() override;
+	void setSkinPalette(Mesh* instance, Mesh* source, const float* palette16, int boneCount,
+	                    const float* morphWeights = nullptr, int morphCount = 0) override;
 	void renderSelectionOutline(Mesh* mesh, const float pos[3], const float quat[4], const float scale[3]) override;
+	void selectionOutlineBegin() override;
+	void selectionOutlineAdd(Mesh* mesh, const float pos[3], const float quat[4], const float scale[3]) override;
+	void selectionOutlineEnd() override;
 	void setWindowTitle(const char* title) override;
 	bool isWindowFocused() override;
 	bool isWindowMaximized() override;
@@ -62,7 +82,8 @@ public:
 	void setSpriteSoftDepth(float dist) override;                               // 7.3 soft particles
 	void setBendPushers(const float* xyzr, int count) override;                 // 7.4 foliage interaction
 	void setBendVolumes(const float* vols, int count) override;                 // 7.4 zones/fields bend
-	void beginWaterBottomPass(const float pos[3], const float quat[4], float sizeX, float sizeZ) override;
+	void beginWaterBottomPass(const float pos[3], const float quat[4], float sizeX, float sizeZ,
+	                          float aboveY) override;
 	void endWaterBottomPass() override;
 	bool fetchWaterBottom(float* out, int n) override;
 	bool isMouseButtonDown(int button) override;
@@ -153,6 +174,20 @@ public:
 	struct Impl;          // PImpl: keeps Diligent types out of this header
 	static Impl* nativeImpl;   // active renderer's Impl for the native hatch; set/cleared by ctor/dtor
 private:
+	// Section-range draw cores behind renderObject/renderShadowObject/renderGBufferObject and
+	// their Multi variants: firstIndex/indexCount select the IB range (soup meshes pass the
+	// full vertex range and draw non-indexed).
+	void RenderObjectRange(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
+	                       uint32_t firstIndex, uint32_t indexCount);
+	void RenderShadowRange(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
+	                       uint32_t firstIndex, uint32_t indexCount);
+	void RenderGBufferRange(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
+	                        const float prevPos[3], const float prevQuat[4], const float prevScale[3],
+	                        uint32_t firstIndex, uint32_t indexCount);
+	// One TLAS entry over an IB range (indexed meshes: per-section BLAS; soup passes 0/numVerts).
+	void AddRTInstanceRange(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
+	                        bool inReflections, bool castShadows, uint32_t firstIndex, uint32_t indexCount);
+
 	Impl*       m_impl   = nullptr;
 	GLFWwindow* m_window = nullptr;
 	int         m_cursorMode = 0;   // 0 Normal / 1 Hidden / 2 Locked / 3 Confined

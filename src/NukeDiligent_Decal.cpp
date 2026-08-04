@@ -95,7 +95,7 @@ void NukeDiligent::drawDecal(Texture* tex, const float pos[3], const float quat[
                              const float tint[4], float intensity, float angleFade, int mode)
 {
 	m_impl->lastInstBind.pso = nullptr;   // decal pipeline replaces the instanced VB/PSO state
-	if (!m_impl->decalPSO || !tex) return;
+	if (!m_impl->decalPSO || !m_impl->decalStamp.current(m_impl->samples, m_impl->SceneFmt()) || !tex) return;
 	ITextureView* dtex = m_impl->GetTexSRV(tex);
 	if (!dtex || !m_impl->gbufDepthSRV) return;   // needs the depth prepass (engine forces it for decals)
 

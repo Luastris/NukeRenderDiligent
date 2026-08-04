@@ -207,6 +207,9 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 		}
 		else if ((int)sc->GetDesc().Width != w || (int)sc->GetDesc().Height != h)
 		{
+			// A target the driver already refused: asking again every frame is a live-lock.
+			auto ref = uiVpRefused.find(handle);
+			if (ref != uiVpRefused.end() && ref->second.first == w && ref->second.second == h) continue;
 			// Debounced: a per-frame resize storm during a live drag starves the main swap chain's latency wait.
 			auto& st = uiVpStable[handle];
 			if (st.first.first != w || st.first.second != h) { st.first = { w, h }; st.second = 1; continue; }
@@ -218,6 +221,13 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 			std::cout << "[NukeDiligent]	vp chain RESIZE " << handle << " " << sc->GetDesc().Width << "x"
 			          << sc->GetDesc().Height << " -> " << w << "x" << h << std::endl;
 			sc->Resize((Uint32)w, (Uint32)h);
+			if ((int)sc->GetDesc().Width != w || (int)sc->GetDesc().Height != h)
+			{
+				uiVpRefused[handle] = { w, h };   // driver kept its own size: stop asking
+				std::cout << "[NukeDiligent]	vp chain RESIZE REFUSED (kept " << sc->GetDesc().Width
+				          << "x" << sc->GetDesc().Height << ")" << std::endl;
+			}
+			else uiVpRefused.erase(handle);
 			std::cout << "[NukeDiligent]	vp chain RESIZE done" << std::endl;
 			uiVpGrace[handle] = 2;   // settle frames after a resize (same DXGI race as creation)
 			heavyOpDone = true;
