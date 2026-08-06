@@ -1,0 +1,234 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 947c391e6..79344680d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -158,9 +158,17 @@ endif()
+ add_library(Diligent-PublicBuildSettings INTERFACE)
+ 
+ if(PLATFORM_WIN32 OR PLATFORM_UNIVERSAL_WINDOWS)
+-    try_compile(HAS_D3D11 "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/BuildTools/CMake/CheckD3D11.cpp")
+-    try_compile(HAS_D3D12 "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/BuildTools/CMake/CheckD3D12.cpp")
+-    try_compile(HAS_ATL "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/BuildTools/CMake/CheckATL.cpp")
++    # NUKE patch: honor pre-seeded results — the probes only pass from a VS dev prompt
++    # (plain-shell try_compile misses ATL), while the real build resolves them fine.
++    if(NOT DEFINED HAS_D3D11)
++        try_compile(HAS_D3D11 "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/BuildTools/CMake/CheckD3D11.cpp")
++    endif()
++    if(NOT DEFINED HAS_D3D12)
++        try_compile(HAS_D3D12 "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/BuildTools/CMake/CheckD3D12.cpp")
++    endif()
++    if(NOT DEFINED HAS_ATL)
++        try_compile(HAS_ATL "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/BuildTools/CMake/CheckATL.cpp")
++    endif()
+     message("")
+     message("Checking for Direct3D11 and Direct3D12 support:")
+     message("  d3d11.h found:   " ${HAS_D3D11})
+diff --git a/Graphics/GraphicsEngineD3D12/src/CommandContext.cpp b/Graphics/GraphicsEngineD3D12/src/CommandContext.cpp
+index d572f5ef4..0da954de4 100644
+--- a/Graphics/GraphicsEngineD3D12/src/CommandContext.cpp
++++ b/Graphics/GraphicsEngineD3D12/src/CommandContext.cpp
+@@ -104,6 +104,38 @@ ID3D12GraphicsCommandList* CommandContext::Close(CComPtr<ID3D12CommandAllocator>
+ 
+     VERIFY_EXPR(m_pCurrentAllocator != nullptr);
+     HRESULT hr = m_pCommandList->Close();
++    // NUKE PATCH: name the actual HRESULT + the device-removal reason before the assert.
++    // A Close failure with NO validation error queued = the device was removed
++    // ASYNCHRONOUSLY (GPU fault executing earlier frames) — see the DRED dump in the log.
++    if (FAILED(hr))
++    {
++        CComPtr<ID3D12Device> pd3d12Device;
++        m_pCommandList->GetDevice(__uuidof(pd3d12Device), reinterpret_cast<void**>(&pd3d12Device));
++        const HRESULT RemovedHr = pd3d12Device ? pd3d12Device->GetDeviceRemovedReason() : S_OK;
++        LOG_ERROR_MESSAGE("CommandContext::Close failed: hr=0x", std::hex, static_cast<unsigned long>(hr),
++                          ", device-removed reason=0x", static_cast<unsigned long>(RemovedHr), std::dec,
++                          " (887A0005=REMOVED, 887A0006=HUNG, 887A0007=RESET, 887A0020=DRIVER_INTERNAL, 0=alive)");
++        // The validation text explaining WHY lands in the info queue exactly now — the
++        // per-frame drain never runs again (the assert kills the process), so dump the
++        // whole queue synchronously here.
++        CComPtr<ID3D12InfoQueue> pInfoQueue;
++        if (pd3d12Device && SUCCEEDED(pd3d12Device->QueryInterface(__uuidof(ID3D12InfoQueue),
++                                                                   reinterpret_cast<void**>(&pInfoQueue))))
++        {
++            const UINT64 NumMsgs = pInfoQueue->GetNumStoredMessages();
++            for (UINT64 msg = 0; msg < NumMsgs; ++msg)
++            {
++                SIZE_T MsgLen = 0;
++                pInfoQueue->GetMessage(msg, nullptr, &MsgLen);
++                if (MsgLen == 0) continue;
++                std::vector<char> MsgBuf(MsgLen);
++                D3D12_MESSAGE* pMsg = reinterpret_cast<D3D12_MESSAGE*>(MsgBuf.data());
++                if (SUCCEEDED(pInfoQueue->GetMessage(msg, pMsg, &MsgLen))
++                    && pMsg->Severity <= D3D12_MESSAGE_SEVERITY_WARNING && pMsg->pDescription)
++                    LOG_ERROR_MESSAGE("[D3D12@Close] ", pMsg->pDescription);
++            }
++        }
++    }
+     DEV_CHECK_ERR(SUCCEEDED(hr), "Failed to close the command list");
+ 
+     pAllocator = std::move(m_pCurrentAllocator);
+diff --git a/Graphics/GraphicsEngineD3D12/src/SwapChainD3D12Impl.cpp b/Graphics/GraphicsEngineD3D12/src/SwapChainD3D12Impl.cpp
+index 9987bdf43..886e7997f 100644
+--- a/Graphics/GraphicsEngineD3D12/src/SwapChainD3D12Impl.cpp
++++ b/Graphics/GraphicsEngineD3D12/src/SwapChainD3D12Impl.cpp
+@@ -155,6 +155,17 @@ void SwapChainD3D12Impl::Present(Uint32 SyncInterval)
+     WaitForFrame();
+ 
+     HRESULT hr = PresentInternal(SyncInterval);
++    // NUKE PATCH: a failed Present is almost always device removal — log the ACTUAL
++    // HRESULT and the device-removed reason BEFORE the debug assert kills the process,
++    // so the console says WHY (page fault / hang / reset) instead of just "failed".
++    if (FAILED(hr))
++    {
++        RenderDeviceD3D12Impl* pDeviceD3D12 = ClassPtrCast<RenderDeviceD3D12Impl>(pImmediateCtxD3D12->GetDevice());
++        HRESULT                RemovedHr    = pDeviceD3D12->GetD3D12Device()->GetDeviceRemovedReason();
++        LOG_ERROR_MESSAGE("Present failed: hr=0x", std::hex, static_cast<unsigned long>(hr),
++                          ", device-removed reason=0x", static_cast<unsigned long>(RemovedHr), std::dec,
++                          " (887A0005=REMOVED, 887A0006=HUNG, 887A0007=RESET, 887A0020=DRIVER_INTERNAL_ERROR, 0=alive)");
++    }
+     VERIFY(SUCCEEDED(hr), "Present failed");
+ 
+     if (m_SwapChainDesc.IsPrimary)
+diff --git a/Graphics/GraphicsEngineD3DBase/include/SwapChainD3DBase.hpp b/Graphics/GraphicsEngineD3DBase/include/SwapChainD3DBase.hpp
+index e28d46987..5b421068a 100644
+--- a/Graphics/GraphicsEngineD3DBase/include/SwapChainD3DBase.hpp
++++ b/Graphics/GraphicsEngineD3DBase/include/SwapChainD3DBase.hpp
+@@ -28,6 +28,8 @@
+ #pragma once
+ 
+ #include <VersionHelpers.h>
++#include <dxgi1_3.h>   // NUKE PATCH: CreateDXGIFactory2 (debug factory via NUKE_DXGI_DEBUG)
++#include <cstdlib>     // NUKE PATCH: std::getenv
+ #include "SwapChainBase.hpp"
+ #include "DXGITypeConversions.hpp"
+ #include "GraphicsAccessories.hpp"
+@@ -36,6 +38,13 @@
+ /// \file
+ /// Base implementation of a D3D swap chain
+ 
++// NUKE PATCH: when set (by NukeDiligent, before creating the PRIMARY swap chain for a
++// transparent window), CreateDXGISwapChain builds a DirectComposition swap chain with
++// premultiplied alpha (per-pixel transparency to the desktop) instead of an HWND swap
++// chain. The renderer binds the result into a DComp visual tree after creation. Guarded
++// so the normal opaque path is byte-for-byte unchanged when the flag is false.
++extern "C" bool g_NukeCompositionSwapChain;
++
+ namespace Diligent
+ {
+ 
+@@ -196,13 +205,27 @@ protected:
+ 
+         CComPtr<IDXGIFactory2> pDXGIFactory;
+ 
+-        HRESULT hr = CreateDXGIFactory1(__uuidof(pDXGIFactory), reinterpret_cast<void**>(static_cast<IDXGIFactory2**>(&pDXGIFactory)));
++        // NUKE PATCH: NUKE_DXGI_DEBUG=1 -> DEBUG factory, so the DXGI debug layer records
++        // swapchain/present errors into IDXGIInfoQueue (the D3D12 layer does NOT cover
++        // DXGI-side faults — they were invisible without this).
++        HRESULT hr = E_FAIL;
++        if (std::getenv("NUKE_DXGI_DEBUG"))
++            hr = CreateDXGIFactory2(0x1 /*DXGI_CREATE_FACTORY_DEBUG*/, __uuidof(pDXGIFactory), reinterpret_cast<void**>(static_cast<IDXGIFactory2**>(&pDXGIFactory)));
++        if (FAILED(hr))
++            hr = CreateDXGIFactory1(__uuidof(pDXGIFactory), reinterpret_cast<void**>(static_cast<IDXGIFactory2**>(&pDXGIFactory)));
+         CHECK_D3D_RESULT_THROW(hr, "Failed to create DXGI factory");
+ 
+         // DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT enables querying a waitable object that can be
+         // used to synchronize presentation with CPU timeline.
+         // The flag is not supported in D3D11 fullscreen mode.
+-        if (!(m_FSDesc.Fullscreen && m_pRenderDevice->GetDeviceInfo().Type == RENDER_DEVICE_TYPE_D3D11))
++        // NUKE PATCH: only the PRIMARY swap chain gets the frame-latency waitable.
++        // A SECONDARY window (editor asset editors / imgui viewports) that is occluded
++        // or minimized stops being composited by DWM — its waitable stops signaling and
++        // every Present() then blocks in WaitForFrame() for the full 500 ms timeout
++        // (massive stutters), and the repeatedly forced presents eventually get the
++        // device REMOVED. Frame pacing belongs to the primary swap chain alone.
++        if (m_SwapChainDesc.IsPrimary &&
++            !(m_FSDesc.Fullscreen && m_pRenderDevice->GetDeviceInfo().Type == RENDER_DEVICE_TYPE_D3D11))
+         {
+             // We do not need pDXGIFactory3 itself, however DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT flag
+             // is only supported starting with Windows 8.1, and so is IDXGIFactory3 interface. We query this
+@@ -223,6 +246,16 @@ protected:
+             swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+         }
+ 
++        // NUKE PATCH: a DirectComposition swap chain must be windowed, premultiplied-alpha,
++        // STRETCH-scaled, and must NOT carry the mode-switch flag.
++        const bool nukeComposition = g_NukeCompositionSwapChain && m_SwapChainDesc.IsPrimary;
++        if (nukeComposition)
++        {
++            swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
++            swapChainDesc.Scaling   = DXGI_SCALING_STRETCH;
++            swapChainDesc.Flags &= ~DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
++        }
++
+         CComPtr<IDXGISwapChain1> pSwapChain1;
+ 
+ #if PLATFORM_WIN32
+@@ -235,8 +268,18 @@ protected:
+         FullScreenDesc.Scaling                 = static_cast<DXGI_MODE_SCALING>(m_FSDesc.Scaling);
+         FullScreenDesc.ScanlineOrdering        = static_cast<DXGI_MODE_SCANLINE_ORDER>(m_FSDesc.ScanlineOrder);
+ 
+-        hr = pDXGIFactory->CreateSwapChainForHwnd(pD3D11DeviceOrD3D12CmdQueue, hWnd, &swapChainDesc, &FullScreenDesc, nullptr, &pSwapChain1);
+-        CHECK_D3D_RESULT_THROW(hr, "Failed to create Swap Chain");
++        if (nukeComposition)
++        {
++            // Composition swap chains present into a DComp visual, not directly to the HWND —
++            // no HWND / fullscreen desc. NukeDiligent binds it via CreateTargetForHwnd after.
++            hr = pDXGIFactory->CreateSwapChainForComposition(pD3D11DeviceOrD3D12CmdQueue, &swapChainDesc, nullptr, &pSwapChain1);
++            CHECK_D3D_RESULT_THROW(hr, "Failed to create composition Swap Chain");
++        }
++        else
++        {
++            hr = pDXGIFactory->CreateSwapChainForHwnd(pD3D11DeviceOrD3D12CmdQueue, hWnd, &swapChainDesc, &FullScreenDesc, nullptr, &pSwapChain1);
++            CHECK_D3D_RESULT_THROW(hr, "Failed to create Swap Chain");
++        }
+ 
+         {
+             // This is silly, but IDXGIFactory used for MakeWindowAssociation must be retrieved via
+diff --git a/Graphics/GraphicsEngineD3DBase/src/SwapChainD3DBase.cpp b/Graphics/GraphicsEngineD3DBase/src/SwapChainD3DBase.cpp
+index d2a75c3c8..814c211ba 100644
+--- a/Graphics/GraphicsEngineD3DBase/src/SwapChainD3DBase.cpp
++++ b/Graphics/GraphicsEngineD3DBase/src/SwapChainD3DBase.cpp
+@@ -31,6 +31,12 @@
+ 
+ #include "SwapChainD3DBase.hpp"
+ 
++// NUKE PATCH: the composition-swap-chain flag lives HERE (D3DBase static lib), so every
++// consumer that links D3DBase — the D3D11/D3D12 engines, their standalone DLLs, and
++// NukeDiligent — resolves the same symbol. NukeDiligent flips it; the swap-chain code in
++// the header reads it. Default false = ordinary opaque HWND swap chain.
++extern "C" bool g_NukeCompositionSwapChain = false;
++
+ namespace Diligent
+ {
+ 
+diff --git a/Graphics/GraphicsEngineVulkan/src/CommandQueueVkImpl.cpp b/Graphics/GraphicsEngineVulkan/src/CommandQueueVkImpl.cpp
+index bd888f668..4b89d1891 100644
+--- a/Graphics/GraphicsEngineVulkan/src/CommandQueueVkImpl.cpp
++++ b/Graphics/GraphicsEngineVulkan/src/CommandQueueVkImpl.cpp
+@@ -187,6 +187,12 @@ Uint64 CommandQueueVkImpl::Submit(const VkSubmitInfo& InSubmitInfo)
+         0;
+ 
+     VkResult err = vkQueueSubmit(m_VkQueue, SubmitCount, &SubmitInfo, NewSyncPoint->GetFence());
++    // NUKE PATCH: name the ACTUAL VkResult before the assert — "failed to submit" alone
++    // says nothing (-4=DEVICE_LOST, -1/-2=OUT_OF_*_MEMORY). DEVICE_LOST here means the
++    // GPU faulted on a PREVIOUS submission; the culprit is upstream of this call.
++    if (err != VK_SUCCESS)
++        LOG_ERROR_MESSAGE("vkQueueSubmit FAILED: VkResult=", static_cast<int>(err),
++                          " (-4=DEVICE_LOST, -1=OUT_OF_HOST_MEMORY, -2=OUT_OF_DEVICE_MEMORY)");
+     DEV_CHECK_ERR(err == VK_SUCCESS, "Failed to submit command buffer to the command queue");
+     (void)err;
+ 
+diff --git a/Graphics/GraphicsEngineVulkan/src/DeviceContextVkImpl.cpp b/Graphics/GraphicsEngineVulkan/src/DeviceContextVkImpl.cpp
+index 6f2e84482..586602703 100644
+--- a/Graphics/GraphicsEngineVulkan/src/DeviceContextVkImpl.cpp
++++ b/Graphics/GraphicsEngineVulkan/src/DeviceContextVkImpl.cpp
+@@ -3856,6 +3856,10 @@ void DeviceContextVkImpl::BuildTLAS(const BuildTLASAttribs& Attribs)
+     }
+ 
+     // copy instance data into instance buffer
++    // NUKE PATCH: an EMPTY TLAS (InstanceCount == 0, spec-legal — every query misses) must
++    // skip the upload: Allocate(0) yields a null block and the zero-size vkCmdCopyBuffer
++    // dereferences it inside the NVIDIA driver (hard crash).
++    if (Attribs.InstanceCount > 0)
+     {
+         size_t                 Size     = Attribs.InstanceCount * sizeof(VkAccelerationStructureInstanceKHR);
+         VulkanUploadAllocation TmpSpace = m_UploadHeap.Allocate(Size, 16);

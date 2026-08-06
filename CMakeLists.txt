@@ -35,6 +35,45 @@ set(DILIGENT_NO_VULKAN     OFF CACHE BOOL "" FORCE)   # Vulkan backend (task #13
 set(DILIGENT_NO_OPENGL     ON  CACHE BOOL "" FORCE)
 set(DILIGENT_NO_WEBGPU     ON  CACHE BOOL "" FORCE)
 set(DILIGENT_NO_ARCHIVER   ON  CACHE BOOL "" FORCE)
+
+# ---- DiligentCore local patch set (see patches/README.md) --------------------------------
+# The submodule stays pristine in git; the NUKE fixes (DComp swapchain, empty-TLAS crash,
+# device-removal diagnostics, try_compile pre-seed) apply here, at configure time, before
+# the subdirectory is entered. Idempotent: an already-patched tree is detected via the
+# reverse-check and left alone — the same configure works on a dirty dev tree and on a
+# fresh clone. Same pattern as the root superbuild's GLFW vcpkg overlay.
+set(_nuke_dc_dir   "${CMAKE_CURRENT_SOURCE_DIR}/deps/DiligentEngine/DiligentCore")
+set(_nuke_dc_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/DiligentCore.patch")
+if(EXISTS "${_nuke_dc_patch}")
+    find_package(Git QUIET)
+    if(Git_FOUND)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_nuke_dc_dir}" apply --check "${_nuke_dc_patch}"
+                        RESULT_VARIABLE _nuke_dc_applies OUTPUT_QUIET ERROR_QUIET)
+        if(_nuke_dc_applies EQUAL 0)
+            execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_nuke_dc_dir}" apply "${_nuke_dc_patch}"
+                            RESULT_VARIABLE _nuke_dc_rc)
+            if(_nuke_dc_rc EQUAL 0)
+                message(STATUS "DiligentCore: NUKE patch set applied")
+            else()
+                message(FATAL_ERROR "DiligentCore: patch passed --check but failed to apply — inspect patches/DiligentCore.patch")
+            endif()
+        else()
+            execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_nuke_dc_dir}" apply --check --reverse "${_nuke_dc_patch}"
+                            RESULT_VARIABLE _nuke_dc_applied OUTPUT_QUIET ERROR_QUIET)
+            if(_nuke_dc_applied EQUAL 0)
+                message(STATUS "DiligentCore: NUKE patch set already applied")
+            else()
+                # Neither cleanly applies nor is fully applied: the submodule moved or the
+                # tree was hand-edited. Building an UNPATCHED renderer silently would ship
+                # the empty-TLAS crash back in — refuse loudly instead.
+                message(FATAL_ERROR "DiligentCore: patches/DiligentCore.patch neither applies nor is applied — rebase it (patches/README.md, 'Upgrading DiligentCore')")
+            endif()
+        endif()
+    else()
+        message(WARNING "git not found: cannot apply DiligentCore patches — a pristine checkout builds WITHOUT the NUKE fixes")
+    endif()
+endif()
+
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/deps/DiligentEngine DiligentEngine)
 
 set(VCPKG_INSTALLED "$ENV{VCPKG_ROOT}/installed/x64-windows")   # VCPKG_ROOT env var, not a hardcoded path
