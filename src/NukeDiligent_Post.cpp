@@ -459,11 +459,9 @@ void NukeDiligent::setPostChain(const NukePostStage* stages, int count)
 
 void NukeDiligent::setHDROutput(bool on)
 {
-#ifdef _WIN32
-	m_impl->hdrOutput = on;   // honoured at init (swap-chain format + HDR10 colour space)
-#else
-	(void)on;                 // no D3D11/DXGI off Windows — HDR output stays off
-#endif
+	// Honoured at init: D3D backends switch the DXGI colour space (SetupHDROutput), the
+	// Vulkan backend requests an ST2084 surface format (macOS: PQ CAMetalLayer + EDR).
+	m_impl->hdrOutput = on;
 }
 bool NukeDiligent::getHDROutput() { return m_impl->hdr10Active; }
 

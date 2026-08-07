@@ -158,6 +158,11 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 {
 	++uiVpFrameNo;   // multi-window interleave clock; ticks every frame
 	if (uiVpPending.empty() || !device) return;
+#if !defined(_WIN32) && !defined(__APPLE__)
+	// TODO(Deuterium/linux): X11/Wayland handles for per-viewport swap chains.
+	uiVpPending.clear();
+	return;
+#else
 	// At most ONE swap-chain create/resize per frame: back-to-back DXGI ops return ACCESS_DENIED
 	// device removal. Skipped windows re-queue next frame.
 	bool heavyOpDone = false;
@@ -167,8 +172,10 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 		void* handle = kv.first;
 		const int w = kv.second.first, h = kv.second.second;
 		if (w < 8 || h < 8) continue;
+#ifdef _WIN32
 		// A queued op can outlive its HWND; any DXGI call on a dead window is ACCESS_DENIED + device removal.
 		if (!::IsWindow((HWND)handle)) { uiVpSC.erase(handle); uiVpStable.erase(handle); continue; }
+#endif   // macOS: imgui's Renderer_DestroyWindow tears the chain down before the NSWindow dies
 		// Cool down after a failed creation: repeated DXGI failures escalate to device removal.
 		{
 			auto cd = uiVpCooldown.find(handle);
@@ -192,6 +199,7 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 			// Secondary chains must NOT be primary: a primary Present() runs FinishFrame() +
 			// ReleaseStaleResources(), which must happen exactly once per frame.
 			scd.IsPrimary = False;
+#ifdef _WIN32
 			Win32NativeWindow win{ handle };
 			if (useVulkan)
 				GetEngineFactoryVk()->CreateSwapChainVk(device, context, scd, win, &sc);
@@ -199,6 +207,12 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 				GetEngineFactoryD3D12()->CreateSwapChainD3D12(device, context, scd, FullScreenModeDesc{}, win, &sc);
 			else
 				GetEngineFactoryD3D11()->CreateSwapChainD3D11(device, context, scd, FullScreenModeDesc{}, win, &sc);
+#elif defined(__APPLE__)
+			// imgui_impl_glfw hands over the NSWindow: attach a CAMetalLayer to its content
+			// view (same shim as the main window) and let MoltenVK own the surface.
+			MacOSNativeWindow win{ NukeCocoaMetalViewForNSWindow(handle) };
+			GetEngineFactoryVk()->CreateSwapChainVk(device, context, scd, win, &sc);   // Vulkan-only off Windows
+#endif
 			std::cout << "[NukeDiligent]	vp chain CREATE " << handle << " " << w << "x" << h
 			          << (sc ? " ok" : " FAILED") << std::endl;
 			if (!sc) { uiVpSC.erase(handle); uiVpCooldown[handle] = 120; }   // back off ~2s, don't hammer DXGI
@@ -234,6 +248,7 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 		}
 	}
 	uiVpPending.clear();
+#endif   // per-viewport swap chains (win32 + macOS)
 }
 
 // Render a detached window's UI into an offscreen texture and copy it to a staging ring;
@@ -320,6 +335,10 @@ void NukeDiligent::Impl::ViewportRenderSwapchain(void* nativeHandle, int w, int 
 void NukeDiligent::Impl::BlitHostWindows()
 {
 	if (uiHostBlitQueue.empty()) return;
+#ifndef _WIN32
+	uiHostBlitQueue.clear();   // GDI host blit is Windows-only (D3D detached-window fallback)
+	return;
+#else
 	for (void* hwnd : uiHostBlitQueue)
 	{
 		auto it = uiHostBlits.find(hwnd);
@@ -376,6 +395,7 @@ void NukeDiligent::Impl::BlitHostWindows()
 		ReleaseDC((HWND)hwnd, dc);
 	}
 	uiHostBlitQueue.clear();
+#endif   // _WIN32
 }
 void NukeDiligent::uiViewportDestroy(void* nativeHandle)
 {

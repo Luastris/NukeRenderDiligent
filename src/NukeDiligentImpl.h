@@ -4,6 +4,7 @@
 
 #include <cmath>
 
+#ifdef _WIN32
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3.h>
 #include <GLFW/glfw3native.h>
@@ -15,7 +16,16 @@
 
 #include "EngineFactoryD3D11.h"
 #include "EngineFactoryD3D12.h"   // D3D12 backend (ray tracing)
-#include "EngineFactoryVk.h"      // Vulkan backend: HLSL->SPIRV via glslang
+#else
+#include <GLFW/glfw3.h>           // native handles come through the Cocoa shim, not glfw3native.h
+#endif
+#ifdef __APPLE__
+#include "MacOSNativeWindow.h"    // Diligent-ApplePlatform: NSView-backed native window
+// NukeDiligent_Cocoa.mm: CAMetalLayer attach for the main GLFW window / a secondary NSWindow.
+extern "C" void* NukeCocoaMetalView(GLFWwindow* wnd);
+extern "C" void* NukeCocoaMetalViewForNSWindow(void* nswindow);
+#endif
+#include "EngineFactoryVk.h"      // Vulkan backend: HLSL->SPIRV via glslang (the only backend off Windows)
 #include "RenderDevice.h"
 #include "DeviceContext.h"
 #include "SwapChain.h"
@@ -106,11 +116,13 @@ struct NukeDiligent::Impl
 	double                   warmBudgetMs = 3.0;   // per frame, across all builders
 	void PumpPipelineWarmup();
 	bool                          vsync    = true;    // main-present sync interval (1 = vsync, 0 = uncapped)
+#ifdef _WIN32
 	// DirectComposition objects for a TRANSPARENT window. IUnknown* keeps <dcomp.h> out of this
 	// header (typed use lives in NukeDiligent.cpp).
 	IUnknown*                     dcompDevice = nullptr;   // IDCompositionDevice
 	IUnknown*                     dcompTarget = nullptr;   // IDCompositionTarget
 	IUnknown*                     dcompVisual = nullptr;   // IDCompositionVisual
+#endif
 	bool                          transparent = false;     // clears to alpha 0; final pass outputs PREMULTIPLIED alpha
 	bool                          rtSupported = false;     // device reports ray-tracing capability
 	// #include resolver (+ RT shader loading): a MEMORY factory over the sources the engine pushed

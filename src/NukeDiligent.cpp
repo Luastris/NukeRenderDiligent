@@ -1,11 +1,15 @@
 #include "NukeDiligentImpl.h"
+#ifdef _WIN32
 #include "RenderDeviceD3D12.h"   // D3D12 debug-layer drain
 #include "SwapChainD3D12.h"      // ISwapChainD3D12::GetDXGISwapChain (bind into DComp)
 #include "SwapChainD3D11.h"
+#endif
 #include <config.h>              // nuke::WindowMode (window display mode)
+#ifdef _WIN32
 #include <d3d12.h>
 #include <dxgidebug.h>           // IDXGIInfoQueue: DXGI's OWN error queue (swapchain/present faults)
 #include <dcomp.h>               // DirectComposition (per-pixel window transparency)
+#endif
 #include <cstdlib>               // std::getenv (NUKE_GPU_VALIDATION opt-in)
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>   // shader/PSO cache file IO
@@ -15,7 +19,18 @@
 
 // NUKE PATCH global, defined in the vendored SwapChainD3DBase.cpp: true => the PRIMARY swap
 // chain is created for DirectComposition (premultiplied alpha) instead of the HWND.
+#ifdef _WIN32
 extern "C" bool g_NukeCompositionSwapChain;
+#endif
+
+// NUKE PATCH globals (patches/DiligentCore-vk-alpha.patch, defined in SwapChainVkImpl.cpp):
+// AlphaComposite => the PRIMARY Vulkan swap chain prefers an alpha-compositing mode — the
+// transparent window's Vk/MoltenVK counterpart of the DComp path (CAMetalLayer.opaque
+// follows it). HDR10 => request an ST2084 surface format (macOS: PQ CAMetalLayer + EDR);
+// HDR10Active reports the outcome after creation.
+extern "C" bool g_NukeVkAlphaComposite;
+extern "C" bool g_NukeVkHDR10;
+extern "C" bool g_NukeVkHDR10Active;
 
 #include "DebugOutput.h"   // Diligent::SetDebugMessageCallback
 
@@ -32,6 +47,7 @@ static void NukeDiligentLogCallback(Diligent::DEBUG_MESSAGE_SEVERITY sev, const 
 	std::cout << "Diligent Engine: " << tag << ": " << (msg ? msg : "") << std::endl;
 }
 
+#ifdef _WIN32
 // Prints the device-removal reason plus the DRED breadcrumb trail and page-fault
 // allocation, once per process.
 static void DumpDeviceRemoval(ID3D12Device* d3dDev)
@@ -166,6 +182,11 @@ bool NukeDiligent::Impl::DeviceRemoved()
 	DumpDeviceRemoval(dev);   // prints once
 	return true;
 }
+#else
+// No D3D off Windows: the Vulkan backend has no device-removal notion to poll here.
+static void DrainD3D12DebugMessages(Diligent::IRenderDevice*, bool) {}
+bool NukeDiligent::Impl::DeviceRemoved() { return false; }
+#endif   // _WIN32
 
 static void glfw_error(int code, const char* desc)
 {
@@ -312,6 +333,11 @@ int NukeDiligent::init(const WindowDesc& desc)
 	if (w <= 0 || h <= 0) { cout << "[NukeDiligent]\tbad size, using 1280x720" << endl; w = 1280; h = 720; }
 
 	glfwSetErrorCallback(glfw_error);
+#ifdef __APPLE__
+	// GLFW's Cocoa default chdir's into the bundle's Contents/Resources at init — the hosts
+	// pinned CWD to the run root already, and every engine-relative path rides on it.
+	glfwInitHint(GLFW_COCOA_CHDIR_RESOURCES, GLFW_FALSE);
+#endif
 	if (!glfwInit()) { cout << "[NukeDiligent]\tglfwInit failed" << endl; return 1; }
 
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API); // Diligent owns the graphics API
@@ -337,6 +363,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 	glfwSetKeyCallback(m_window, cb_key);
 	glfwSetCharCallback(m_window, cb_char);
 
+#ifdef _WIN32
 	HWND hWnd = glfwGetWin32Window(m_window);
 
 	// Window icon = the host exe's first icon group (no fixed resource id).
@@ -357,16 +384,30 @@ int NukeDiligent::init(const WindowDesc& desc)
 		HRESULT hr = DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
 		cout << "[NukeDiligent]\tdark title bar hr=0x" << std::hex << hr << std::dec << endl;
 	}
+#endif   // _WIN32 (icon/dark-titlebar are host-OS niceties; macOS titlebars follow the system theme)
 	if (desc.opacity < 1.0f)
 		glfwSetWindowOpacity(m_window, desc.opacity);
 	glfwShowWindow(m_window);
 
 	m_impl->useD3D12  = (desc.backend == 1);
 	m_impl->useVulkan = (desc.backend == 2);
+#ifndef _WIN32
+	// The D3D backends exist only on Windows — everything else runs Vulkan (macOS: MoltenVK).
+	if (!m_impl->useVulkan)
+		cout << "[NukeDiligent]\tbackend " << desc.backend << " is Windows-only — forcing Vulkan" << endl;
+	m_impl->useD3D12  = false;
+	m_impl->useVulkan = true;
+#endif
+#ifdef _WIN32
 	// D3D only (vendored SwapChainD3DBase.hpp patch): set around PRIMARY creation only, so
 	// secondary UI-viewport swap chains stay ordinary opaque HWND chains.
 	g_NukeCompositionSwapChain = desc.transparent && !m_impl->useVulkan;
 	Win32NativeWindow Window{ hWnd };
+#elif defined(__APPLE__)
+	MacOSNativeWindow Window{ NukeCocoaMetalView(m_window) };
+#else
+	LinuxNativeWindow Window{};   // TODO(Deuterium): X11/Wayland handles via glfwGetX11Window
+#endif
 	SwapChainDesc SCDesc;
 	// Must match the World PSO + offscreen RTs (Diligent would default the backbuffer to *_SRGB);
 	// HDR10 output needs a 10-bit backbuffer for the PQ-encoded signal.
@@ -374,6 +415,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 	// 3, not Diligent's default 2: Vulkan MAILBOX with 2 images blocks acquire until vblank.
 	SCDesc.BufferCount = 3;
 	IEngineFactory* engFactory = nullptr;
+#ifdef _WIN32
 	if (m_impl->useD3D12)
 	{
 		auto* pFactory = GetEngineFactoryD3D12(); engFactory = pFactory;
@@ -417,7 +459,9 @@ int NukeDiligent::init(const WindowDesc& desc)
 		pFactory->CreateSwapChainD3D12(m_impl->device, m_impl->context, SCDesc,
 		                               FullScreenModeDesc{}, Window, &m_impl->swapChain);
 	}
-	else if (m_impl->useVulkan)
+	else
+#endif   // _WIN32
+	if (m_impl->useVulkan)
 	{
 		// Vulkan WSI path: no DXGI anywhere; HLSL shaders compile to SPIR-V via the vendored glslang.
 		auto* pFactory = GetEngineFactoryVk(); engFactory = pFactory;
@@ -436,13 +480,31 @@ int NukeDiligent::init(const WindowDesc& desc)
 		// Unlike D3D12, Vulkan device features must be opted into at device creation.
 		EngineCI.Features.RayTracing = DEVICE_FEATURE_STATE_OPTIONAL;
 		EngineCI.Features.Tessellation = DEVICE_FEATURE_STATE_OPTIONAL;
+#ifdef _WIN32
 		// RT shaders are SM6.x HLSL and need DXC; point Diligent at the one vendored
 		// dxcompiler.dll (emits both DXIL and SPIR-V) instead of its "spv_dxcompiler.dll" default.
 		EngineCI.pDxCompilerPath = "dxcompiler.dll";
+#endif   // off Windows there is no vendored DXC (yet): SM5 HLSL compiles via glslang, RT stays off
 		pFactory->CreateDeviceAndContextsVk(EngineCI, &m_impl->device, &m_impl->context);
 		if (!m_impl->device) { cout << "[NukeDiligent]\tVulkan device creation failed" << endl; return 1; }
+		// Transparent window on Vulkan: prefer an alpha-compositing swap chain (macOS: the
+		// chosen mode drives CAMetalLayer.opaque). PRIMARY only — secondary UI chains stay
+		// opaque, mirroring the DComp arrangement. HDR10: request an ST2084 surface format —
+		// the Vulkan counterpart of the DXGI SetColorSpace1 path (macOS: PQ layer + EDR).
+		g_NukeVkAlphaComposite = desc.transparent;
+		g_NukeVkHDR10          = m_impl->hdrOutput;
 		pFactory->CreateSwapChainVk(m_impl->device, m_impl->context, SCDesc, Window, &m_impl->swapChain);
+		g_NukeVkAlphaComposite = false;
+		g_NukeVkHDR10          = false;
+		if (m_impl->hdrOutput)
+		{
+			m_impl->hdr10Active = g_NukeVkHDR10Active;
+			cout << "[NukeDiligent]\tHDR10 output "
+			     << (m_impl->hdr10Active ? "ACTIVE (ST2084 swap chain)"
+			                             : "off (surface offers no HDR10 format)") << endl;
+		}
 	}
+#ifdef _WIN32
 	else
 	{
 		auto* pFactory = GetEngineFactoryD3D11(); engFactory = pFactory;
@@ -452,14 +514,19 @@ int NukeDiligent::init(const WindowDesc& desc)
 		pFactory->CreateSwapChainD3D11(m_impl->device, m_impl->context, SCDesc,
 		                               FullScreenModeDesc{}, Window, &m_impl->swapChain);
 	}
+#endif
 	if (!m_impl->swapChain) { cout << "[NukeDiligent]\tswap chain creation failed" << endl; return 1; }
+#ifdef _WIN32
 	g_NukeCompositionSwapChain = false;   // primary done — secondary swap chains stay opaque
+#endif
 	m_impl->transparent = desc.transparent;   // drives the alpha-0 clear + premultiplied final pass
 
 	// Transparent window: the composition swap chain must be bound into a DComp visual on the
 	// HWND — the swap chain alone does not compose.
 	if (desc.transparent && m_impl->useVulkan)
-		cout << "[NukeDiligent]\twindow transparency is D3D-only (DirectComposition) — opaque on Vulkan" << endl;
+		cout << "[NukeDiligent]\ttransparent window: alpha-composited Vulkan swap chain requested"
+		        " (opaque fallback if the surface can't composite)" << endl;
+#ifdef _WIN32
 	if (desc.transparent && !m_impl->useVulkan)
 	{
 		IDXGISwapChain* dxgiSC = nullptr;
@@ -502,6 +569,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 		else
 			cout << "[NukeDiligent]\tDComp device creation failed — window opaque" << endl;
 	}
+#endif   // _WIN32 (DirectComposition)
 	m_impl->RebuildShaderFactory();
 	// Ray tracing: D3D12 (DXR) or Vulkan (VK_KHR_ray_tracing) + a capable GPU/driver.
 	m_impl->rtSupported = desc.rayTracing &&   // config kill switch: window.rayTracing=false forces the raster path
@@ -714,10 +782,9 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 
 	namespace bfs = boost::filesystem;
 	char hex[24]; snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)h);
-	// Cache next to the EXECUTABLE, not the CWD (a shortcut-launched game has an arbitrary CWD).
-	boost::system::error_code dec;
-	bfs::path cacheRoot = boost::dll::program_location(dec).parent_path();
-	if (dec || cacheRoot.empty()) cacheRoot = ".";
+	// Cache in the engine's WRITABLE root (run root on Windows/dev; the per-user dir for an
+	// installed bundle — nothing may write beside or inside a deployed .app).
+	bfs::path cacheRoot = nuke::Config::writableDir();
 	// Per backend: SPIR-V and DXBC/DXIL are different products of the same source.
 	const char* backendTag = useVulkan ? "vk" : (useD3D12 ? "d3d12" : "d3d11");
 	const bfs::path dir = cacheRoot / "config" / (std::string("shadercache_") + backendTag);
@@ -809,10 +876,12 @@ void NukeDiligent::deinit()
 		m_impl->device->IdleGPU();
 	}
 	m_impl->PurgeTrash(true);
+#ifdef _WIN32
 	// DComp release order: visual -> target -> device, all before the swap chain they reference.
 	if (m_impl->dcompVisual) { m_impl->dcompVisual->Release(); m_impl->dcompVisual = nullptr; }
 	if (m_impl->dcompTarget) { m_impl->dcompTarget->Release(); m_impl->dcompTarget = nullptr; }
 	if (m_impl->dcompDevice) { m_impl->dcompDevice->Release(); m_impl->dcompDevice = nullptr; }
+#endif
 	m_impl->swapChain.Release();
 	m_impl->context.Release();
 	m_impl->device.Release();

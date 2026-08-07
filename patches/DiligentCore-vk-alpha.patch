@@ -1,0 +1,98 @@
+diff --git a/Graphics/GraphicsEngineVulkan/src/SwapChainVkImpl.cpp b/Graphics/GraphicsEngineVulkan/src/SwapChainVkImpl.cpp
+index 8b6e5bb30..6811d024d 100644
+--- a/Graphics/GraphicsEngineVulkan/src/SwapChainVkImpl.cpp
++++ b/Graphics/GraphicsEngineVulkan/src/SwapChainVkImpl.cpp
+@@ -34,6 +34,15 @@
+ #include "EngineMemory.h"
+ #include "GraphicsAccessories.hpp"
+ 
++// NUKE PATCH: see the composite-alpha selection in CreateVulkanSwapChain. The host flips
++// this around PRIMARY swap-chain creation only, so secondary UI chains stay opaque.
++extern "C" bool g_NukeVkAlphaComposite = false;
++// NUKE PATCH: HDR10 output on the Vulkan WSI path. The host requests it around PRIMARY
++// swap-chain creation; `Active` reports whether the surface offered an HDR10 (ST2084)
++// format — on MoltenVK that maps to a PQ CAMetalLayer with EDR content enabled.
++extern "C" bool g_NukeVkHDR10        = false;
++extern "C" bool g_NukeVkHDR10Active  = false;
++
+ namespace Diligent
+ {
+ 
+@@ -406,6 +415,51 @@ void SwapChainVkImpl::CreateVulkanSwapChain()
+             VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+             VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+         };
++    // NUKE PATCH: HDR10 output — pick an ST2084 (PQ) surface format when the host asked for
++    // it and the surface offers one (needs VK_EXT_swapchain_colorspace on the instance).
++    // Preference mirrors the requested 10-bit backbuffer; RGBA16F EDR is the fallback.
++    g_NukeVkHDR10Active = false;
++    if (g_NukeVkHDR10)
++    {
++        // Only formats with a TEXTURE_FORMAT mapping — an unmapped pick would flow
++        // VK_FORMAT_UNDEFINED into every downstream view/render pass.
++        const VkFormat HdrPreference[] = {
++            VK_FORMAT_A2B10G10R10_UNORM_PACK32,
++            VK_FORMAT_R16G16B16A16_SFLOAT,
++        };
++        for (VkFormat Pref : HdrPreference)
++        {
++            for (const VkSurfaceFormatKHR& SrfFmt : SupportedFormats)
++            {
++                if (SrfFmt.format == Pref && SrfFmt.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
++                    VkFormatToTexFormat(SrfFmt.format) != TEX_FORMAT_UNKNOWN)
++                {
++                    m_VkColorFormat                   = SrfFmt.format;
++                    ColorSpace                        = SrfFmt.colorSpace;
++                    m_SwapChainDesc.ColorBufferFormat = VkFormatToTexFormat(SrfFmt.format);
++                    g_NukeVkHDR10Active               = true;
++                    break;
++                }
++            }
++            if (g_NukeVkHDR10Active)
++                break;
++        }
++    }
++
++    // NUKE PATCH: transparent windows on the Vulkan WSI path (macOS/MoltenVK: the chosen
++    // composite alpha drives CAMetalLayer.opaque). When the host requests it around PRIMARY
++    // swap-chain creation, prefer an alpha-compositing mode over OPAQUE — premultiplied
++    // first, matching the renderer's premultiplied final pass (same semantics as the
++    // DirectComposition path on Windows).
++    if (g_NukeVkAlphaComposite)
++    {
++        if (surfCapabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)
++            compositeAlphaFlags[0] = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
++        else if (surfCapabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR)
++            compositeAlphaFlags[0] = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
++        else if (surfCapabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)
++            compositeAlphaFlags[0] = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
++    }
+     for (uint32_t i = 0; i < _countof(compositeAlphaFlags); i++)
+     {
+         if (surfCapabilities.supportedCompositeAlpha & compositeAlphaFlags[i])
+diff --git a/Graphics/GraphicsEngineVulkan/src/VulkanUtilities/Instance.cpp b/Graphics/GraphicsEngineVulkan/src/VulkanUtilities/Instance.cpp
+index 56cef9a30..26fbdb3cf 100644
+--- a/Graphics/GraphicsEngineVulkan/src/VulkanUtilities/Instance.cpp
++++ b/Graphics/GraphicsEngineVulkan/src/VulkanUtilities/Instance.cpp
+@@ -395,12 +395,20 @@ Instance::Instance(const CreateInfo& CI) :
+ #if defined(VK_USE_PLATFORM_METAL_EXT)
+         InstanceExtensions.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+ #endif
++
++        // NUKE PATCH: non-sRGB swap-chain color spaces (HDR10/EDR — on MoltenVK the chosen
++        // space drives CAMetalLayer's color space + extended-dynamic-range content).
++        if (IsExtensionAvailable(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
++            InstanceExtensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+     };
+ 
+ #if PLATFORM_MACOS
+     // Beginning with the 1.3.216 Vulkan SDK, the Vulkan Loader is strictly
+     // enforcing the new VK_KHR_PORTABILITY_subset extension.
+-    constexpr bool UsePortabilityEnumeartion = true;
++    // NUKE PATCH: portability enumeration is a LOADER extension — when the ICD (a bundled
++    // MoltenVK) is dlopen'ed directly it does not exist and is not needed. Requiring it
++    // unconditionally kills instance creation on loader-less machines; enable on offer.
++    const bool UsePortabilityEnumeartion = IsExtensionAvailable(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+ #else
+     constexpr bool UsePortabilityEnumeartion = false;
+ #endif

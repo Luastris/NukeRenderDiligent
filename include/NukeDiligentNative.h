@@ -14,10 +14,14 @@
 #include "PipelineState.h"
 #include "Shader.h"
 
-#ifdef NUKEDILIGENT_BUILD
-#define NUKEDLG_API __declspec(dllexport)
+#ifdef _WIN32
+  #ifdef NUKEDILIGENT_BUILD
+  #define NUKEDLG_API __declspec(dllexport)
+  #else
+  #define NUKEDLG_API __declspec(dllimport)
+  #endif
 #else
-#define NUKEDLG_API __declspec(dllimport)
+  #define NUKEDLG_API __attribute__((visibility("default")))
 #endif
 
 namespace nuke { struct NukeLight; }
