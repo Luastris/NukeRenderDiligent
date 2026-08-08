@@ -24,3 +24,5 @@ deps/DiligentEngine/
 Thumbs.db
 .DS_Store
 deps/moltenvk/
+# Vendored Linux DXC — downloaded at configure time, pinned by hash (see CMakeLists).
+deps/dxc-linux/

@@ -16,8 +16,47 @@
 
 #include "EngineFactoryD3D11.h"
 #include "EngineFactoryD3D12.h"   // D3D12 backend (ray tracing)
-#else
+#elif defined(__APPLE__)
 #include <GLFW/glfw3.h>           // native handles come through the Cocoa shim, not glfw3native.h
+#else
+#define GLFW_EXPOSE_NATIVE_X11
+#include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>     // glfwGetX11Display / glfwGetX11Window for the Vulkan surface
+// Xlib.h leaks single-word macros that break ordinary C++ (Status/Bool/None are used as
+// identifiers by Diligent and the engine alike). The typedefs the two glfwGetX11* calls
+// return survive the undefs — only the macro pollution goes.
+#undef Status
+#undef Bool
+#undef True
+#undef False
+#undef None
+#undef Always
+#undef Success
+#undef Complex
+#undef Convex
+#undef CursorShape
+#include "LinuxNativeWindow.h"    // Diligent-LinuxPlatform: X11 AND Wayland native windows
+#include <dlfcn.h>
+// Wayland entry points resolve at RUNTIME: linking must not depend on which backends this
+// GLFW build carries (the standalone-configure fallback is an X11-only static glfw3).
+inline bool NukeGlfwIsWayland()
+{
+#ifdef GLFW_PLATFORM_WAYLAND
+	return glfwGetPlatform() == GLFW_PLATFORM_WAYLAND;
+#else
+	return false;
+#endif
+}
+inline void* NukeGlfwWaylandDisplay()
+{
+	static void* (*fn)() = (void* (*)())dlsym(RTLD_DEFAULT, "glfwGetWaylandDisplay");
+	return fn ? fn() : nullptr;
+}
+inline void* NukeGlfwWaylandWindow(GLFWwindow* w)
+{
+	static void* (*fn)(GLFWwindow*) = (void* (*)(GLFWwindow*))dlsym(RTLD_DEFAULT, "glfwGetWaylandWindow");
+	return fn ? fn(w) : nullptr;
+}
 #endif
 #ifdef __APPLE__
 #include "MacOSNativeWindow.h"    // Diligent-ApplePlatform: NSView-backed native window

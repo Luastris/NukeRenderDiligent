@@ -196,6 +196,11 @@ else()
     find_package(glm CONFIG REQUIRED)
     find_package(Boost REQUIRED COMPONENTS filesystem system)
     find_package(nlohmann_json CONFIG REQUIRED)
+    if(NOT APPLE)
+        # Window-icon PNG decode (stb_image, header-only): X11 icons are files, not resources.
+        find_path(STB_INCLUDE_DIRS "stb_image.h" REQUIRED)
+        target_include_directories(NukeRenderDiligent PRIVATE ${STB_INCLUDE_DIRS})
+    endif()
 
     target_link_libraries(NukeRenderDiligent PRIVATE
         NukeEngine
@@ -243,9 +248,54 @@ else()
         BUILD_RPATH "${_nuke_rd_rpath}")
 endif()
 
+# ---- vendored Linux DXC (SM6.x shaders + ray tracing off Windows) ------------------------
+# The exact same arrangement as the Windows deps/dxc DLLs and the macOS MoltenVK download:
+# official Microsoft release, pinned by hash, fetched once at configure time. Deployed next
+# to the hosts below; NukeDiligent.cpp points EngineVkCreateInfo::pDxCompilerPath at it and
+# ray tracing gates on its presence in the run root.
+if(UNIX AND NOT APPLE)
+    set(_nuke_dxc_dir "${CMAKE_CURRENT_SOURCE_DIR}/deps/dxc-linux")
+    set(_nuke_dxc     "${_nuke_dxc_dir}/libdxcompiler.so")
+    if(NOT EXISTS "${_nuke_dxc}")
+        set(_nuke_dxc_url "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2607/linux_dxc_2026_07_29.x86_x64.tar.gz")
+        set(_nuke_dxc_sha "55665c87824051ed4774ff3280a79ccbbb7d39243b9736ca5e98222134112d54")
+        message(STATUS "DXC: downloading Linux libdxcompiler (v1.9.2607, official release)...")
+        file(DOWNLOAD "${_nuke_dxc_url}" "${CMAKE_BINARY_DIR}/dxc-linux.tar.gz"
+             EXPECTED_HASH SHA256=${_nuke_dxc_sha} STATUS _nuke_dxc_st)
+        list(GET _nuke_dxc_st 0 _nuke_dxc_rc)
+        if(_nuke_dxc_rc EQUAL 0)
+            file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/dxc-x")
+            execute_process(COMMAND ${CMAKE_COMMAND} -E tar xzf "${CMAKE_BINARY_DIR}/dxc-linux.tar.gz"
+                            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/dxc-x")
+            file(GLOB _nuke_dxc_libs "${CMAKE_BINARY_DIR}/dxc-x/*/lib/libdxcompiler.so"
+                                     "${CMAKE_BINARY_DIR}/dxc-x/*/lib/libdxil.so")
+            file(MAKE_DIRECTORY "${_nuke_dxc_dir}")
+            file(COPY ${_nuke_dxc_libs} DESTINATION "${_nuke_dxc_dir}")
+            # Microsoft ships the .so UNSTRIPPED (301 MB of DWARF nobody will ever debug) —
+            # strip to the ~24 MB it really is before it rides into every AppImage.
+            find_program(_nuke_strip strip)
+            if(_nuke_strip)
+                execute_process(COMMAND "${_nuke_strip}" -s "${_nuke_dxc_dir}/libdxcompiler.so"
+                                                            "${_nuke_dxc_dir}/libdxil.so")
+            endif()
+            message(STATUS "DXC: vendored at deps/dxc-linux/ (stripped)")
+        else()
+            message(WARNING "DXC download failed — SM6.x/ray tracing stays off (glslang-only shaders)")
+        endif()
+    endif()
+endif()
+
 # Deploy the module DLL next to the editor, into modules/.
 set(MODULES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/${NUKE_RUN_SUBDIR}/$<CONFIG>/modules")
 set(EDITOR_DIR  "${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/${NUKE_RUN_SUBDIR}/$<CONFIG>")
+
+# Vendored-DXC deploy commands for the Linux branches below (empty without the download).
+set(_nuke_dxc_deploy "")
+if(UNIX AND NOT APPLE AND EXISTS "${_nuke_dxc}")
+    set(_nuke_dxc_deploy
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_nuke_dxc}" "${EDITOR_DIR}/"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_nuke_dxc_dir}/libdxil.so" "${EDITOR_DIR}/")
+endif()
 if(WIN32)
     add_custom_command(TARGET NukeRenderDiligent POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "${MODULES_DIR}"
@@ -307,11 +357,24 @@ elseif(APPLE)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_nuke_mvk}" "${EDITOR_DIR}/"
         COMMENT "Deploying NukeRenderDiligent module + shared GLFW + MoltenVK fallback"
     )
+elseif(NUKE_GLFW_DYLIB)
+    # Linux, shared GLFW: mirror the mac arrangement — the run dir carries what a packaged
+    # game ships. Copying the soname path (libglfw.so.3, not its realpath) dereferences the
+    # symlink while keeping the exact name DT_NEEDED looks up.
+    add_custom_command(TARGET NukeRenderDiligent POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${MODULES_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:NukeRenderDiligent>" "${MODULES_DIR}/"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NUKE_GLFW_DYLIB}" "${EDITOR_DIR}/"
+        ${_nuke_dxc_deploy}
+        COMMENT "Deploying NukeRenderDiligent module + shared GLFW + DXC"
+    )
 else()
     add_custom_command(TARGET NukeRenderDiligent POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "${MODULES_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:NukeRenderDiligent>" "${MODULES_DIR}/"
+        ${_nuke_dxc_deploy}
         COMMENT "Deploying NukeRenderDiligent module"
     )
 endif()

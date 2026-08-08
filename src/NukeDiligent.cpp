@@ -34,6 +34,20 @@ extern "C" bool g_NukeVkHDR10Active;
 
 #include "DebugOutput.h"   // Diligent::SetDebugMessageCallback
 
+#if !defined(_WIN32) && !defined(__APPLE__)
+// Window-icon PNG decode (X11 has no icon-in-binary concept — the AppDir png is the icon).
+// STATIC: DiligentCore vendors its own stb internally; two implementations must not meet.
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#include <stb_image.h>
+// Downscale before handing to the WM: _NET_WM_ICON stores 8 bytes/pixel, and a full-size
+// logo blows past the X request limit — the server drops it SILENTLY (empty property).
+#define STB_IMAGE_RESIZE_STATIC
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include <stb_image_resize2.h>
+#endif
+
 // Serializes Diligent log output: its workers log concurrently and concurrent fwrite on one
 // stream trips the debug CRT.
 static void NukeDiligentLogCallback(Diligent::DEBUG_MESSAGE_SEVERITY sev, const Diligent::Char* msg,
@@ -338,7 +352,39 @@ int NukeDiligent::init(const WindowDesc& desc)
 	// pinned CWD to the run root already, and every engine-relative path rides on it.
 	glfwInitHint(GLFW_COCOA_CHDIR_RESOURCES, GLFW_FALSE);
 #endif
+#if !defined(_WIN32) && !defined(__APPLE__) && defined(GLFW_PLATFORM_X11)
+	// Display backend: native Wayland BY DEFAULT when the session offers it, X11 (XWayland)
+	// as the fallback — or whatever NUKE_DISPLAY_BACKEND=wayland|x11 demands. On Wayland the
+	// UI module turns imgui multi-viewport off (no client-side window positioning there).
+	bool wantedWayland = false;
+	{
+		const char* want = std::getenv("NUKE_DISPLAY_BACKEND");
+		bool wayland = !(want && strcmp(want, "x11") == 0);
+#ifdef GLFW_PLATFORM_WAYLAND
+		wayland = wayland && std::getenv("WAYLAND_DISPLAY")
+		                  && glfwPlatformSupported(GLFW_PLATFORM_WAYLAND);
+#else
+		wayland = false;
+#endif
+		wantedWayland = wayland;
+#ifdef GLFW_PLATFORM_WAYLAND
+		glfwInitHint(GLFW_PLATFORM, wayland ? GLFW_PLATFORM_WAYLAND : GLFW_PLATFORM_X11);
+#else
+		glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
+#endif
+		cout << "[NukeDiligent]\tdisplay backend: " << (wayland ? "wayland (native)" : "x11")
+		     << (want && *want ? " (NUKE_DISPLAY_BACKEND)" : "") << endl;
+	}
+	if (!glfwInit())
+	{
+		if (!wantedWayland) { cout << "[NukeDiligent]\tglfwInit failed" << endl; return 1; }
+		cout << "[NukeDiligent]\tWayland init failed — falling back to X11" << endl;
+		glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
+		if (!glfwInit()) { cout << "[NukeDiligent]\tglfwInit failed" << endl; return 1; }
+	}
+#else
 	if (!glfwInit()) { cout << "[NukeDiligent]\tglfwInit failed" << endl; return 1; }
+#endif
 
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API); // Diligent owns the graphics API
 	glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);     // create hidden; show after the dark title-bar attr is set
@@ -384,6 +430,61 @@ int NukeDiligent::init(const WindowDesc& desc)
 		HRESULT hr = DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
 		cout << "[NukeDiligent]\tdark title bar hr=0x" << std::hex << hr << std::dec << endl;
 	}
+#elif !defined(__APPLE__)
+	// Window icon: X11 has no icon-in-binary concept — the run root's icon png IS the icon
+	// (games: "<exe stem>.png" stamped by the packager; editor image: nukeengine-editor.png /
+	// .DirIcon; dev tree: the editor's res/logo.png). GLFW publishes it as _NET_WM_ICON and
+	// the UI module mirrors it onto secondary windows. macOS keeps using the bundle icon;
+	// Wayland taskbars take it from the .desktop entry (glfwSetWindowIcon is a no-op there).
+	if (!NukeGlfwIsWayland())
+	{
+		namespace ibfs = boost::filesystem;
+		boost::system::error_code iec;
+		const ibfs::path exe  = boost::dll::program_location(iec);
+		const ibfs::path base = nuke::Config::baseDir();
+		const ibfs::path cands[] = {
+			base / (exe.stem().string() + ".png"),
+			base / "nukeengine-editor.png",
+			base / ".DirIcon",
+			base.parent_path().parent_path().parent_path() / "NukeEngine-Editor" / "res" / "logo.png",
+		};
+		bool iconSet = false;
+		for (const ibfs::path& c : cands)
+			if (ibfs::exists(c, iec) && !ibfs::is_directory(c, iec))
+			{
+				int iw = 0, ih = 0, comp = 0;
+				if (unsigned char* px = stbi_load(c.string().c_str(), &iw, &ih, &comp, 4))
+				{
+					// Standard WM sizes; the source stays untouched when already small.
+					static const int kSizes[] = { 128, 48, 32, 16 };
+					std::vector<std::vector<unsigned char>> scaled;
+					std::vector<GLFWimage> imgs;
+					if (iw <= 256 && ih <= 256)
+						imgs.push_back({ iw, ih, px });
+					else
+						for (int s : kSizes)
+						{
+							scaled.emplace_back((size_t)s * s * 4);
+							if (stbir_resize_uint8_srgb(px, iw, ih, 0, scaled.back().data(), s, s, 0, STBIR_RGBA))
+								imgs.push_back({ s, s, scaled.back().data() });
+						}
+					if (!imgs.empty())
+					{
+						glfwSetWindowIcon(m_window, (int)imgs.size(), imgs.data());
+						cout << "[NukeDiligent]\twindow icon: " << c.string() << " (" << iw << "x" << ih
+						     << (imgs[0].pixels == px ? "" : ", downscaled") << ")" << endl;
+						iconSet = true;
+					}
+					stbi_image_free(px);
+					if (iconSet) break;
+				}
+				else
+					cout << "[NukeDiligent]\twindow icon: " << c.string() << " failed to decode ("
+					     << (stbi_failure_reason() ? stbi_failure_reason() : "?") << ")" << endl;
+			}
+		if (!iconSet)
+			cout << "[NukeDiligent]\tno window icon found near " << base.string() << endl;
+	}
 #endif   // _WIN32 (icon/dark-titlebar are host-OS niceties; macOS titlebars follow the system theme)
 	if (desc.opacity < 1.0f)
 		glfwSetWindowOpacity(m_window, desc.opacity);
@@ -406,7 +507,19 @@ int NukeDiligent::init(const WindowDesc& desc)
 #elif defined(__APPLE__)
 	MacOSNativeWindow Window{ NukeCocoaMetalView(m_window) };
 #else
-	LinuxNativeWindow Window{};   // TODO(Deuterium): X11/Wayland handles via glfwGetX11Window
+	// Wayland: wl_display + wl_surface. X11: the Xlib pair (pDisplay + WindowId, no XCB
+	// connection). Runtime choice — see the display-backend ladder at glfwInit.
+	LinuxNativeWindow Window{};
+	if (NukeGlfwIsWayland())
+	{
+		Window.pDisplay        = NukeGlfwWaylandDisplay();
+		Window.pWaylandSurface = NukeGlfwWaylandWindow(m_window);
+	}
+	else
+	{
+		Window.pDisplay = glfwGetX11Display();
+		Window.WindowId = (Uint32)glfwGetX11Window(m_window);
+	}
 #endif
 	SwapChainDesc SCDesc;
 	// Must match the World PSO + offscreen RTs (Diligent would default the backbuffer to *_SRGB);
@@ -414,6 +527,15 @@ int NukeDiligent::init(const WindowDesc& desc)
 	SCDesc.ColorBufferFormat = m_impl->hdrOutput ? TEX_FORMAT_RGB10A2_UNORM : TEX_FORMAT_RGBA8_UNORM;
 	// 3, not Diligent's default 2: Vulkan MAILBOX with 2 images blocks acquire until vblank.
 	SCDesc.BufferCount = 3;
+	// The DESIRED size must be explicit: a Wayland surface reports currentExtent as
+	// "undefined" (0xFFFFFFFF), and with zero desired size Diligent passes that straight
+	// into vkCreateSwapchainKHR — NVIDIA answers ERROR_OUT_OF_DEVICE_MEMORY. Everywhere
+	// else a defined currentExtent simply overrides these, so this is Wayland-only in effect.
+	{
+		int fbw = 0, fbh = 0;
+		glfwGetFramebufferSize(m_window, &fbw, &fbh);
+		if (fbw > 0 && fbh > 0) { SCDesc.Width = (Uint32)fbw; SCDesc.Height = (Uint32)fbh; }
+	}
 	IEngineFactory* engFactory = nullptr;
 #ifdef _WIN32
 	if (m_impl->useD3D12)
@@ -484,7 +606,12 @@ int NukeDiligent::init(const WindowDesc& desc)
 		// RT shaders are SM6.x HLSL and need DXC; point Diligent at the one vendored
 		// dxcompiler.dll (emits both DXIL and SPIR-V) instead of its "spv_dxcompiler.dll" default.
 		EngineCI.pDxCompilerPath = "dxcompiler.dll";
-#endif   // off Windows there is no vendored DXC (yet): SM5 HLSL compiles via glslang, RT stays off
+#elif !defined(__APPLE__)
+		// Same arrangement on Linux: vendored libdxcompiler.so (deps/dxc-linux, deployed next
+		// to the hosts) — dlopen resolves the bare name through this module's $ORIGIN/..
+		// runpath. Missing file → Diligent falls back to glslang (SM5, no RayQuery).
+		EngineCI.pDxCompilerPath = "libdxcompiler.so";
+#endif   // macOS: no DXC — SM5 HLSL compiles via glslang, RT off (MoltenVK reports no caps anyway)
 		pFactory->CreateDeviceAndContextsVk(EngineCI, &m_impl->device, &m_impl->context);
 		if (!m_impl->device) { cout << "[NukeDiligent]\tVulkan device creation failed" << endl; return 1; }
 		// Transparent window on Vulkan: prefer an alpha-compositing swap chain (macOS: the
@@ -494,6 +621,17 @@ int NukeDiligent::init(const WindowDesc& desc)
 		g_NukeVkAlphaComposite = desc.transparent;
 		g_NukeVkHDR10          = m_impl->hdrOutput;
 		pFactory->CreateSwapChainVk(m_impl->device, m_impl->context, SCDesc, Window, &m_impl->swapChain);
+#if !defined(_WIN32) && !defined(__APPLE__)
+		// Wayland maps the surface ASYNCHRONOUSLY: until the compositor's configure lands,
+		// a swapchain can't bind to it (NVIDIA reports the unconfigured state as
+		// ERROR_OUT_OF_DEVICE_MEMORY). Pump events and retry — arrives within a few frames.
+		if (!m_impl->swapChain && NukeGlfwIsWayland())
+			for (int tries = 0; tries < 40 && !m_impl->swapChain; ++tries)
+			{
+				glfwWaitEventsTimeout(0.025);
+				pFactory->CreateSwapChainVk(m_impl->device, m_impl->context, SCDesc, Window, &m_impl->swapChain);
+			}
+#endif
 		g_NukeVkAlphaComposite = false;
 		g_NukeVkHDR10          = false;
 		if (m_impl->hdrOutput)
@@ -571,8 +709,36 @@ int NukeDiligent::init(const WindowDesc& desc)
 	}
 #endif   // _WIN32 (DirectComposition)
 	m_impl->RebuildShaderFactory();
-	// Ray tracing: D3D12 (DXR) or Vulkan (VK_KHR_ray_tracing) + a capable GPU/driver.
-	m_impl->rtSupported = desc.rayTracing &&   // config kill switch: window.rayTracing=false forces the raster path
+	// Ray tracing: D3D12 (DXR) or Vulkan (VK_KHR_ray_tracing) + a capable GPU/driver — and a
+	// shader compiler that speaks SM6.x. Off Windows no DXC is vendored (yet): glslang cannot
+	// even parse RayQuery HLSL (RT_ENABLED world.ps), so a Linux GPU with RT caps must still
+	// take the raster path or every world PSO fails to build.
+#ifdef _WIN32
+	const bool rtCompilerOk = true;                  // vendored dxcompiler.dll (deps/dxc)
+#elif defined(__APPLE__)
+	const bool rtCompilerOk = false;                 // no DXC on macOS (MoltenVK has no RT caps anyway)
+#else
+	// Vendored libdxcompiler.so deployed next to the hosts (deps/dxc-linux) unlocks SM6.x.
+	// PRESENT is not LOADABLE: the official DXC build wants glibc 2.38+ — on an older distro
+	// dlopen fails inside Diligent and the RT shader path would poison every world PSO, so
+	// probe the load for real (the handle refcounts; Diligent's own dlopen reuses it).
+	boost::system::error_code rtec;
+	const boost::filesystem::path dxcPath = nuke::Config::baseDir() / "libdxcompiler.so";
+	bool rtCompilerOk = boost::filesystem::exists(dxcPath, rtec);
+	if (!rtCompilerOk)
+		cout << "[NukeDiligent]\tno libdxcompiler.so next to the host — ray tracing unavailable" << endl;
+	else if (void* dxcProbe = dlopen(dxcPath.string().c_str(), RTLD_LAZY | RTLD_LOCAL))
+		dlclose(dxcProbe);
+	else
+	{
+		rtCompilerOk = false;
+		const char* err = dlerror();
+		cout << "[NukeDiligent]\tlibdxcompiler.so present but not loadable ("
+		     << (err ? err : "?") << ") — ray tracing unavailable (raster path)" << endl;
+	}
+#endif
+	m_impl->rtSupported = rtCompilerOk &&
+	                      desc.rayTracing &&   // config kill switch: window.rayTracing=false forces the raster path
 	                      (m_impl->useD3D12 || m_impl->useVulkan) && m_impl->device &&
 	                      (m_impl->device->GetAdapterInfo().RayTracing.CapFlags & RAY_TRACING_CAP_FLAG_STANDALONE_SHADERS) != 0;
 	cout << "[NukeDiligent]\tbackend=" << (m_impl->useD3D12 ? "D3D12" : m_impl->useVulkan ? "Vulkan" : "D3D11")

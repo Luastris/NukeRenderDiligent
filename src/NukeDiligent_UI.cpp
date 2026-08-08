@@ -158,11 +158,6 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 {
 	++uiVpFrameNo;   // multi-window interleave clock; ticks every frame
 	if (uiVpPending.empty() || !device) return;
-#if !defined(_WIN32) && !defined(__APPLE__)
-	// TODO(Deuterium/linux): X11/Wayland handles for per-viewport swap chains.
-	uiVpPending.clear();
-	return;
-#else
 	// At most ONE swap-chain create/resize per frame: back-to-back DXGI ops return ACCESS_DENIED
 	// device removal. Skipped windows re-queue next frame.
 	bool heavyOpDone = false;
@@ -212,6 +207,22 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 			// view (same shim as the main window) and let MoltenVK own the surface.
 			MacOSNativeWindow win{ NukeCocoaMetalViewForNSWindow(handle) };
 			GetEngineFactoryVk()->CreateSwapChainVk(device, context, scd, win, &sc);   // Vulkan-only off Windows
+#else
+			// Linux: the native handle travels in the void* (see NukeImGui's handle wiring) —
+			// the X11 Window id, or the wl_surface* on native Wayland. Same pairs as the
+			// primary chain.
+			LinuxNativeWindow win{};
+			if (NukeGlfwIsWayland())
+			{
+				win.pDisplay        = NukeGlfwWaylandDisplay();
+				win.pWaylandSurface = handle;
+			}
+			else
+			{
+				win.WindowId = (Uint32)(uintptr_t)handle;
+				win.pDisplay = glfwGetX11Display();
+			}
+			GetEngineFactoryVk()->CreateSwapChainVk(device, context, scd, win, &sc);
 #endif
 			std::cout << "[NukeDiligent]	vp chain CREATE " << handle << " " << w << "x" << h
 			          << (sc ? " ok" : " FAILED") << std::endl;
@@ -248,7 +259,6 @@ void NukeDiligent::Impl::ApplyPendingViewportOps()
 		}
 	}
 	uiVpPending.clear();
-#endif   // per-viewport swap chains (win32 + macOS)
 }
 
 // Render a detached window's UI into an offscreen texture and copy it to a staging ring;
