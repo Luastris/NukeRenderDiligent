@@ -273,6 +273,7 @@ void NukeDiligent::Impl::RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* ds
 // Begin the single-sample G-buffer prepass (normal/roughness/metalness + depth) for `cam`.
 void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 {
+	m_impl->GpuPass("gbuffer");   // depth/normal/velocity prepass; "scene" opens in beginCamera
 	++m_impl->passSerial;   // invalidate the per-draw redundancy gates (this pass maps the shared CBs itself)
 	// The prepass runs BEFORE beginCamera: latch the LOD anchor here too, or the prepass
 	// selects LODs against the PREVIOUS camera and mismatches the beauty pass geometry.

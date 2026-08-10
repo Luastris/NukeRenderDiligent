@@ -139,6 +139,7 @@ void NukeDiligent::Impl::DrawUILists(ITextureView* uirtv, Uint32 surfW, Uint32 s
 
 void NukeDiligent::renderDrawLists(const NukeUIDrawData& data)
 {
+	Impl::GpuMark gm(m_impl, "ui");   // runtime GUI composite (NukeGUI/Canvas overlays)
 	ITextureView* uirtv = m_impl->uiRTV ? m_impl->uiRTV : m_impl->swapChain->GetCurrentBackBufferRTV();
 	const Uint32 surfW = (m_impl->uiRTV && m_impl->uiTW) ? m_impl->uiTW : m_impl->swapChain->GetDesc().Width;
 	const Uint32 surfH = (m_impl->uiRTV && m_impl->uiTH) ? m_impl->uiTH : m_impl->swapChain->GetDesc().Height;

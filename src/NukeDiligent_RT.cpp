@@ -511,6 +511,7 @@ void NukeDiligent::buildRTScene()
 {
 	auto* d = m_impl;
 	if (!d->rtSupported || d->rtInstances.empty()) { d->rtSceneReady = false; return; }
+	Impl::GpuMark gm(d, "rt.build");   // BLAS bends/rebuilds + TLAS build/refit
 	d->BendRTMeshes();         // sway the foliage BLASes BEFORE the TLAS build/refit
 	d->RebuildDynamicBLAS();   // particle quad BLASes follow this frame's vertex data
 	const Uint32 count = (Uint32)d->rtInstances.size();

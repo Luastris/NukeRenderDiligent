@@ -400,9 +400,15 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	m_impl->curRTV = rtv; m_impl->curDSV = dsv;                     // for the selection-outline pass (restore)
 	m_impl->curRTW = w; m_impl->curRTH = h;
 	m_impl->cameraPassActive = true;   // sprites may draw from here until endCamera completes
-	{   // module camera-begin hook (water resets its per-camera underwater candidate here)
+	{   // module camera-begin hook (water resets its per-camera underwater candidate here);
+		// its GPU work (FFT/ripple/SWE/FLIP sims) times as "water.sim", then "scene" resumes.
 		const nukediligent::WaterHooks& wh = nukediligent::ActiveWaterHooks();
-		if (wh.onCameraBegin) wh.onCameraBegin(wh.user);
+		if (wh.onCameraBegin)
+		{
+			m_impl->GpuPass("water.sim");
+			wh.onCameraBegin(wh.user);
+			m_impl->GpuPass("scene");
+		}
 	}
 
 	IDeviceContext* ctx = m_impl->context;
@@ -648,8 +654,12 @@ void NukeDiligent::endCamera()
 	{
 		const nukediligent::WaterHooks& wh = nukediligent::ActiveWaterHooks();
 		if (wh.onCameraPost && chainSrc)
+		{
+			m_impl->GpuPass("water.post");   // water surface/underwater compose times separately
 			if (ITextureView* replaced = wh.onCameraPost(wh.user, chainSrc))
 				chainSrc = replaced;
+			m_impl->GpuPass("post");
+		}
 	}
 	if (!m_impl->postChain.empty() && chainSrc && m_impl->curRTW > 0 && m_impl->curRTH > 0)
 	{
@@ -665,26 +675,36 @@ void NukeDiligent::endCamera()
 			Diligent::ITexture* dstTex = m_impl->scratch[idx % 2];
 			if (!dstTex) break;
 			ITextureView* dstRTV = dstTex->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+			// The heavy built-ins time as their own gpu.* slices; "post" resumes after each
+			// (slices of one name sum, so the remaining fullscreen work still reads as post).
 			if (pit->second.isSSR)     // built-in screen-space reflections (samples the prepass G-buffer + depth)
 			{
 				if (!m_impl->gbufActive) continue;   // no prepass ran -> skip this stage (src passes through unchanged)
+				m_impl->GpuPass("ssr");
 				m_impl->RunSSR(pit->second, srcSRV, dstRTV, w, h, cs.params);
+				m_impl->GpuPass("post");
 			}
 			else if (pit->second.isRTRef)   // built-in ray-traced reflections (real DXR pipeline: rt_rgen/rmiss/rchit + SBT)
 			{
 				if (!m_impl->gbufActive) continue;   // needs the gbuffer prepass (reflector roughness/metalness); no TLAS -> passthrough inside
+				m_impl->GpuPass("rt.trace");
 				m_impl->RunRTReflectPipeline(srcSRV, dstTex, w, h, cs.params);
+				m_impl->GpuPass("post");
 			}
 			else if (pit->second.isTAA)   // built-in temporal AA (jittered accumulation; needs the depth prepass)
 			{
 				if (!m_impl->gbufActive) continue;   // no depth prepass -> skip (src passes through)
+				m_impl->GpuPass("taa");
 				m_impl->RunTAA(pit->second, srcSRV, dstTex, w, h, cs.params);
+				m_impl->GpuPass("post");
 			}
 			else if (pit->second.isBloom)   // built-in multi-pass bloom (params: x=threshold, y=intensity)
 			{
 				float thr = cs.params.size() > 0 ? cs.params[0] : 1.0f;
 				float inten = cs.params.size() > 1 ? cs.params[1] : 0.6f;
+				m_impl->GpuPass("bloom");
 				m_impl->RunBloom(srcSRV, dstRTV, w, h, thr, inten);
+				m_impl->GpuPass("post");
 			}
 			else                       // single fullscreen custom effect
 			{
