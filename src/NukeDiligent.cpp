@@ -339,6 +339,27 @@ void NukeDiligent::Impl::RebuildShaderFactory()
 	CreateMemoryShaderSourceFactory(mci, &shaderFactory);
 }
 
+// Hide-from-capture: the window renders for the user, but screen capture (screenshots,
+// recorders, vision pipelines) sees the content BEHIND it. Live-toggleable. Windows:
+// SetWindowDisplayAffinity; macOS: NSWindow.sharingType (cocoa shim); X11/Wayland: no protocol.
+static void ApplyCaptureAffinity(GLFWwindow* wnd, bool hide)
+{
+	if (!wnd) return;
+#ifdef _WIN32
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011   // pre-2004 SDK headers lack it; the OS call still works
+#endif
+	if (HWND h = glfwGetWin32Window(wnd))
+		if (!SetWindowDisplayAffinity(h, hide ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE))
+			cout << "[NukeDiligent]\thideFromCapture failed (needs Windows 10 2004+)" << endl;
+#elif defined(__APPLE__)
+	NukeCocoaSetHiddenFromCapture(wnd, hide);
+#else
+	if (hide)
+		cout << "[NukeDiligent]\thideFromCapture: X11/Wayland have no capture-exclusion protocol — ignored" << endl;
+#endif
+}
+
 int NukeDiligent::init(const WindowDesc& desc)
 {
 	int w = desc.w, h = desc.h;
@@ -392,6 +413,9 @@ int NukeDiligent::init(const WindowDesc& desc)
 	glfwWindowHint(GLFW_RESIZABLE, desc.resizable ? GLFW_TRUE : GLFW_FALSE);
 	glfwWindowHint(GLFW_FLOATING,  desc.floating  ? GLFW_TRUE : GLFW_FALSE);
 	glfwWindowHint(GLFW_MAXIMIZED, desc.maximized ? GLFW_TRUE : GLFW_FALSE);
+#ifdef GLFW_MOUSE_PASSTHROUGH   // GLFW 3.4+: overlay windows let input fall through to the desktop
+	glfwWindowHint(GLFW_MOUSE_PASSTHROUGH, desc.clickThrough ? GLFW_TRUE : GLFW_FALSE);
+#endif
 	if (desc.transparent)
 		glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, GLFW_TRUE); // see-through also needs swapchain alpha (DComp)
 	// Always create WINDOWED; fullscreen is applied right after init via applyWindow.
@@ -488,6 +512,8 @@ int NukeDiligent::init(const WindowDesc& desc)
 #endif   // _WIN32 (icon/dark-titlebar are host-OS niceties; macOS titlebars follow the system theme)
 	if (desc.opacity < 1.0f)
 		glfwSetWindowOpacity(m_window, desc.opacity);
+	if (desc.hideFromCapture)
+		ApplyCaptureAffinity(m_window, true);
 	glfwShowWindow(m_window);
 
 	m_impl->useD3D12  = (desc.backend == 1);
@@ -1119,11 +1145,21 @@ void NukeDiligent::applyWindow(const WindowDesc& d)
 	}
 
 	glfwSetWindowOpacity(m_window, d.opacity <= 0.0f ? 1.0f : d.opacity);
+	glfwSetWindowAttrib(m_window, GLFW_FLOATING, d.floating ? GLFW_TRUE : GLFW_FALSE);
+#ifdef GLFW_MOUSE_PASSTHROUGH
+	glfwSetWindowAttrib(m_window, GLFW_MOUSE_PASSTHROUGH, d.clickThrough ? GLFW_TRUE : GLFW_FALSE);
+#else
+	if (d.clickThrough)
+		cout << "[NukeDiligent]\tclickThrough needs GLFW 3.4+ — ignored" << endl;
+#endif
+	ApplyCaptureAffinity(m_window, d.hideFromCapture);
 	m_windowMode = d.mode;
 	if (d.transparent)
 		cout << "[NukeDiligent]\tper-pixel transparency is a creation-time property — applies on next launch" << endl;
 	cout << "[NukeDiligent]\tapplyWindow mode=" << d.mode << " " << d.w << "x" << d.h
-	     << " decorated=" << d.decorated << " opacity=" << d.opacity << endl;
+	     << " decorated=" << d.decorated << " opacity=" << d.opacity
+	     << " floating=" << d.floating << " clickThrough=" << d.clickThrough
+	     << " hideFromCapture=" << d.hideFromCapture << endl;
 }
 void NukeDiligent::getCursorPos(double& x, double& y) { x = y = 0; if (m_window) glfwGetCursorPos(m_window, &x, &y); }
 

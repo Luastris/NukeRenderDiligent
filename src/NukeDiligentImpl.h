@@ -63,6 +63,7 @@ inline void* NukeGlfwWaylandWindow(GLFWwindow* w)
 // NukeDiligent_Cocoa.mm: CAMetalLayer attach for the main GLFW window / a secondary NSWindow.
 extern "C" void* NukeCocoaMetalView(GLFWwindow* wnd);
 extern "C" void* NukeCocoaMetalViewForNSWindow(void* nswindow);
+extern "C" void  NukeCocoaSetHiddenFromCapture(GLFWwindow* wnd, bool hide);
 #endif
 #include "EngineFactoryVk.h"      // Vulkan backend: HLSL->SPIRV via glslang (the only backend off Windows)
 #include "RenderDevice.h"

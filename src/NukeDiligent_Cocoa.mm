@@ -61,4 +61,13 @@ extern "C" void* NukeCocoaMetalViewForNSWindow(void* nswindow)
     return MetalViewFor((__bridge NSWindow*)nswindow);
 }
 
+// Capture exclusion (WindowDesc.hideFromCapture): NSWindowSharingNone removes the window from
+// every capture path — screenshots/recorders see what is behind it, the user still sees it.
+// ReadOnly is AppKit's default sharing type, so `false` restores stock behavior.
+extern "C" void NukeCocoaSetHiddenFromCapture(GLFWwindow* wnd, bool hide)
+{
+    NSWindow* w = wnd ? glfwGetCocoaWindow(wnd) : nil;
+    if (w) [w setSharingType: hide ? NSWindowSharingNone : NSWindowSharingReadOnly];
+}
+
 #endif // __APPLE__
