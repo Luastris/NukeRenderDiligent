@@ -1,4 +1,5 @@
 #include "NukeDiligentImpl.h"
+#include <array>
 
 
 // Make the G-buffer set for w*h current: RGBA16F (octN.xy, rough, metal) + velocity + object id
@@ -71,6 +72,42 @@ void NukeDiligent::Impl::EvictGBufferCache()
 	}
 }
 
+// Overlay props + the per-draw condition context into a mapped G-buffer MatCB. The gbuffer
+// cbuffer mirrors the world shader's layout, so the engine-parsed offsets apply verbatim.
+static void FillGBufOverlays(Diligent::Uint8* p, nuke::Material* mat)
+{
+	using Impl = NukeDiligent::Impl;
+	if (!mat || !mat->shader) return;
+	for (const nuke::ShaderProp& sp : mat->shader->props)
+	{
+		if (sp.name.compare(0, 4, "g_Ov") != 0 && sp.name != "g_Det" && sp.name != "g_Var") continue;
+		auto pv = mat->props.find(sp.name);
+		if (pv == mat->props.end()) continue;
+		uint32_t bytes = (uint32_t)sp.components * sizeof(float);
+		if (sp.offset + bytes <= Impl::kMatCBBytes) memcpy(p + sp.offset, pv->second.data(), bytes);
+	}
+	if (mat->liveOvCount <= 0 || !mat->liveDrawSet) return;
+	static const auto kOvV = []{ std::array<std::string, Impl::kOvSlots> a; for (int s = 0; s < Impl::kOvSlots; ++s) a[s] = "g_Ov"  + std::to_string(s); return a; }();
+	static const auto kOvP = []{ std::array<std::string, Impl::kOvSlots> a; for (int s = 0; s < Impl::kOvSlots; ++s) a[s] = "g_OvP" + std::to_string(s); return a; }();
+	static const char* const kOvM[3] = { "g_OvM0", "g_OvM1", "g_OvM2" };
+	for (const nuke::ShaderProp& sp : mat->shader->props)
+	{
+		if (sp.components != 4 || sp.offset + 16 > Impl::kMatCBBytes) continue;
+		float* d = (float*)(p + sp.offset);
+		for (int sl = 0; sl < Impl::kOvSlots; ++sl)
+		{
+			if (sp.name == kOvV[sl] && mat->liveDrawValue[sl] >= 0.0f) d[0] = mat->liveDrawValue[sl];
+			if (sp.name == kOvP[sl]) d[2] = mat->liveDrawMaskChan[sl];
+		}
+		if (mat->liveDrawMask3D)
+		{
+			for (int r = 0; r < 3; ++r)
+				if (sp.name == kOvM[r]) memcpy(d, &mat->liveDrawMaskXform[r * 4], 16);
+			if (sp.name == "g_OvMQ") { d[0] = mat->liveDrawMaskRes; d[1] = 1.0f; }
+		}
+	}
+}
+
 // Build the G-buffer prepass PSOs (plain + instanced). Single-sample, depth write on.
 // Returns true when the plain PSO is ready.
 bool NukeDiligent::Impl::BuildGBufferPipe()
@@ -97,18 +134,26 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	LayoutElement layout[] = { {0, 0, 3, VT_FLOAT32}, {1, 1, 3, VT_FLOAT32}, {2, 2, 2, VT_FLOAT32} };
 	gp.InputLayout.NumElements = 3; gp.InputLayout.LayoutElements = layout;
 
-	ShaderResourceVariableDesc vars[] = {
+	std::vector<ShaderResourceVariableDesc> vars = {
 		{SHADER_TYPE_PIXEL, "g_MetalRough", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Normal",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_Tex",        SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // base alpha for cutout (LM-3)
+		{SHADER_TYPE_PIXEL, "g_WipeMask",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // luma-wipe holes (LM-3)
 	};
-	ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 2;
+	// Overlay slots shape the G-buffer normal/roughness too (LM-3); one shared sampler on g_Ov0Nrm.
+	for (const std::string& n : OvGbufNames())
+		vars.push_back({SHADER_TYPE_PIXEL, n.c_str(), SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+	ci.PSODesc.ResourceLayout.Variables = vars.data(); ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_WRAP; samp.AddressV = TEXTURE_ADDRESS_WRAP;
 	ImmutableSamplerDesc imm[] = {   // per-texture samplers pair by name (D3D12-strict combined samplers)
 		{SHADER_TYPE_PIXEL, "g_MetalRough", samp},
 		{SHADER_TYPE_PIXEL, "g_Normal",     samp},
+		{SHADER_TYPE_PIXEL, "g_Tex",        samp},
+		{SHADER_TYPE_PIXEL, "g_WipeMask",   samp},
+		{SHADER_TYPE_PIXEL, "g_Ov0Nrm",     samp},   // shared by the whole overlay block
 	};
-	ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 2;
+	ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 5;
 	ci.pVS = vs; ci.pPS = ps;
 	CreateGraphicsPipelineStateCached(ci, &gbufPSO);
 	if (!gbufPSO) { cout << "[NukeDiligent]\tgbuffer PSO build failed" << endl; return false; }
@@ -117,6 +162,11 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	gbufPSO->CreateShaderResourceBinding(&gbufSRB, true);
 	gbufMRVar  = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
 	gbufNrmVar = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
+	gbufTexVar  = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
+	gbufWipeVar = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_WipeMask");
+	for (int k = 0; k < kOvGbufCount; ++k)
+		gbufOvVar[k] = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, OvGbufNames()[k].c_str());
+	memset(gbufOvLast, 0, sizeof(gbufOvLast));
 
 	// Instanced twin: per-instance world rows; the CB carries current + previous camera view*proj
 	// only, so instanced velocity is camera-only (gbuffer.vs.hlsl NUKE_INSTANCED).
@@ -152,6 +202,10 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 				if (auto* b = gbufSRBInst->GetVariableByName(SHADER_TYPE_VERTEX, "BendCB")) b->Set(bendCB);
 				gbufMRVarInst  = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
 				gbufNrmVarInst = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
+				gbufTexVarInst  = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
+				gbufWipeVarInst = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_WipeMask");
+				for (int k = 0; k < kOvGbufCount; ++k)
+					gbufOvVarInst[k] = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, OvGbufNames()[k].c_str());
 			}
 		}
 	}
@@ -183,6 +237,10 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 				gbufPSOSkin->CreateShaderResourceBinding(&gbufSRBSkin, true);
 				gbufMRVarSkin  = gbufSRBSkin->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
 				gbufNrmVarSkin = gbufSRBSkin->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
+				gbufTexVarSkin  = gbufSRBSkin->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
+				gbufWipeVarSkin = gbufSRBSkin->GetVariableByName(SHADER_TYPE_PIXEL, "g_WipeMask");
+				for (int k = 0; k < kOvGbufCount; ++k)
+					gbufOvVarSkin[k] = gbufSRBSkin->GetVariableByName(SHADER_TYPE_PIXEL, OvGbufNames()[k].c_str());
 			}
 		}
 	}
@@ -363,32 +421,77 @@ void NukeDiligent::RenderGBufferRange(Mesh* mesh, Material* mat, const float pos
 	{ MapHelper<CBData> cb(m_impl->context, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD); cb->wvp = wvp; cb->world = world; cb->prevWVP = prevWVP; }
 
 	float metallic = 0.0f, roughness = 0.6f; ITextureView* mrsrv = nullptr; ITextureView* nsrv = nullptr;
+	ITextureView* texsrv = nullptr; ITextureView* wipesrv = nullptr;
 	if (mat) { metallic = mat->metallic; roughness = mat->roughness;
-	           if (mat->mr) mrsrv = m_impl->GetTexSRV(mat->mr); if (mat->norm) nsrv = m_impl->GetTexSRV(mat->norm); }
+	           if (mat->mr) mrsrv = m_impl->GetTexSRV(mat->mr); if (mat->norm) nsrv = m_impl->GetTexSRV(mat->norm);
+	           if (mat->diff) texsrv = m_impl->GetTexSRV(mat->diff);
+	           if (mat->wipe) wipesrv = m_impl->GetTexSRV(mat->wipe); }
 	{
 		MapHelper<Uint8> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		Uint8* p = mb; memset(p, 0, Impl::kMatCBBytes);
+		float col[4] = { 1, 1, 1, mat ? (float)mat->color.a : 1.0f };   // g_Color (alpha feeds the cutout clip)
+		memcpy(p + 0, col, sizeof(float) * 4);
 		float nrmY = nsrv ? ((mat && mat->norm && !mat->norm->invertGreen) ? -1.0f : 1.0f) : 0.0f;   // sign = green convention
-		float prm[4]  = { 0, nrmY, metallic, roughness };   // g_Params (_, hasNormal±greenConv, metallic.z, roughness.w)
+		float prm[4]  = { texsrv ? 1.0f : 0.0f, nrmY, metallic, roughness };   // g_Params (hasBase, hasNormal±greenConv, metallic, roughness)
 		memcpy(p + 16, prm, sizeof(float) * 4);
 		float prm2[4] = { mrsrv ? 1.0f : 0.0f, 0, 0, 1.0f };   // g_Params2 (hasMR.x)
 		memcpy(p + 32, prm2, sizeof(float) * 4);
+		// LiveMaterial: UV transform + cutout/wipe thresholds mirror the color pass.
+		float uvt[4]  = { mat ? (float)mat->uvTiling.x : 0.0f, mat ? (float)mat->uvTiling.y : 0.0f,
+		                  mat ? (float)mat->uvOffset.x + mat->uvAnim[0] : 0.0f,
+		                  mat ? (float)mat->uvOffset.y + mat->uvAnim[1] : 0.0f };
+		memcpy(p + 64, uvt, sizeof(float) * 4);
+		float uvt2[4] = { mat ? mat->uvRotation * 0.01745329f : 0.0f,
+		                  (mat && mat->blendMode == 3) ? mat->alphaCutoff : 0.0f,
+		                  (mat && mat->wipe && mat->wipeThreshold > 0.0f) ? mat->wipeThreshold : 0.0f, 0.0f };
+		memcpy(p + 80, uvt2, sizeof(float) * 4);
+		FillGBufOverlays(p, mat);   // overlay slots shape the SSR normal/roughness too
 	}
 	// GPU-skinned instance: prev-position stream + the NUKE_SKINNED pipeline (true MVs).
 	const bool skinnedDraw = g.skinned && g.skinPosPrev && m_impl->gbufPSOSkin && m_impl->gbufSRBSkin;
+	ITextureView* whiteSRV = m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 	if (skinnedDraw)
 	{
 		if (m_impl->gbufMRVarSkin)
-			m_impl->gbufMRVarSkin->Set(mrsrv ? mrsrv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+			m_impl->gbufMRVarSkin->Set(mrsrv ? mrsrv : whiteSRV);
 		if (m_impl->gbufNrmVarSkin)
 			m_impl->gbufNrmVarSkin->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+		if (m_impl->gbufTexVarSkin)  m_impl->gbufTexVarSkin->Set(texsrv ? texsrv : whiteSRV);
+		if (m_impl->gbufWipeVarSkin) m_impl->gbufWipeVarSkin->Set(wipesrv ? wipesrv : whiteSRV);
 	}
 	else
 	{
 		if (m_impl->gbufMRVar)
-			m_impl->gbufMRVar->Set(mrsrv ? mrsrv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+			m_impl->gbufMRVar->Set(mrsrv ? mrsrv : whiteSRV);
 		if (m_impl->gbufNrmVar)
 			m_impl->gbufNrmVar->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+		if (m_impl->gbufTexVar)  m_impl->gbufTexVar->Set(texsrv ? texsrv : whiteSRV);
+		if (m_impl->gbufWipeVar) m_impl->gbufWipeVar->Set(wipesrv ? wipesrv : whiteSRV);
+	}
+	// Overlay maps (normal/MR/mask per slot + the painted 3D mask), redundancy-gated per SRB.
+	{
+		const int srbIdx = skinnedDraw ? 2 : 0;
+		IShaderResourceVariable** ovVars = skinnedDraw ? m_impl->gbufOvVarSkin : m_impl->gbufOvVar;
+		ITextureView* flatN = m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+		ITextureView* ovsrv[Impl::kOvGbufCount] = {};
+		if (mat)
+		{
+			for (int sl = 0; sl < mat->liveOvCount && sl < nuke::Material::kOverlaySlots; ++sl)
+			{
+				const nuke::Material::OverlayRT& ov = mat->liveOv[sl];
+				if (ov.normal) ovsrv[sl * 3 + 0] = m_impl->GetTexSRV(ov.normal);
+				if (ov.mrTex)  ovsrv[sl * 3 + 1] = m_impl->GetTexSRV(ov.mrTex);
+				if (ov.mask)   ovsrv[sl * 3 + 2] = m_impl->GetTexSRV(ov.mask);
+			}
+			if (mat->liveDrawSet && mat->liveDrawMask3D) ovsrv[Impl::kOvSlots * 3] = m_impl->GetTexSRV(mat->liveDrawMask3D);
+			if (mat->detailNrm) ovsrv[Impl::kOvSlots * 3 + 1] = m_impl->GetTexSRV(mat->detailNrm);
+		}
+		for (int k = 0; k < Impl::kOvGbufCount; ++k)
+		{
+			IDeviceObject* o = ovsrv[k] ? (IDeviceObject*)ovsrv[k]
+			                            : (((k < Impl::kOvSlots * 3 && (k % 3) == 0) || k == Impl::kOvSlots * 3 + 1) ? (IDeviceObject*)flatN : (IDeviceObject*)whiteSRV);
+			if (ovVars[k] && o != m_impl->gbufOvLast[srbIdx][k]) { ovVars[k]->Set(o); m_impl->gbufOvLast[srbIdx][k] = o; }
+		}
 	}
 
 	IDeviceContext* ctx = m_impl->context;
@@ -419,6 +522,7 @@ void NukeDiligent::RenderGBufferRange(Mesh* mesh, Material* mat, const float pos
 		da.StartVertexLocation = (Uint32)firstIndex;
 		ctx->Draw(da);
 	}
+	if (mat && mat->liveDrawSet) mat->liveDrawSet = false;   // consumed; the colour pass re-pushes
 }
 
 // Draw [first, first+count) of `instBuf` into the prepass. The CB carries current + previous
@@ -457,11 +561,35 @@ void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t in
 		memcpy(p + 16, prm, sizeof(float) * 4);
 		float prm2[4] = { mrsrv ? 1.0f : 0.0f, 0, 0, 1.0f };
 		memcpy(p + 32, prm2, sizeof(float) * 4);
+		FillGBufOverlays(p, mat);
 	}
 	if (m_impl->gbufMRVarInst)
 		m_impl->gbufMRVarInst->Set(mrsrv ? mrsrv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
 	if (m_impl->gbufNrmVarInst)
 		m_impl->gbufNrmVarInst->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	{
+		ITextureView* whiteSRV = m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+		ITextureView* flatN = m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+		ITextureView* ovsrv[Impl::kOvGbufCount] = {};
+		if (mat)
+		{
+			for (int sl = 0; sl < mat->liveOvCount && sl < nuke::Material::kOverlaySlots; ++sl)
+			{
+				const nuke::Material::OverlayRT& ov = mat->liveOv[sl];
+				if (ov.normal) ovsrv[sl * 3 + 0] = m_impl->GetTexSRV(ov.normal);
+				if (ov.mrTex)  ovsrv[sl * 3 + 1] = m_impl->GetTexSRV(ov.mrTex);
+				if (ov.mask)   ovsrv[sl * 3 + 2] = m_impl->GetTexSRV(ov.mask);
+			}
+			if (mat->liveDrawSet && mat->liveDrawMask3D) ovsrv[Impl::kOvSlots * 3] = m_impl->GetTexSRV(mat->liveDrawMask3D);
+			if (mat->detailNrm) ovsrv[Impl::kOvSlots * 3 + 1] = m_impl->GetTexSRV(mat->detailNrm);
+		}
+		for (int k = 0; k < Impl::kOvGbufCount; ++k)
+		{
+			IDeviceObject* o = ovsrv[k] ? (IDeviceObject*)ovsrv[k]
+			                            : (((k < Impl::kOvSlots * 3 && (k % 3) == 0) || k == Impl::kOvSlots * 3 + 1) ? (IDeviceObject*)flatN : (IDeviceObject*)whiteSRV);
+			if (m_impl->gbufOvVarInst[k] && o != m_impl->gbufOvLast[1][k]) { m_impl->gbufOvVarInst[k]->Set(o); m_impl->gbufOvLast[1][k] = o; }
+		}
+	}
 
 	IDeviceContext* ctx = m_impl->context;
 	IBuffer* vbs[] = { g.pos, g.nrm, g.uv, bit->second.buf }; Uint64 offs[] = { 0, 0, 0, 0 };
@@ -487,6 +615,7 @@ void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t in
 		da.FirstInstanceLocation = (Uint32)first;
 		ctx->Draw(da);
 	}
+	if (mat && mat->liveDrawSet) mat->liveDrawSet = false;   // consumed; the colour pass re-pushes
 }
 
 void NukeDiligent::endGBufferPass() { /* gbufActive stays set so endCamera's SSR pass can sample it; beginCamera rebinds the colour target */ }

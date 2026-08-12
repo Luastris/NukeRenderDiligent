@@ -1,5 +1,36 @@
 #include "NukeDiligentImpl.h"
 
+// Overlay-slot texture names, generated to stay in lock-step with kOvSlots (the HLSL declares
+// g_Ov{slot}{Alb|Nrm|MR|Mask} + g_Mask3D; the G-buffer set has no albedos).
+const std::vector<std::string>& NukeDiligent::Impl::OvTexNames()
+{
+	static const std::vector<std::string> names = []{
+		std::vector<std::string> v;
+		static const char* kind[4] = { "Alb", "Nrm", "MR", "Mask" };
+		for (int s = 0; s < kOvSlots; ++s)
+			for (int k = 0; k < 4; ++k) v.push_back("g_Ov" + std::to_string(s) + kind[k]);
+		v.push_back("g_Mask3D");
+		v.push_back("g_Detail");
+		v.push_back("g_DetailNrm");
+		return v;
+	}();
+	return names;
+}
+
+const std::vector<std::string>& NukeDiligent::Impl::OvGbufNames()
+{
+	static const std::vector<std::string> names = []{
+		std::vector<std::string> v;
+		static const char* kind[3] = { "Nrm", "MR", "Mask" };
+		for (int s = 0; s < kOvSlots; ++s)
+			for (int k = 0; k < 3; ++k) v.push_back("g_Ov" + std::to_string(s) + kind[k]);
+		v.push_back("g_Mask3D");
+		v.push_back("g_DetailNrm");
+		return v;
+	}();
+	return names;
+}
+
 static const char GAMMA_TO_LINEAR[] = "((Gamma) < 0.04045 ? (Gamma) / 12.92 : pow(max((Gamma) + 0.055, 0.0) / 1.055, 2.4))";
 static const char SRGBA_TO_LINEAR[] =
     "col.r = GAMMA_TO_LINEAR(col.r); col.g = GAMMA_TO_LINEAR(col.g); "
@@ -405,33 +436,41 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		{0, 0, 3, VT_FLOAT32}, // position
 		{1, 1, 3, VT_FLOAT32}, // normal
 		{2, 2, 2, VT_FLOAT32}, // uv
+		{3, 3, 4, VT_FLOAT32}, // vertex color (opt-in via the NUKE_VCOLOR marker in the VS source)
 	};
-	gp.InputLayout.NumElements    = 3;
+	gp.InputLayout.NumElements    = vsSrc.find("NUKE_VCOLOR") != std::string::npos ? 4 : 3;
 	gp.InputLayout.LayoutElements = layout;
 
-	ShaderResourceVariableDesc vars[] = {
+	ShaderResourceVariableDesc varsBase[] = {
 		{SHADER_TYPE_PIXEL, "g_Tex",        SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Normal",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_MetalRough", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Occlusion",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Emissive",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Spec",       SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_WipeMask",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // luma-wipe mask (LM-3)
+		{SHADER_TYPE_PIXEL, "g_Height",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // POM/displacement height (LM-3)
 		{SHADER_TYPE_PIXEL, "g_Shadow",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_ShadowCube", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Probe",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // reflection probe cubemap
 		{SHADER_TYPE_PIXEL, "g_TLAS",       SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // RT scene (only present when rtSupported)
 		{SHADER_TYPE_PIXEL, "g_RTInst",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // per-instance RT data (shadow footprints)
 	};
-	ci.PSODesc.ResourceLayout.Variables    = vars;
-	// The last two entries are RT-only — drop them when the device has no ray tracing.
-	const Uint32 kNumVars = (Uint32)(sizeof(vars) / sizeof(vars[0]));
-	ci.PSODesc.ResourceLayout.NumVariables = rtSupported ? kNumVars : kNumVars - 2;
+	// The last two base entries are RT-only — drop them when the device has no ray tracing.
+	const Uint32 kNumBase = (Uint32)(sizeof(varsBase) / sizeof(varsBase[0]));
+	std::vector<ShaderResourceVariableDesc> vars(varsBase, varsBase + (rtSupported ? kNumBase : kNumBase - 2));
+	// Overlay slots (LM-3 states/layers), OvTexNames() order; one shared sampler on g_Ov0Alb.
+	for (const std::string& n : OvTexNames())
+		vars.push_back({SHADER_TYPE_PIXEL, n.c_str(), SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+	ci.PSODesc.ResourceLayout.Variables    = vars.data();
+	ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_WRAP; samp.AddressV = TEXTURE_ADDRESS_WRAP; samp.AddressW = TEXTURE_ADDRESS_WRAP;
 	// Combined-sampler mode on D3D12 samples texture X via X_sampler, so each map needs its OWN
 	// immutable sampler, and only for the maps this shader actually declares (unassigned ones warn).
-	static const char* const kMapTex[] = { "g_Tex", "g_Normal", "g_MetalRough", "g_Occlusion", "g_Emissive", "g_Spec" };
-	ImmutableSamplerDesc immSamp[6]; Uint32 nImm = 0;
+	static const char* const kMapTex[] = { "g_Tex", "g_Normal", "g_MetalRough", "g_Occlusion", "g_Emissive", "g_Spec", "g_WipeMask", "g_Height",
+	                                       "g_Ov0Alb" };   // ONE sampler serves the whole overlay block (D3D11 sampler cap)
+	ImmutableSamplerDesc immSamp[9]; Uint32 nImm = 0;
 	ps->GetStatus(true);   // async compile (cache miss): reflection needs the FINISHED shader
 	const Uint32 nRes = ps->GetResourceCount();
 	for (const char* nm : kMapTex)
@@ -493,6 +532,125 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		if (wp.psoWire) setStatics(wp.psoWire);
 	}
 
+	// 4b) Vertex-color variants (opt-in: sources handle NUKE_VCTINT). Same resource layout as
+	//     the plain PSOs, so wp.srb serves them; chosen per draw when the mesh has a color
+	//     stream and the material asks for tint/overlay-mask.
+	wp.psoVcol.Release(); wp.psoVcolBlend.Release(); wp.psoVcolAdd.Release();
+	if (vsSrc.find("NUKE_VCTINT") != std::string::npos && psSrc.find("NUKE_VCTINT") != std::string::npos)
+	{
+		const std::string vsV = "#define NUKE_VCTINT 1\n" + vsSrc;
+		const std::string psV = "#define NUKE_VCTINT 1\n" + psSrc;
+		ShaderCreateInfo sciV; sciV.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+		sciV.pShaderSourceStreamFactory = shaderFactory;
+		RefCntAutoPtr<IShader> vsv, psv;
+		sciV.Desc = {"World VS (vcol)", SHADER_TYPE_VERTEX, true}; sciV.Source = vsV.c_str(); CreateShaderCached(sciV, &vsv);
+		sciV.Desc = {"World PS (vcol)", SHADER_TYPE_PIXEL,  true}; sciV.Source = psV.c_str(); CreateShaderCached(sciV, &psv);
+		if (vsv && psv)
+		{
+			LayoutElement layoutV[] = {
+				{0, 0, 3, VT_FLOAT32}, {1, 1, 3, VT_FLOAT32}, {2, 2, 2, VT_FLOAT32},
+				{3, 3, 4, VT_FLOAT32},   // vertex color stream
+			};
+			ci.GraphicsPipeline.InputLayout.LayoutElements = layoutV;
+			ci.GraphicsPipeline.InputLayout.NumElements    = 4;
+			ci.pVS = vsv; ci.pPS = psv;
+			ci.GraphicsPipeline.RasterizerDesc.FillMode = FILL_MODE_SOLID;
+			ci.GraphicsPipeline.BlendDesc.RenderTargets[0] = RenderTargetBlendDesc{};
+			ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = True;
+			ci.PSODesc.Name = "World (vcol)";
+			CreateGraphicsPipelineStateCached(ci, &wp.psoVcol);
+			if (wp.psoVcol) setStatics(wp.psoVcol);
+			{
+				auto& rt = ci.GraphicsPipeline.BlendDesc.RenderTargets[0];
+				rt.BlendEnable = True; rt.SrcBlend = BLEND_FACTOR_SRC_ALPHA; rt.DestBlend = BLEND_FACTOR_INV_SRC_ALPHA;
+				rt.BlendOp = BLEND_OPERATION_ADD;
+				rt.SrcBlendAlpha = BLEND_FACTOR_ONE; rt.DestBlendAlpha = BLEND_FACTOR_INV_SRC_ALPHA; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
+				ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = False;
+				ci.PSODesc.Name = "World (vcol blend)";
+				CreateGraphicsPipelineStateCached(ci, &wp.psoVcolBlend);
+				if (wp.psoVcolBlend) setStatics(wp.psoVcolBlend);
+			}
+			{
+				auto& rt = ci.GraphicsPipeline.BlendDesc.RenderTargets[0];
+				rt.BlendEnable = True; rt.SrcBlend = BLEND_FACTOR_SRC_ALPHA; rt.DestBlend = BLEND_FACTOR_ONE;
+				rt.BlendOp = BLEND_OPERATION_ADD;
+				rt.SrcBlendAlpha = BLEND_FACTOR_ONE; rt.DestBlendAlpha = BLEND_FACTOR_ONE; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
+				ci.PSODesc.Name = "World (vcol add)";
+				CreateGraphicsPipelineStateCached(ci, &wp.psoVcolAdd);
+				if (wp.psoVcolAdd) setStatics(wp.psoVcolAdd);
+			}
+			// Restore the shared state for the blocks below.
+			ci.GraphicsPipeline.BlendDesc.RenderTargets[0] = RenderTargetBlendDesc{};
+			ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = True;
+			ci.GraphicsPipeline.InputLayout.LayoutElements = layout;
+			ci.GraphicsPipeline.InputLayout.NumElements    = vsSrc.find("NUKE_VCOLOR") != std::string::npos ? 4 : 3;
+			ci.pVS = vs; ci.pPS = ps;
+		}
+	}
+
+	// 5) Displacement tessellation — opt-in (VS handles NUKE_TESS + PS declares g_Disp) and
+	//    device-gated. Opaque state, patch-list topology; the DS displaces along the normal by
+	//    g_Height and emits the same PSIn, so the SAME pixel shader lights the result.
+	wp.psoTess.Release(); wp.srbTess.Release();
+	if (device->GetDeviceInfo().Features.Tessellation
+	    && vsSrc.find("NUKE_TESS") != std::string::npos && psSrc.find("g_Disp") != std::string::npos)
+	{
+		const std::string hsSrc = shaderSource("world.hs"), dsSrc = shaderSource("world.ds");
+		if (!hsSrc.empty() && !dsSrc.empty())
+		{
+			const std::string vsT = "#define NUKE_TESS 1\n" + vsSrc;
+			ShaderCreateInfo sciT; sciT.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+			sciT.pShaderSourceStreamFactory = shaderFactory;
+			// ALL tess-PSO stages through DXC (water precedent): glslang hull/domain SPIR-V
+			// breaks on NVIDIA — the driver dies inside pipeline creation.
+			sciT.ShaderCompiler = SHADER_COMPILER_DXC;
+			RefCntAutoPtr<IShader> vst, hst, dst, pst;
+			sciT.Desc = {"World VS (tess)", SHADER_TYPE_VERTEX, true}; sciT.Source = vsT.c_str();   CreateShaderCached(sciT, &vst);
+			sciT.Desc = {"World HS",        SHADER_TYPE_HULL,   true}; sciT.Source = hsSrc.c_str(); CreateShaderCached(sciT, &hst);
+			sciT.Desc = {"World DS",        SHADER_TYPE_DOMAIN, true}; sciT.Source = dsSrc.c_str(); CreateShaderCached(sciT, &dst);
+			sciT.Desc = {"World PS (tess)", SHADER_TYPE_PIXEL,  true}; sciT.Source = psSrc.c_str(); CreateShaderCached(sciT, &pst);
+			if (vst && hst && dst && pst)
+			{
+				ci.GraphicsPipeline.RasterizerDesc.FillMode = FILL_MODE_SOLID;
+				ci.GraphicsPipeline.BlendDesc.RenderTargets[0] = RenderTargetBlendDesc{};
+				ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = True;
+				ci.GraphicsPipeline.PrimitiveTopology = PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST;
+				std::vector<ShaderResourceVariableDesc> varsT(vars);
+				varsT.push_back({SHADER_TYPE_DOMAIN, "g_Height", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+				ci.PSODesc.ResourceLayout.Variables    = varsT.data();
+				ci.PSODesc.ResourceLayout.NumVariables = (Uint32)varsT.size();
+				std::vector<ImmutableSamplerDesc> immT(immSamp, immSamp + nImm);
+				immT.push_back(ImmutableSamplerDesc{SHADER_TYPE_DOMAIN, "g_Height", samp});
+				ci.PSODesc.ResourceLayout.ImmutableSamplers    = immT.data();
+				ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)immT.size();
+				ci.PSODesc.Name = "World (tess)";
+				ci.pVS = vst; ci.pHS = hst; ci.pDS = dst; ci.pPS = pst;
+				CreateGraphicsPipelineStateCached(ci, &wp.psoTess);
+				ci.pHS = nullptr; ci.pDS = nullptr; ci.pVS = vs; ci.pPS = ps;
+				ci.GraphicsPipeline.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+				ci.PSODesc.ResourceLayout.Variables    = vars.data();
+				ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
+				ci.PSODesc.ResourceLayout.ImmutableSamplers    = immSamp;
+				ci.PSODesc.ResourceLayout.NumImmutableSamplers = nImm;
+				cout << "[NukeDiligent]\tworld tess PSO " << (wp.psoTess ? "ready" : "FAILED") << " ('" << dbg << "')" << endl;
+				if (wp.psoTess)
+				{
+					setStatics(wp.psoTess);
+					// HS/DS see MatCB (tess factor + displacement params) and the DS projects via CB.
+					if (auto* m = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_HULL,   "MatCB")) m->Set(worldMatCB);
+					if (auto* m = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_DOMAIN, "MatCB")) m->Set(worldMatCB);
+					if (auto* c = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_DOMAIN, "CB"))    c->Set(worldCB);
+					wp.psoTess->CreateShaderResourceBinding(&wp.srbTess, true);
+					// Vulkan: cbuffers may reflect MUTABLE — bind through the SRB as well.
+					if (auto* d = wp.srbTess->GetVariableByName(SHADER_TYPE_PIXEL,  "DrawFlagsCB")) d->Set(drawFlagsCB);
+					if (auto* m = wp.srbTess->GetVariableByName(SHADER_TYPE_HULL,   "MatCB")) m->Set(worldMatCB);
+					if (auto* m = wp.srbTess->GetVariableByName(SHADER_TYPE_DOMAIN, "MatCB")) m->Set(worldMatCB);
+					if (auto* c = wp.srbTess->GetVariableByName(SHADER_TYPE_DOMAIN, "CB"))    c->Set(worldCB);
+				}
+			}
+		}
+	}
+
 	wp.pso->CreateShaderResourceBinding(&wp.srb, true);
 	// Vulkan: cbuffers may reflect as MUTABLE, so bind through the SRB as well as the statics.
 	if (auto* d = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "DrawFlagsCB")) d->Set(drawFlagsCB);
@@ -502,17 +660,22 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.aoVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Occlusion");
 	wp.emVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Emissive");
 	wp.specVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Spec");
+	wp.wipeVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_WipeMask");
+	wp.heightVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Height");
 	wp.shadowVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Shadow");
 	wp.cubeVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ShadowCube");
 	wp.probeVar  = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Probe");
 	wp.tlasVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_TLAS");
 	wp.rtInstVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_RTInst");
+	for (int k = 0; k < kOvTexCount; ++k)
+		wp.ovVar[k] = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, OvTexNames()[k].c_str());
 
 	// Instanced variants — only for shaders that opt in by handling NUKE_INSTANCED. Same sources
 	// with the define prepended; the layout gains 5 per-instance float4 attributes in slot 3.
 	wp.psoInst.Release(); wp.psoInstBlend.Release(); wp.psoInstAdd.Release(); wp.psoInstWire.Release(); wp.srbInst.Release();
-	wp.texVarI = wp.normVarI = wp.mrVarI = wp.aoVarI = wp.emVarI = wp.specVarI = nullptr;
+	wp.texVarI = wp.normVarI = wp.mrVarI = wp.aoVarI = wp.emVarI = wp.specVarI = wp.wipeVarI = wp.heightVarI = nullptr;
 	wp.shadowVarI = wp.cubeVarI = wp.probeVarI = wp.tlasVarI = nullptr;
+	memset(wp.ovVarI, 0, sizeof(wp.ovVarI));
 	if (vsSrc.find("NUKE_INSTANCED") != std::string::npos && psSrc.find("NUKE_INSTANCED") != std::string::npos)
 	{
 		const std::string vsI = "#define NUKE_INSTANCED 1\n" + vsSrc;
@@ -586,11 +749,15 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				wp.aoVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Occlusion");
 				wp.emVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Emissive");
 				wp.specVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Spec");
+				wp.wipeVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_WipeMask");
+				wp.heightVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Height");
 				wp.shadowVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Shadow");
 				wp.cubeVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_ShadowCube");
 				wp.probeVarI  = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Probe");
 				wp.tlasVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_TLAS");
 				wp.rtInstVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_RTInst");
+				for (int k = 0; k < kOvTexCount; ++k)
+					wp.ovVarI[k] = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, OvTexNames()[k].c_str());
 			}
 			else
 				cout << "[NukeDiligent]\tinstanced PSO build failed for shader '" << dbg << "'" << endl;
@@ -615,6 +782,10 @@ uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::s
 	}
 	uint64_t h = nextShaderHandle++;
 	worldPipes[h] = std::move(wp);
+	// Custom shaders can register AFTER the warm pump finished its sweep (module OnLoad, shader
+	// hot-reload) — re-arm the renderer's own entry or the new pipe never builds and every draw
+	// silently falls back to the default pipeline.
+	for (WarmEntry& e : warmups) if (e.user == this) e.done = false;
 	return h;
 }
 

@@ -1,5 +1,6 @@
 #include "NukeDiligentImpl.h"
-#include "../include/NukeDiligentNative.h"   // module pass hooks (camera begin / post point)
+#include "../include/NukeDiligentNative.h"
+#include <array>   // module pass hooks (camera begin / post point)
 
 namespace nukediligent { const WaterHooks& ActiveWaterHooks(); }
 
@@ -123,6 +124,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	float specF = 1.0f;
 	ITextureView* srv = nullptr; ITextureView* nsrv = nullptr;
 	ITextureView* mrsrv = nullptr; ITextureView* aosrv = nullptr; ITextureView* emsrv = nullptr; ITextureView* specsrv = nullptr;
+	ITextureView* wipesrv = nullptr; ITextureView* heightsrv = nullptr;
 	if (mat)
 	{
 		col[0] = (float)mat->color.r; col[1] = (float)mat->color.g; col[2] = (float)mat->color.b; col[3] = (float)mat->color.a;
@@ -135,12 +137,48 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		if (mat->ao)   aosrv = m_impl->GetTexSRV(mat->ao);
 		if (mat->em)   emsrv = m_impl->GetTexSRV(mat->em);
 		if (mat->spec) specsrv = m_impl->GetTexSRV(mat->spec);
+		if (mat->wipe) wipesrv = m_impl->GetTexSRV(mat->wipe);
+		if (mat->liveSurface.height) heightsrv = m_impl->GetTexSRV(mat->liveSurface.height);
+	}
+	// Overlay slot maps (LM-3 states/layers), OvTexNames() order; last = the painted 3D mask.
+	ITextureView* ovsrv[Impl::kOvTexCount] = {};
+	if (mat)
+	{
+		for (int s = 0; s < mat->liveOvCount && s < nuke::Material::kOverlaySlots; ++s)
+		{
+			const nuke::Material::OverlayRT& ov = mat->liveOv[s];
+			if (ov.albedo) ovsrv[s * 4 + 0] = m_impl->GetTexSRV(ov.albedo);
+			if (ov.normal) ovsrv[s * 4 + 1] = m_impl->GetTexSRV(ov.normal);
+			if (ov.mrTex)  ovsrv[s * 4 + 2] = m_impl->GetTexSRV(ov.mrTex);
+			if (ov.mask)   ovsrv[s * 4 + 3] = m_impl->GetTexSRV(ov.mask);
+		}
+		if (mat->liveDrawSet && mat->liveDrawMask3D) ovsrv[Impl::kOvSlots * 4] = m_impl->GetTexSRV(mat->liveDrawMask3D);
+		if (mat->detail)    ovsrv[Impl::kOvSlots * 4 + 1] = m_impl->GetTexSRV(mat->detail);
+		if (mat->detailNrm) ovsrv[Impl::kOvSlots * 4 + 2] = m_impl->GetTexSRV(mat->detailNrm);
 	}
 	uint64_t h = (mat && mat->shader && mat->shader->rendererHandle) ? mat->shader->rendererHandle
 	                                                                  : m_impl->defaultWorldHandle;
 	Impl::WorldPipe* pipe = m_impl->PipeFor(h);
 	if (!pipe) return;
 	Impl::WorldPipe& wp = *pipe;
+
+	// Displacement tessellation: opaque/cutout material with a height map + Disp Scale, near
+	// enough that the distance-faded factor exceeds 1 (far away the plain PSO takes over and
+	// the DS displacement fades to zero, so the handover is seam-free).
+	float tessF = 0.0f;
+	if (wp.psoTess && wp.srbTess && mat && mat->liveSurface.height && mat->liveSurface.dispScale > 0.0f
+	    && (mat->blendMode == 0 || mat->blendMode == 3) && !m_impl->wireframe)
+	{
+		const float4x4 inv = m_impl->curView.Inverse();
+		const float dx = inv.m30 - pos[0], dy = inv.m31 - pos[1], dz = inv.m32 - pos[2];
+		const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+		const float f = std::min(48.0f / std::max(dist, 1.0f), 12.0f);
+		if (f > 1.05f) tessF = f;
+	}
+	m_impl->tessFillFactor = tessF;
+	if (tessF > 0.0f) m_impl->matCBFor = nullptr;   // the factor is per-DRAW: force the refill
+	// Overlay draw context (per-atom values + painted mask) is per-DRAW too.
+	if (mat && mat->liveOvCount > 0 && mat->liveDrawSet) m_impl->matCBFor = nullptr;
 
 	// Gated on the material changing; dynamic CBs recycle per frame, so the gate is pass-scoped.
 	if (m_impl->matCBFor != mat || m_impl->matCBPass != m_impl->passSerial)
@@ -173,6 +211,36 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 				uint32_t bytes = (uint32_t)sp.components * sizeof(float);
 				if (sp.offset + bytes <= Impl::kMatCBBytes) memcpy(p + sp.offset, v, bytes);
 			}
+		// Tessellation factor is per-DRAW (camera distance): patch it over g_Disp.w at the
+		// shader's own parsed offset (custom shaders may lay their props out differently).
+		if (m_impl->tessFillFactor > 0.0f && mat && mat->shader)
+			for (const nuke::ShaderProp& sp : mat->shader->props)
+				if (sp.name == "g_Disp" && sp.components == 4 && sp.offset + 16 <= Impl::kMatCBBytes)
+				{ memcpy(p + sp.offset + 12, &m_impl->tessFillFactor, sizeof(float)); break; }
+		// Overlay draw context: per-atom state values over g_Ov*.x, painted-mask channels over
+		// g_OvP*.z and the world->mask transform — patched at the parsed offsets, same rule.
+		if (mat && mat->liveOvCount > 0 && mat->liveDrawSet && mat->shader)
+		{
+			static const auto kOvV = []{ std::array<std::string, Impl::kOvSlots> a; for (int s = 0; s < Impl::kOvSlots; ++s) a[s] = "g_Ov"  + std::to_string(s); return a; }();
+			static const auto kOvP = []{ std::array<std::string, Impl::kOvSlots> a; for (int s = 0; s < Impl::kOvSlots; ++s) a[s] = "g_OvP" + std::to_string(s); return a; }();
+			static const char* const kOvM[3] = { "g_OvM0", "g_OvM1", "g_OvM2" };
+			for (const nuke::ShaderProp& sp : mat->shader->props)
+			{
+				if (sp.components != 4 || sp.offset + 16 > Impl::kMatCBBytes) continue;
+				float* d = (float*)(p + sp.offset);
+				for (int s = 0; s < Impl::kOvSlots; ++s)
+				{
+					if (sp.name == kOvV[s] && mat->liveDrawValue[s] >= 0.0f) d[0] = mat->liveDrawValue[s];
+					if (sp.name == kOvP[s]) d[2] = mat->liveDrawMaskChan[s];
+				}
+				if (mat->liveDrawMask3D)
+				{
+					for (int r = 0; r < 3; ++r)
+						if (sp.name == kOvM[r]) memcpy(d, &mat->liveDrawMaskXform[r * 4], 16);
+					if (sp.name == "g_OvMQ") { d[0] = mat->liveDrawMaskRes; d[1] = 1.0f; }
+				}
+			}
+		}
 	}
 
 	// Gate on the pointer changing: Diligent rewrites the descriptor cache on every DYNAMIC-var Set().
@@ -190,17 +258,60 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	bindIf(wp.probeVar,  (m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV, wp.lastBind[8]);
 	bindIf(wp.tlasVar,   (m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr(), wp.lastBind[9]);
 	bindIf(wp.rtInstVar, (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV), wp.lastBind[10]);
+	bindIf(wp.wipeVar, wipesrv ? wipesrv : whiteSRV, wp.lastBind[11]);
+	bindIf(wp.heightVar, heightsrv ? heightsrv : whiteSRV, wp.lastBind[12]);
+	{
+		ITextureView* flatN = m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+		for (int k = 0; k < Impl::kOvTexCount; ++k)
+			bindIf(wp.ovVar[k], ovsrv[k] ? ovsrv[k] : (((k < Impl::kOvSlots * 4 && (k & 3) == 1) || k == Impl::kOvSlots * 4 + 2) ? flatN : whiteSRV), wp.lastBind[13 + k]);
+	}
 
 	IDeviceContext* ctx = m_impl->context;
-	IBuffer* vbs[]    = { g.pos, g.nrm, g.uv };
-	Uint64   offs[]   = { 0, 0, 0 };
-	ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	// Slot 3 = optional vertex colors; extra bound buffers are ignored by 3-element layouts.
+	IBuffer* vbs[]    = { g.pos, g.nrm, g.uv, g.col };
+	Uint64   offs[]   = { 0, 0, 0, 0 };
+	ctx->SetVertexBuffers(0, g.col ? 4 : 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	// Blend variant for this material; wireframe draw mode overrides them all.
 	IPipelineState* pso = wp.pso;
+	IShaderResourceBinding* srb = wp.srb;
+	// Vertex-color variant: mesh has a color stream + the material asks for tint/overlay-mask.
+	// Displacement tessellation takes precedence (same materials still render, un-tinted).
+	const bool vcolDraw = mat && mat->vcolorMode > 0 && g.col && wp.psoVcol && tessF <= 0.0f && !m_impl->wireframe;
 	if (m_impl->wireframe && wp.psoWire) pso = wp.psoWire;
-	else if (mat) { if (mat->blendMode == 1 && wp.psoBlend) pso = wp.psoBlend; else if (mat->blendMode == 2 && wp.psoAdd) pso = wp.psoAdd; }
+	else if (vcolDraw)
+	{
+		if      (mat->blendMode == 1 && wp.psoVcolBlend) pso = wp.psoVcolBlend;
+		else if (mat->blendMode == 2 && wp.psoVcolAdd)   pso = wp.psoVcolAdd;
+		else                                             pso = wp.psoVcol;
+	}
+	else if (mat && mat->blendMode == 1 && wp.psoBlend) pso = wp.psoBlend;
+	else if (mat && mat->blendMode == 2 && wp.psoAdd)   pso = wp.psoAdd;
+	else if (tessF > 0.0f)
+	{
+		// Tess draws are rare: bind the whole set by NAME on the tess SRB, no redundancy gates.
+		pso = wp.psoTess; srb = wp.srbTess;
+		ITextureView* flatN = m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+		auto TP = [&](SHADER_TYPE st, const char* nm, IDeviceObject* o)
+		{ if (o) if (auto* v = wp.srbTess->GetVariableByName(st, nm)) v->Set(o); };
+		TP(SHADER_TYPE_PIXEL, "g_Tex",        srv     ? srv     : whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_Normal",     nsrv    ? nsrv    : flatN);
+		TP(SHADER_TYPE_PIXEL, "g_MetalRough", mrsrv   ? mrsrv   : whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_Occlusion",  aosrv   ? aosrv   : whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_Emissive",   emsrv   ? emsrv   : whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_Spec",       specsrv ? specsrv : whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_WipeMask",   wipesrv ? wipesrv : whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_Height",     heightsrv ? heightsrv : whiteSRV);
+		TP(SHADER_TYPE_DOMAIN, "g_Height",    heightsrv ? heightsrv : whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_Shadow",     m_impl->shadowSRV ? (IDeviceObject*)m_impl->shadowSRV : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_ShadowCube", m_impl->shadowCubeSRV);
+		TP(SHADER_TYPE_PIXEL, "g_Probe",      (m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV);
+		TP(SHADER_TYPE_PIXEL, "g_TLAS",       (m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr());
+		TP(SHADER_TYPE_PIXEL, "g_RTInst",     (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV));
+		for (int k = 0; k < Impl::kOvTexCount; ++k)
+			TP(SHADER_TYPE_PIXEL, Impl::OvTexNames()[k].c_str(), ovsrv[k] ? ovsrv[k] : (((k < Impl::kOvSlots * 4 && (k & 3) == 1) || k == Impl::kOvSlots * 4 + 2) ? (IDeviceObject*)flatN : (IDeviceObject*)whiteSRV));
+	}
 	ctx->SetPipelineState(pso);
-	ctx->CommitShaderResources(wp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ctx->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	if (g.idx)
 	{
 		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -214,6 +325,9 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		da.StartVertexLocation = (Uint32)firstIndex;
 		ctx->Draw(da);
 	}
+	// The overlay draw context was for THIS draw only: consume it so a later draw of the same
+	// material from another pass (preview, module) falls back to the CB's global values.
+	if (mat && mat->liveDrawSet) mat->liveDrawSet = false;
 }
 
 void NukeDiligent::selectionOutlineBegin()
@@ -633,8 +747,78 @@ void NukeDiligent::Impl::DrawDepthDebugLines()
 	context->Draw(da);
 }
 
+void NukeDiligent::drawEditorGrid(float step) { m_impl->gridStep = step; }
+
+// The analytic infinite grid: a camera-centred ground quad whose PS draws AA lines with x10
+// adaptive LOD and a distance fade — no geometric boundary to ever see. Depth-tested against
+// the still-bound MS scene depth, drawn under the gizmo lines.
+void NukeDiligent::Impl::DrawEditorGridPass()
+{
+	if (gridStep <= 0.0f) return;
+	if (!gridPSO || gridSamples != (int)samples || gridFmt != SceneFmt())
+	{
+		if (gridPSO) Trash(gridPSO);
+		gridPSO.Release(); gridSRB.Release();
+		std::string vsSrc = shaderSource("grid.vs"), psSrc = shaderSource("grid.ps");
+		if (vsSrc.empty() || psSrc.empty()) return;
+		if (!gridCB)
+		{
+			BufferDesc cbd; cbd.Name = "GridCB"; cbd.Size = sizeof(float4x4) + sizeof(float) * 8;
+			cbd.Usage = USAGE_DYNAMIC; cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
+			device->CreateBuffer(cbd, nullptr, &gridCB);
+			if (!gridCB) return;
+		}
+		ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+		RefCntAutoPtr<IShader> v, p;
+		sci.Desc = {"Grid VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); CreateShaderCached(sci, &v);
+		sci.Desc = {"Grid PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); CreateShaderCached(sci, &p);
+		if (!v || !p) return;
+		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Editor Grid PSO";
+		auto& gp = ci.GraphicsPipeline;
+		gp.NumRenderTargets = 1; gp.RTVFormats[0] = SceneFmt();
+		gp.DSVFormat = TEX_FORMAT_D32_FLOAT;
+		gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+		gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
+		gp.DepthStencilDesc.DepthEnable = True;          // occluded by scene geometry
+		gp.DepthStencilDesc.DepthWriteEnable = False;
+		gp.SmplDesc.Count = samples;
+		auto& rt0 = gp.BlendDesc.RenderTargets[0];
+		rt0.BlendEnable = True;
+		rt0.SrcBlend = BLEND_FACTOR_SRC_ALPHA;  rt0.DestBlend = BLEND_FACTOR_INV_SRC_ALPHA;
+		rt0.SrcBlendAlpha = BLEND_FACTOR_ZERO;  rt0.DestBlendAlpha = BLEND_FACTOR_ONE;
+		ci.pVS = v; ci.pPS = p;
+		CreateGraphicsPipelineStateCached(ci, &gridPSO);
+		if (!gridPSO) return;
+		if (auto* sv = gridPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "GridCB")) sv->Set(gridCB);
+		if (auto* sp = gridPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "GridCB")) sp->Set(gridCB);
+		gridPSO->CreateShaderResourceBinding(&gridSRB, true);
+		gridSamples = (int)samples; gridFmt = SceneFmt();
+	}
+	if (!gridPSO || !gridSRB) return;
+
+	// Camera position from the inverse view; the fade reach grows with camera height so the
+	// grid always dissolves well inside its quad, never at an edge.
+	float4x4 invView = curView.Inverse();
+	const float cx = invView.m30, cy = invView.m31, cz = invView.m32;
+	struct CB { float4x4 vp; float cam[4]; float fade[4]; };
+	{
+		MapHelper<CB> cb(context, gridCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		cb->vp = curView * curProj;
+		cb->cam[0] = cx; cb->cam[1] = cy; cb->cam[2] = cz; cb->cam[3] = gridStep;
+		cb->fade[0] = std::max(400.0f, std::fabs(cy) * 30.0f);   // fade distance
+		cb->fade[1] = 0.9f;                                      // master alpha
+		cb->fade[2] = 0.0f; cb->fade[3] = 0.0f;
+	}
+	context->SetVertexBuffers(0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	context->SetPipelineState(gridPSO);
+	context->CommitShaderResources(gridSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{6, DRAW_FLAG_VERIFY_STATES};
+	context->Draw(da);
+}
+
 void NukeDiligent::endCamera()
 {
+	m_impl->DrawEditorGridPass();    // the infinite grid, under the gizmo lines
 	m_impl->DrawDepthDebugLines();   // depth-tested gizmos: against this camera's still-bound MS depth
 	m_impl->FlushSprites();     // draw any pending sprite batch WHILE the (MS) camera targets are still bound
 	m_impl->FlushSpritesLit();  // ...and the pending lit batch (tilemap normal-mapped runs)
@@ -874,6 +1058,7 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	float specF = 1.0f;
 	ITextureView* srv = nullptr; ITextureView* nsrv = nullptr;
 	ITextureView* mrsrv = nullptr; ITextureView* aosrv = nullptr; ITextureView* emsrv = nullptr; ITextureView* specsrv = nullptr;
+	ITextureView* wipesrv = nullptr; ITextureView* heightsrv = nullptr;
 	if (mat)
 	{
 		col[0] = (float)mat->color.r; col[1] = (float)mat->color.g; col[2] = (float)mat->color.b; col[3] = (float)mat->color.a;
@@ -886,6 +1071,8 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 		if (mat->ao)   aosrv = m_impl->GetTexSRV(mat->ao);
 		if (mat->em)   emsrv = m_impl->GetTexSRV(mat->em);
 		if (mat->spec) specsrv = m_impl->GetTexSRV(mat->spec);
+		if (mat->wipe) wipesrv = m_impl->GetTexSRV(mat->wipe);
+		if (mat->liveSurface.height) heightsrv = m_impl->GetTexSRV(mat->liveSurface.height);
 	}
 	// A shader without an instanced variant falls back to the default world instanced pipeline.
 	uint64_t h = (mat && mat->shader && mat->shader->rendererHandle) ? mat->shader->rendererHandle
@@ -905,6 +1092,8 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	Impl::WorldPipe& wp = *pipe;
 
 	// Per-draw flags + material CB — gated on the material changing (see renderObject).
+	// The overlay draw context (source atom's values + painted mask) is per-SET: force a refill.
+	if (mat && mat->liveOvCount > 0 && mat->liveDrawSet) m_impl->matCBFor = nullptr;
 	if (m_impl->matCBFor != mat || m_impl->matCBPass != m_impl->passSerial)
 	{
 		m_impl->matCBFor = mat; m_impl->matCBPass = m_impl->passSerial;
@@ -933,6 +1122,30 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 				uint32_t bytes = (uint32_t)sp.components * sizeof(float);
 				if (sp.offset + bytes <= Impl::kMatCBBytes) memcpy(p + sp.offset, v, bytes);
 			}
+		// Overlay draw context (source atom's values + painted mask) — same patch as the
+		// plain path, at the shader's own parsed offsets.
+		if (mat && mat->liveOvCount > 0 && mat->liveDrawSet && mat->shader)
+		{
+			static const auto kOvV = []{ std::array<std::string, Impl::kOvSlots> a; for (int s = 0; s < Impl::kOvSlots; ++s) a[s] = "g_Ov"  + std::to_string(s); return a; }();
+			static const auto kOvP = []{ std::array<std::string, Impl::kOvSlots> a; for (int s = 0; s < Impl::kOvSlots; ++s) a[s] = "g_OvP" + std::to_string(s); return a; }();
+			static const char* const kOvM[3] = { "g_OvM0", "g_OvM1", "g_OvM2" };
+			for (const nuke::ShaderProp& sp : mat->shader->props)
+			{
+				if (sp.components != 4 || sp.offset + 16 > Impl::kMatCBBytes) continue;
+				float* d = (float*)(p + sp.offset);
+				for (int s = 0; s < Impl::kOvSlots; ++s)
+				{
+					if (sp.name == kOvV[s] && mat->liveDrawValue[s] >= 0.0f) d[0] = mat->liveDrawValue[s];
+					if (sp.name == kOvP[s]) d[2] = mat->liveDrawMaskChan[s];
+				}
+				if (mat->liveDrawMask3D)
+				{
+					for (int r = 0; r < 3; ++r)
+						if (sp.name == kOvM[r]) memcpy(d, &mat->liveDrawMaskXform[r * 4], 16);
+					if (sp.name == "g_OvMQ") { d[0] = mat->liveDrawMaskRes; d[1] = 1.0f; }
+				}
+			}
+		}
 	}
 
 	auto bindIf = [](IShaderResourceVariable* v, IDeviceObject* o, IDeviceObject*& cached)
@@ -949,6 +1162,30 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	bindIf(wp.probeVarI,  (m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV, wp.lastBindI[8]);
 	bindIf(wp.tlasVarI,   (m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr(), wp.lastBindI[9]);
 	bindIf(wp.rtInstVarI, (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV), wp.lastBindI[10]);
+	bindIf(wp.wipeVarI, wipesrv ? wipesrv : whiteSRV, wp.lastBindI[11]);
+	bindIf(wp.heightVarI, heightsrv ? heightsrv : whiteSRV, wp.lastBindI[12]);
+	// Overlay slots: the whole-set draw context (source atom's values + painted mask) was pushed
+	// by the engine before the chunk loop; patch + bind exactly like the plain path.
+	{
+		ITextureView* flatN = m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+		ITextureView* ovsrv[Impl::kOvTexCount] = {};
+		if (mat)
+		{
+			for (int s = 0; s < mat->liveOvCount && s < nuke::Material::kOverlaySlots; ++s)
+			{
+				const nuke::Material::OverlayRT& ov = mat->liveOv[s];
+				if (ov.albedo) ovsrv[s * 4 + 0] = m_impl->GetTexSRV(ov.albedo);
+				if (ov.normal) ovsrv[s * 4 + 1] = m_impl->GetTexSRV(ov.normal);
+				if (ov.mrTex)  ovsrv[s * 4 + 2] = m_impl->GetTexSRV(ov.mrTex);
+				if (ov.mask)   ovsrv[s * 4 + 3] = m_impl->GetTexSRV(ov.mask);
+			}
+			if (mat->liveDrawSet && mat->liveDrawMask3D) ovsrv[Impl::kOvSlots * 4] = m_impl->GetTexSRV(mat->liveDrawMask3D);
+		if (mat->detail)    ovsrv[Impl::kOvSlots * 4 + 1] = m_impl->GetTexSRV(mat->detail);
+		if (mat->detailNrm) ovsrv[Impl::kOvSlots * 4 + 2] = m_impl->GetTexSRV(mat->detailNrm);
+		}
+		for (int k = 0; k < Impl::kOvTexCount; ++k)
+			bindIf(wp.ovVarI[k], ovsrv[k] ? ovsrv[k] : (((k < Impl::kOvSlots * 4 && (k & 3) == 1) || k == Impl::kOvSlots * 4 + 2) ? flatN : whiteSRV), wp.lastBindI[13 + k]);
+	}
 
 	IDeviceContext* ctx = m_impl->context;
 	IPipelineState* pso = wp.psoInst;
@@ -984,4 +1221,7 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 		da.FirstInstanceLocation = (Uint32)first;
 		ctx->Draw(da);
 	}
+	// Consume the overlay draw context; the CB keeps the patched values for the set's remaining
+	// chunks (same material -> no refill), so pushing once per set is enough.
+	if (mat && mat->liveDrawSet) mat->liveDrawSet = false;
 }

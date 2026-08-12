@@ -346,12 +346,29 @@ struct NukeDiligent::Impl
 	std::unordered_map<uint64_t, GBufferSet> gbufCache;
 	uint64_t                            gbufFrameCtr = 0;   // LRU clock
 	uint64_t                            gbufCurKey = 0;     // active set's key (never evicted)
+	// Overlay-slot texture names (LM-3): kOvSlots x (albedo, normal, MR, mask2D) + the painted
+	// 3D-mask flipbook. Shared by the pipeline var fetch and the draw binds. The G-buffer set
+	// skips the albedos (normals/roughness only): kOvSlots x (normal, MR, mask2D) + the mask.
+	static const int kOvSlots    = 8;                   // must match Material::kOverlaySlots
+	static const int kOvTexCount = kOvSlots * 4 + 3;    // world SRVs: slots + mask3D + detail + detailNrm
+	static const int kOvGbufCount = kOvSlots * 3 + 2;   // g-buffer SRVs: slots + mask3D + detailNrm
+	static const std::vector<std::string>& OvTexNames();
+	static const std::vector<std::string>& OvGbufNames();
+
 	void EvictGBufferCache();
 	bool                                gbufActive = false;   // a valid prepass ran for the current camera
 	RefCntAutoPtr<IPipelineState>       gbufPSO;
 	RefCntAutoPtr<IShaderResourceBinding> gbufSRB;
 	IShaderResourceVariable*            gbufMRVar = nullptr;   // PS g_MetalRough (dynamic)
 	IShaderResourceVariable*            gbufNrmVar = nullptr;  // PS g_Normal (dynamic) — normal-mapped gbuffer normal
+	IShaderResourceVariable*            gbufTexVar = nullptr;  // PS g_Tex (base alpha for cutout, LM-3)
+	IShaderResourceVariable*            gbufWipeVar = nullptr; // PS g_WipeMask (luma-wipe holes, LM-3)
+	// Overlay maps in the G-buffer (kOvSlots x normal/MR/mask2D + the painted 3D mask), one set
+	// per SRB variant (normal/instanced/skinned), OvGbufNames() order. gbufOvLast gate the Sets.
+	IShaderResourceVariable*            gbufOvVar[kOvGbufCount]     = {};
+	IShaderResourceVariable*            gbufOvVarInst[kOvGbufCount] = {};
+	IShaderResourceVariable*            gbufOvVarSkin[kOvGbufCount] = {};
+	IDeviceObject*                      gbufOvLast[3][kOvGbufCount] = {};
 	RefCntAutoPtr<IBuffer>              ssrCB;                 // SSR matrices (view/proj/invProj/res)
 	RefCntAutoPtr<IBuffer>              rtRefCB;               // RT reflections (invViewProj, light, ambient, sky)
 	// Temporal AA: per-camera history + previous view/proj (keyed by curTarget), shared CB, and this
@@ -496,6 +513,13 @@ struct NukeDiligent::Impl
 		RefCntAutoPtr<IPipelineState>         psoBlend;   // transparent: alpha blend, depth test on / write off
 		RefCntAutoPtr<IPipelineState>         psoAdd;     // additive: add blend, depth write off
 		RefCntAutoPtr<IPipelineState>         psoWire;    // wireframe fill (scene draw-mode toggle)
+		// Vertex-color variant (opt-in: sources handle NUKE_VCTINT): the mesh's color stream
+		// tints the base color or masks the overlay slots. Same resource layout -> shares srb.
+		RefCntAutoPtr<IPipelineState>         psoVcol, psoVcolBlend, psoVcolAdd;
+		// Displacement tessellation variant (opt-in: VS handles NUKE_TESS + PS declares g_Disp).
+		// Own SRB (extra HS/DS stages + DOMAIN g_Height); bound by NAME per draw — tess draws are rare.
+		RefCntAutoPtr<IPipelineState>         psoTess;
+		RefCntAutoPtr<IShaderResourceBinding> srbTess;
 		RefCntAutoPtr<IShaderResourceBinding> srb;
 		IShaderResourceVariable*              texVar  = nullptr;  // PS "g_Tex"        (base color, dynamic)
 		IShaderResourceVariable*              normVar = nullptr;  // PS "g_Normal"     (normal map, dynamic)
@@ -503,6 +527,11 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              aoVar   = nullptr;  // PS "g_Occlusion"  (dynamic)
 		IShaderResourceVariable*              emVar   = nullptr;  // PS "g_Emissive"   (dynamic)
 		IShaderResourceVariable*              specVar = nullptr;  // PS "g_Spec"       (specular map, dynamic)
+		IShaderResourceVariable*              wipeVar = nullptr;  // PS "g_WipeMask"   (luma-wipe mask, dynamic)
+		IShaderResourceVariable*              heightVar = nullptr;// PS "g_Height"     (POM/displacement height, dynamic)
+		// Overlay slots (LM-3 states/layers): kOvSlots x (albedo, normal, MR, mask2D) + the
+		// painted 3D-mask flipbook. Same order as OvTexNames(); lastBind[13..] gate them.
+		IShaderResourceVariable*              ovVar[kOvTexCount] = {};
 		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
 		IShaderResourceVariable*              probeVar  = nullptr;// PS "g_Probe" (reflection cubemap, dynamic)
@@ -513,13 +542,16 @@ struct NukeDiligent::Impl
 		RefCntAutoPtr<IPipelineState>         psoInst, psoInstBlend, psoInstAdd, psoInstWire;
 		RefCntAutoPtr<IShaderResourceBinding> srbInst;
 		IShaderResourceVariable *texVarI = nullptr, *normVarI = nullptr, *mrVarI = nullptr, *aoVarI = nullptr,
-		                        *emVarI = nullptr, *specVarI = nullptr, *shadowVarI = nullptr, *cubeVarI = nullptr,
-		                        *probeVarI = nullptr, *tlasVarI = nullptr, *rtInstVarI = nullptr;
+		                        *emVarI = nullptr, *specVarI = nullptr, *wipeVarI = nullptr, *heightVarI = nullptr,
+		                        *shadowVarI = nullptr, *cubeVarI = nullptr, *probeVarI = nullptr, *tlasVarI = nullptr,
+		                        *rtInstVarI = nullptr;
+		IShaderResourceVariable *ovVarI[kOvTexCount] = {};
 		// Redundancy gates: object each DYNAMIC variable currently holds — Diligent rewrites the
 		// descriptor cache on EVERY Set() of a dynamic var, so only Set() on an actual change.
-		// [0..10] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst. Cleared when SRBs are rebuilt.
-		IDeviceObject* lastBind[11]  = {};
-		IDeviceObject* lastBindI[11] = {};
+		// [0..12] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst,wipe,height;
+		// [13..] = the overlay-slot maps (OvTexNames() order). Cleared on SRB rebuild.
+		IDeviceObject* lastBind[13 + kOvTexCount]  = {};
+		IDeviceObject* lastBindI[13 + kOvTexCount] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
 		// What this pipeline was built for. Stale or never-built pipes are skipped by the draw
 		// and rebuilt by the warm-up; the draw falls back to the default world pipeline.
@@ -571,20 +603,26 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IPipelineState>         shadowPSOInst;
 	RefCntAutoPtr<IShaderResourceBinding> shadowSRBInst;
 	IShaderResourceVariable*              shadowPsTexVarInst = nullptr;
+	IShaderResourceVariable*              shadowPsWipeVarInst = nullptr;   // shadow PS "g_WipeMask" (inst)
 	RefCntAutoPtr<IPipelineState>         gbufPSOInst;
 	RefCntAutoPtr<IShaderResourceBinding> gbufSRBInst;
 	IShaderResourceVariable*              gbufMRVarInst = nullptr;
 	IShaderResourceVariable*              gbufNrmVarInst = nullptr;
+	IShaderResourceVariable*              gbufTexVarInst = nullptr;
+	IShaderResourceVariable*              gbufWipeVarInst = nullptr;
 	// Skinned twin (NUKE_SKINNED): stream 3 = previous-frame skinned positions -> true MVs.
 	RefCntAutoPtr<IPipelineState>         gbufPSOSkin;
 	RefCntAutoPtr<IShaderResourceBinding> gbufSRBSkin;
 	IShaderResourceVariable*              gbufMRVarSkin = nullptr;
 	IShaderResourceVariable*              gbufNrmVarSkin = nullptr;
+	IShaderResourceVariable*              gbufTexVarSkin = nullptr;
+	IShaderResourceVariable*              gbufWipeVarSkin = nullptr;
 	bool warnedNoInstPipe = false;   // one-shot log: material shader without an instanced variant
 	uint64_t                              nextShaderHandle   = 1;   // handles handed to the engine
 	RefCntAutoPtr<IBuffer>                worldCB;     // VS: WVP + World   (shared)
 	RefCntAutoPtr<IBuffer>                worldMatCB;  // PS: color + params + custom shader props (shared)
-	static const uint32_t                 kMatCBBytes = 256;   // MatCB capacity (color/params + props)
+	static const uint32_t                 kMatCBBytes = 1024;   // MatCB capacity (color/params + props + 8 overlay slots)
+	float                                 tessFillFactor = 0.0f;   // per-draw tess factor patched into g_Disp.w
 	Diligent::RefCntAutoPtr<Diligent::IBuffer> drawFlagsCB;    // per-draw flags (x = receiveShadows)
 	RefCntAutoPtr<ITexture>               whiteTex;    // 1x1 fallback when a material has no texture
 	RefCntAutoPtr<ITexture>               flatNormTex; // 1x1 (0.5,0.5,1) flat normal fallback
@@ -642,6 +680,7 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IPipelineState>         shadowPSO;
 	RefCntAutoPtr<IShaderResourceBinding> shadowSRB;
 	IShaderResourceVariable*              shadowPsTexVar = nullptr;   // shadow PS "g_Tex" (alpha)
+	IShaderResourceVariable*              shadowPsWipeVar = nullptr;  // shadow PS "g_WipeMask" (luma-wipe holes)
 	RefCntAutoPtr<IBuffer>                shadowVSCB;    // VS: g_LightWVP (per shadow draw)
 	RefCntAutoPtr<IBuffer>                shadowPSCB;    // PS: g_Alpha    (per shadow draw)
 	RefCntAutoPtr<ISampler>               shadowCmpSampler;   // PCF comparison sampler (set on shadowSRV)
@@ -667,6 +706,14 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IShaderResourceBinding> debugDepthSRB;
 	int            debugDepthSamples = 0;                        // PSO built for this sample count
 	TEXTURE_FORMAT debugDepthFmt     = TEX_FORMAT_UNKNOWN;       // ...and this scene format
+	// Editor infinite grid: analytic shader plane, drawn depth-tested before the gizmo lines.
+	RefCntAutoPtr<IPipelineState>         gridPSO;
+	RefCntAutoPtr<IShaderResourceBinding> gridSRB;
+	RefCntAutoPtr<IBuffer>                gridCB;
+	int            gridSamples = 0;
+	TEXTURE_FORMAT gridFmt     = TEX_FORMAT_UNKNOWN;
+	float          gridStep    = 0.0f;      // per-frame handover from the editor (0 = hidden)
+	void DrawEditorGridPass();              // endCamera, before DrawDepthDebugLines
 	std::vector<float> debugVertsDepth;   // 7 floats per vertex (shares debugMutex + debugVB)
 	void DrawDepthDebugLines();
 
@@ -754,6 +801,7 @@ struct NukeDiligent::Impl
 	bool     BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg);
 	void     RebuildForMSAA();   // rebuild all sample-count-dependent pipelines + targets after `samples` changes
 	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; int version = 0;
+	                 RefCntAutoPtr<IBuffer> col;   // optional vertex-color stream (Mesh::colorArray) — slot 3, ATTRIB3
 	                 RefCntAutoPtr<IBuffer> idx; int numIndices = 0;   // v4 indexed meshes (null = soup)
 	                 // RT wind bend: NukeBend compute inputs + the BENT position buffer the BLAS builds over.
 	                 RefCntAutoPtr<IBuffer> bendSrc, bendData, bendPivot, posBent, blasScratch;

@@ -60,7 +60,7 @@ void NukeDiligent::Impl::CreateShadowResources()
 
 	BufferDesc cbd; cbd.Usage = USAGE_DYNAMIC; cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	cbd.Name = "ShadowVSCB"; cbd.Size = sizeof(float4x4);    device->CreateBuffer(cbd, nullptr, &shadowVSCB);
-	cbd.Name = "ShadowPSCB"; cbd.Size = sizeof(float) * 4;   device->CreateBuffer(cbd, nullptr, &shadowPSCB);
+	cbd.Name = "ShadowPSCB"; cbd.Size = sizeof(float) * 8;   device->CreateBuffer(cbd, nullptr, &shadowPSCB);
 
 	std::string vs = shaderSource("shadow.vs"), ps = shaderSource("shadow.ps");
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tshadow shaders missing" << endl; return; }
@@ -88,11 +88,12 @@ void NukeDiligent::Impl::CreateShadowResources()
 		{SHADER_TYPE_VERTEX, "ShadowVSCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 		{SHADER_TYPE_PIXEL,  "ShadowPSCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 		{SHADER_TYPE_PIXEL,  "g_Tex",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL,  "g_WipeMask", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // luma-wipe holes in shadows
 	};
-	ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 3;
+	ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 4;
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
-	ImmutableSamplerDesc imm[] = {{SHADER_TYPE_PIXEL, "g_Tex", samp}};
-	ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+	ImmutableSamplerDesc imm[] = {{SHADER_TYPE_PIXEL, "g_Tex", samp}, {SHADER_TYPE_PIXEL, "g_WipeMask", samp}};
+	ci.PSODesc.ResourceLayout.ImmutableSamplers = imm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 2;
 	ci.pVS = vsh; ci.pPS = psh;
 	CreateGraphicsPipelineStateCached(ci, &shadowPSO);
 	if (shadowPSO)
@@ -104,11 +105,12 @@ void NukeDiligent::Impl::CreateShadowResources()
 		if (auto* v = shadowSRB->GetVariableByName(SHADER_TYPE_VERTEX, "ShadowVSCB")) v->Set(shadowVSCB);
 		if (auto* v = shadowSRB->GetVariableByName(SHADER_TYPE_PIXEL,  "ShadowPSCB")) v->Set(shadowPSCB);
 		shadowPsTexVar = shadowSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
+		shadowPsWipeVar = shadowSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_WipeMask");
 	}
 
 	// Instanced twin: same depth state/CBs, per-instance world rows in buffer slot 3; the CB then
 	// carries the light's view*proj only (shadow.vs.hlsl NUKE_INSTANCED).
-	shadowPSOInst.Release(); shadowSRBInst.Release(); shadowPsTexVarInst = nullptr;
+	shadowPSOInst.Release(); shadowSRBInst.Release(); shadowPsTexVarInst = nullptr; shadowPsWipeVarInst = nullptr;
 	{
 		const std::string vsI = "#define NUKE_INSTANCED 1\n" + vs;
 		const std::string psI = "#define NUKE_INSTANCED 1\n" + ps;
@@ -141,6 +143,7 @@ void NukeDiligent::Impl::CreateShadowResources()
 				// Vulkan: cbuffers may reflect MUTABLE, not static — an unbound BendCB invalidates the descriptor set.
 				if (auto* v = shadowSRBInst->GetVariableByName(SHADER_TYPE_VERTEX, "BendCB"))     v->Set(bendCB);
 				shadowPsTexVarInst = shadowSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
+				shadowPsWipeVarInst = shadowSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_WipeMask");
 			}
 		}
 	}
@@ -296,10 +299,19 @@ void NukeDiligent::RenderShadowRange(Mesh* mesh, Material* mat,
 	{
 		MapHelper<float> cb(m_impl->context, m_impl->shadowPSCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		cb[0] = mat ? (float)mat->color.a : 1.0f;
-		cb[1] = base ? 1.0f : 0.0f; cb[2] = 0.f; cb[3] = 0.f;
+		cb[1] = base ? 1.0f : 0.0f;
+		// LiveMaterial: cutout threshold + wipe threshold + UV transform mirror the color pass.
+		cb[2] = (mat && mat->blendMode == 3) ? mat->alphaCutoff : 0.0f;
+		cb[3] = (mat && mat->wipe && mat->wipeThreshold > 0.0f) ? mat->wipeThreshold : 0.0f;
+		cb[4] = mat ? (float)mat->uvTiling.x : 0.0f; cb[5] = mat ? (float)mat->uvTiling.y : 0.0f;
+		cb[6] = mat ? (float)mat->uvOffset.x + mat->uvAnim[0] : 0.0f;
+		cb[7] = mat ? (float)mat->uvOffset.y + mat->uvAnim[1] : 0.0f;
 	}
 	if (m_impl->shadowPsTexVar)
 		m_impl->shadowPsTexVar->Set(base ? base : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	if (m_impl->shadowPsWipeVar)
+		m_impl->shadowPsWipeVar->Set(mat && mat->wipe ? (IDeviceObject*)m_impl->GetTexSRV(mat->wipe)
+		                                              : (IDeviceObject*)m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
 
 	IDeviceContext* ctx = m_impl->context;
 	IBuffer* vbs[] = { g.pos, g.nrm, g.uv };
@@ -345,10 +357,18 @@ void NukeDiligent::renderShadowInstanced(Mesh* mesh, uint64_t instBuf, int first
 		MapHelper<float> cb(m_impl->context, m_impl->shadowPSCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		if (cb == nullptr) return;
 		cb[0] = mat ? (float)mat->color.a : 1.0f;
-		cb[1] = base ? 1.0f : 0.0f; cb[2] = 0.f; cb[3] = 0.f;
+		cb[1] = base ? 1.0f : 0.0f;
+		cb[2] = (mat && mat->blendMode == 3) ? mat->alphaCutoff : 0.0f;
+		cb[3] = (mat && mat->wipe && mat->wipeThreshold > 0.0f) ? mat->wipeThreshold : 0.0f;
+		cb[4] = mat ? (float)mat->uvTiling.x : 0.0f; cb[5] = mat ? (float)mat->uvTiling.y : 0.0f;
+		cb[6] = mat ? (float)mat->uvOffset.x + mat->uvAnim[0] : 0.0f;
+		cb[7] = mat ? (float)mat->uvOffset.y + mat->uvAnim[1] : 0.0f;
 	}
 	if (m_impl->shadowPsTexVarInst)
 		m_impl->shadowPsTexVarInst->Set(base ? base : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	if (m_impl->shadowPsWipeVarInst)
+		m_impl->shadowPsWipeVarInst->Set(mat && mat->wipe ? (IDeviceObject*)m_impl->GetTexSRV(mat->wipe)
+		                                                  : (IDeviceObject*)m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
 
 	IDeviceContext* ctx = m_impl->context;
 	IBuffer* vbs[]  = { g.pos, g.nrm, g.uv, bit->second.buf };

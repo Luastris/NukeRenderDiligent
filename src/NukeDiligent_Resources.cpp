@@ -222,6 +222,12 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 		const float* uvSrc = mesh->uvArray;
 		if (!uvSrc) { zeroUV.assign((size_t)mesh->numVerts * 2, 0.0f); uvSrc = zeroUV.data(); }   // mesh has no UVs
 		bd.Size = sz2; bd.Name = "mesh uv"; BufferData udat{uvSrc, sz2}; device->CreateBuffer(bd, &udat, &g.uv);
+		if (mesh->colorArray)   // optional RGBA vertex colors (terrain splat weights etc.), slot 3
+		{
+			const Uint64 sz4c = (Uint64)mesh->numVerts * 4 * sizeof(float);
+			bd.Size = sz4c; bd.Name = "mesh col"; BufferData cdat{mesh->colorArray, sz4c};
+			device->CreateBuffer(bd, &cdat, &g.col);
+		}
 		if (mesh->indexArray && mesh->numIndices > 0)   // v4 indexed mesh: index buffer (BLAS reads it too)
 		{
 			BufferDesc ib; ib.Usage = USAGE_DEFAULT; ib.Name = "mesh idx";
@@ -261,7 +267,7 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 		{
 			// Park EVERYTHING the erase would inline-release — this frame's earlier draws
 			// (and in-flight BLAS builds) may still reference the buffers.
-			Trash(g.pos); Trash(g.nrm); Trash(g.uv); Trash(g.idx);
+			Trash(g.pos); Trash(g.nrm); Trash(g.uv); Trash(g.col); Trash(g.idx);
 			Trash(g.bendSrc); Trash(g.bendData); Trash(g.bendPivot); Trash(g.posBent); Trash(g.blasScratch);
 			Trash(g.skinPosPrev); Trash(g.skinSrcPos); Trash(g.skinSrcNrm);
 			Trash(g.skinIdxBuf); Trash(g.skinWgtBuf); Trash(g.skinMorph);
@@ -278,6 +284,8 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 		const Uint64 sz3 = (Uint64)mesh->numVerts * 3 * sizeof(float);
 		if (mesh->vertexArray) context->UpdateBuffer(g.pos, 0, sz3, mesh->vertexArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		if (mesh->normalArray) context->UpdateBuffer(g.nrm, 0, sz3, mesh->normalArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		if (mesh->colorArray && g.col)
+			context->UpdateBuffer(g.col, 0, (Uint64)mesh->numVerts * 4 * sizeof(float), mesh->colorArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		if (g.bendSrc && mesh->vertexArray)
 		{
 			context->UpdateBuffer(g.bendSrc, 0, sz3, mesh->vertexArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);

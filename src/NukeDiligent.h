@@ -64,6 +64,7 @@ public:
 	void setWireframe(bool on) override;                 // scene fill mode (world meshes only)
 	bool getWireframe() override;
 	void drawDebugLineDepth(const float a[3], const float b[3], const float color[4]) override;
+	void drawEditorGrid(float step) override;   // analytic infinite editor grid (shader plane)
 	void drawSpriteRun(Texture* tex, const float* verts, int vertCount) override;
 	void drawSpriteRunLit(Texture* tex, Texture* normal, const float* verts, int vertCount,
 	                      bool normalFlipY) override;
