@@ -532,6 +532,9 @@ struct NukeDiligent::Impl
 		// Overlay slots (LM-3 states/layers): kOvSlots x (albedo, normal, MR, mask2D) + the
 		// painted 3D-mask flipbook. Same order as OvTexNames(); lastBind[13..] gate them.
 		IShaderResourceVariable*              ovVar[kOvTexCount] = {};
+		// BRDF pack (LM-6): anisotropy flow map + the pre-transparent scene snapshot.
+		IShaderResourceVariable*              flowVar = nullptr;   // PS "g_Flow"
+		IShaderResourceVariable*              refrVar = nullptr;   // PS "g_SceneRefr"
 		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
 		IShaderResourceVariable*              probeVar  = nullptr;// PS "g_Probe" (reflection cubemap, dynamic)
@@ -546,12 +549,13 @@ struct NukeDiligent::Impl
 		                        *shadowVarI = nullptr, *cubeVarI = nullptr, *probeVarI = nullptr, *tlasVarI = nullptr,
 		                        *rtInstVarI = nullptr;
 		IShaderResourceVariable *ovVarI[kOvTexCount] = {};
+		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr;
 		// Redundancy gates: object each DYNAMIC variable currently holds — Diligent rewrites the
 		// descriptor cache on EVERY Set() of a dynamic var, so only Set() on an actual change.
 		// [0..12] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst,wipe,height;
-		// [13..] = the overlay-slot maps (OvTexNames() order). Cleared on SRB rebuild.
-		IDeviceObject* lastBind[13 + kOvTexCount]  = {};
-		IDeviceObject* lastBindI[13 + kOvTexCount] = {};
+		// [13..] = overlay-slot maps (OvTexNames() order), then flow + scene-refraction.
+		IDeviceObject* lastBind[13 + kOvTexCount + 2]  = {};
+		IDeviceObject* lastBindI[13 + kOvTexCount + 2] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
 		// What this pipeline was built for. Stale or never-built pipes are skipped by the draw
 		// and rebuilt by the warm-up; the draw falls back to the default world pipeline.
@@ -835,6 +839,9 @@ struct NukeDiligent::Impl
 	ITextureView*                         outlineMaskSRV = nullptr;
 	int                                   outlineMaskW = 0, outlineMaskH = 0;
 	RefCntAutoPtr<IBuffer>                outlineEdgeCB;      // texel size + thickness
+	// LM-6 background refraction: the opaque scene resolved/copied at beginTransparent.
+	RefCntAutoPtr<ITexture>               refrTex;
+	ITextureView*                         refrSRV = nullptr;   // null = no snapshot this camera
 	ITextureView*                         curRTV = nullptr;   // current camera color target (outline rebind)
 	ITextureView*                         curDSV = nullptr;   // ...and its depth; passes that bind their own
 	                                                          // targets must RESTORE both before returning

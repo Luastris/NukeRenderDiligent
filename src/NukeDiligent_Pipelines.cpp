@@ -462,6 +462,9 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	// Overlay slots (LM-3 states/layers), OvTexNames() order; one shared sampler on g_Ov0Alb.
 	for (const std::string& n : OvTexNames())
 		vars.push_back({SHADER_TYPE_PIXEL, n.c_str(), SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+	// BRDF pack (LM-6): flow map + the pre-transparent scene snapshot (shared sampler too).
+	vars.push_back({SHADER_TYPE_PIXEL, "g_Flow",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+	vars.push_back({SHADER_TYPE_PIXEL, "g_SceneRefr", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	ci.PSODesc.ResourceLayout.Variables    = vars.data();
 	ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
@@ -669,6 +672,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.rtInstVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_RTInst");
 	for (int k = 0; k < kOvTexCount; ++k)
 		wp.ovVar[k] = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, OvTexNames()[k].c_str());
+	wp.flowVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Flow");
+	wp.refrVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneRefr");
 
 	// Instanced variants — only for shaders that opt in by handling NUKE_INSTANCED. Same sources
 	// with the define prepended; the layout gains 5 per-instance float4 attributes in slot 3.
@@ -758,6 +763,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				wp.rtInstVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_RTInst");
 				for (int k = 0; k < kOvTexCount; ++k)
 					wp.ovVarI[k] = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, OvTexNames()[k].c_str());
+				wp.flowVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Flow");
+				wp.refrVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneRefr");
 			}
 			else
 				cout << "[NukeDiligent]\tinstanced PSO build failed for shader '" << dbg << "'" << endl;

@@ -77,6 +77,7 @@ public:
 	void     updateInstanceBuffer(uint64_t id, const NukeInstanceData* data, int count) override;
 	void     destroyInstanceBuffer(uint64_t id) override;
 	void renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count) override;
+	void beginTransparent() override;   // LM-6: snapshot the opaque scene for refraction
 	void renderShadowInstanced(Mesh* mesh, uint64_t instBuf, int first, int count, Material* mat) override;
 	void renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count) override;
 	void setWind(const float dirStrength[4], const float params[4]) override;   // 7.2

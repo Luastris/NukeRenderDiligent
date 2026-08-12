@@ -264,6 +264,8 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		ITextureView* flatN = m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 		for (int k = 0; k < Impl::kOvTexCount; ++k)
 			bindIf(wp.ovVar[k], ovsrv[k] ? ovsrv[k] : (((k < Impl::kOvSlots * 4 && (k & 3) == 1) || k == Impl::kOvSlots * 4 + 2) ? flatN : whiteSRV), wp.lastBind[13 + k]);
+		bindIf(wp.flowVar, (mat && mat->flow) ? m_impl->GetTexSRV(mat->flow) : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount]);
+		bindIf(wp.refrVar, m_impl->refrSRV ? m_impl->refrSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 1]);
 	}
 
 	IDeviceContext* ctx = m_impl->context;
@@ -309,6 +311,8 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		TP(SHADER_TYPE_PIXEL, "g_RTInst",     (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV));
 		for (int k = 0; k < Impl::kOvTexCount; ++k)
 			TP(SHADER_TYPE_PIXEL, Impl::OvTexNames()[k].c_str(), ovsrv[k] ? ovsrv[k] : (((k < Impl::kOvSlots * 4 && (k & 3) == 1) || k == Impl::kOvSlots * 4 + 2) ? (IDeviceObject*)flatN : (IDeviceObject*)whiteSRV));
+		TP(SHADER_TYPE_PIXEL, "g_Flow",      (mat && mat->flow) ? (IDeviceObject*)m_impl->GetTexSRV(mat->flow) : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_SceneRefr", m_impl->refrSRV ? (IDeviceObject*)m_impl->refrSRV : (IDeviceObject*)whiteSRV);
 	}
 	ctx->SetPipelineState(pso);
 	ctx->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -328,6 +332,49 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	// The overlay draw context was for THIS draw only: consume it so a later draw of the same
 	// material from another pass (preview, module) falls back to the CB's global values.
 	if (mat && mat->liveDrawSet) mat->liveDrawSet = false;
+}
+
+// LM-6 background refraction: snapshot the opaque scene (resolve when MSAA) so transparent
+// refractive draws can sample what is behind them. The copy invalidates on size/format change;
+// beginCamera nulls refrSRV so a camera without refraction never samples a stale snapshot.
+void NukeDiligent::beginTransparent()
+{
+	Impl& im = *m_impl;
+	if (!im.curRTV) return;
+	ITexture* src = im.curRTV->GetTexture();
+	const TextureDesc& sd = src->GetDesc();
+	if (im.refrTex && (im.refrTex->GetDesc().Width != sd.Width || im.refrTex->GetDesc().Height != sd.Height
+	                   || im.refrTex->GetDesc().Format != sd.Format))
+	{
+		im.Trash(im.refrTex);
+		im.refrTex.Release();
+	}
+	if (!im.refrTex)
+	{
+		TextureDesc td;
+		td.Name = "Scene refraction copy";
+		td.Type = RESOURCE_DIM_TEX_2D;
+		td.Width = sd.Width; td.Height = sd.Height;
+		td.Format = sd.Format; td.MipLevels = 1; td.SampleCount = 1;
+		td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_DEFAULT;
+		im.device->CreateTexture(td, nullptr, &im.refrTex);
+	}
+	if (!im.refrTex) return;
+	// Copying/resolving from a bound target is invalid - unbind, snapshot, rebind.
+	im.context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
+	if (sd.SampleCount > 1)
+	{
+		ResolveTextureSubresourceAttribs ra;
+		im.context->ResolveTextureSubresource(src, im.refrTex, ra);
+	}
+	else
+	{
+		CopyTextureAttribs cp(src, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
+		                      im.refrTex, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		im.context->CopyTexture(cp);
+	}
+	im.context->SetRenderTargets(1, &im.curRTV, im.curDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	im.refrSRV = im.refrTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 }
 
 void NukeDiligent::selectionOutlineBegin()
@@ -476,6 +523,7 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 
 void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 {
+	m_impl->refrSRV = nullptr;   // a refraction snapshot never outlives its camera pass
 	m_impl->GpuPass("scene");   // geometry of this camera, up to the post chain in endCamera
 	++m_impl->passSerial;   // invalidate the per-draw redundancy gates (shared CBs re-map per pass)
 	m_impl->curTarget = cam.target;   // feedback guard: GetTexSRV won't sample the RT we draw into
@@ -1185,6 +1233,8 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 		}
 		for (int k = 0; k < Impl::kOvTexCount; ++k)
 			bindIf(wp.ovVarI[k], ovsrv[k] ? ovsrv[k] : (((k < Impl::kOvSlots * 4 && (k & 3) == 1) || k == Impl::kOvSlots * 4 + 2) ? flatN : whiteSRV), wp.lastBindI[13 + k]);
+		bindIf(wp.flowVarI, (mat && mat->flow) ? m_impl->GetTexSRV(mat->flow) : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount]);
+		bindIf(wp.refrVarI, m_impl->refrSRV ? m_impl->refrSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 1]);
 	}
 
 	IDeviceContext* ctx = m_impl->context;

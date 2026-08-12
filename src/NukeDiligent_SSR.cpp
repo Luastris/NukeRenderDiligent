@@ -80,7 +80,8 @@ static void FillGBufOverlays(Diligent::Uint8* p, nuke::Material* mat)
 	if (!mat || !mat->shader) return;
 	for (const nuke::ShaderProp& sp : mat->shader->props)
 	{
-		if (sp.name.compare(0, 4, "g_Ov") != 0 && sp.name != "g_Det" && sp.name != "g_Var") continue;
+		if (sp.name.compare(0, 4, "g_Ov") != 0 && sp.name != "g_Det" && sp.name != "g_Var"
+		    && sp.name.compare(0, 6, "g_Brdf") != 0) continue;
 		auto pv = mat->props.find(sp.name);
 		if (pv == mat->props.end()) continue;
 		uint32_t bytes = (uint32_t)sp.components * sizeof(float);
