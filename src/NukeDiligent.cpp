@@ -331,7 +331,9 @@ void NukeDiligent::Impl::RebuildShaderFactory()
 		files.emplace_back(kv.first.c_str(), kv.second.c_str(), (Uint32)kv.second.size());
 		hlslNames.push_back(kv.first + ".hlsl");
 		files.emplace_back(hlslNames.back().c_str(), kv.second.c_str(), (Uint32)kv.second.size());
-		if (kv.first.find('.') == std::string::npos)
+		const bool isInc = kv.first.find('.') == std::string::npos
+		                || (kv.first.size() > 6 && kv.first.compare(kv.first.size() - 6, 6, ".hlsli") == 0);
+		if (isInc)
 			for (unsigned char ch : kv.second) { includeEpoch ^= ch; includeEpoch *= 1099511628211ull; }
 	}
 	MemoryShaderSourceFactoryCreateInfo mci{ files.data(), (Uint32)files.size(), True /*CopySources*/ };

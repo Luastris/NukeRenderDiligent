@@ -60,7 +60,8 @@ public:
 	void drawSpriteScreenEx(Texture* tex, const float rect[4], const float refSize[2],
 	                        const float uv[4], const float tint[4], int afterPost, int scaleMode) override;
 	void drawDecal(Texture* tex, const float pos[3], const float quat[4], const float scale[3],
-	               const float tint[4], float intensity, float angleFade, int mode) override;
+	               const float tint[4], float intensity, float angleFade, int mode,
+	               float appear = 1.0f, int appearMode = 0) override;
 	void setWireframe(bool on) override;                 // scene fill mode (world meshes only)
 	bool getWireframe() override;
 	void drawDebugLineDepth(const float a[3], const float b[3], const float color[4]) override;

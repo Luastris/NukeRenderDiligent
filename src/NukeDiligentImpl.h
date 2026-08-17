@@ -535,6 +535,7 @@ struct NukeDiligent::Impl
 		// BRDF pack (LM-6): anisotropy flow map + the pre-transparent scene snapshot.
 		IShaderResourceVariable*              flowVar = nullptr;   // PS "g_Flow"
 		IShaderResourceVariable*              refrVar = nullptr;   // PS "g_SceneRefr"
+		IShaderResourceVariable*              mskVar  = nullptr;   // PS "g_MskStamp" (LiveMask stamp)
 		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
 		IShaderResourceVariable*              probeVar  = nullptr;// PS "g_Probe" (reflection cubemap, dynamic)
@@ -549,13 +550,13 @@ struct NukeDiligent::Impl
 		                        *shadowVarI = nullptr, *cubeVarI = nullptr, *probeVarI = nullptr, *tlasVarI = nullptr,
 		                        *rtInstVarI = nullptr;
 		IShaderResourceVariable *ovVarI[kOvTexCount] = {};
-		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr;
+		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr, *mskVarI = nullptr;
 		// Redundancy gates: object each DYNAMIC variable currently holds — Diligent rewrites the
 		// descriptor cache on EVERY Set() of a dynamic var, so only Set() on an actual change.
 		// [0..12] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst,wipe,height;
 		// [13..] = overlay-slot maps (OvTexNames() order), then flow + scene-refraction.
-		IDeviceObject* lastBind[13 + kOvTexCount + 2]  = {};
-		IDeviceObject* lastBindI[13 + kOvTexCount + 2] = {};
+		IDeviceObject* lastBind[13 + kOvTexCount + 3]  = {};
+		IDeviceObject* lastBindI[13 + kOvTexCount + 3] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
 		// What this pipeline was built for. Stale or never-built pipes are skipped by the draw
 		// and rebuilt by the warm-up; the draw falls back to the default world pipeline.
@@ -771,10 +772,11 @@ struct NukeDiligent::Impl
 
 	// Screen-space decals (iRender::drawDecal): box volume, surface reconstructed from the gbuf depth,
 	// texture projected along the box +Z. Albedo = alpha blend, LightProjector = additive.
-	RefCntAutoPtr<IPipelineState>         decalPSO, decalPSOAdd;
-	RefCntAutoPtr<IShaderResourceBinding> decalSRB, decalSRBAdd;
+	RefCntAutoPtr<IPipelineState>         decalPSO, decalPSOAdd, decalPSOMod;
+	RefCntAutoPtr<IShaderResourceBinding> decalSRB, decalSRBAdd, decalSRBMod;
 	IShaderResourceVariable*              decalTexVar = nullptr, *decalDepthVar = nullptr;
 	IShaderResourceVariable*              decalTexVarAdd = nullptr, *decalDepthVarAdd = nullptr;
+	IShaderResourceVariable*              decalTexVarMod = nullptr, *decalDepthVarMod = nullptr;
 	RefCntAutoPtr<IBuffer>                decalCB, decalVB;
 	void CreateDecalResources();
 

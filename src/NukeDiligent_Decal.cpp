@@ -13,8 +13,9 @@ struct DecalCBData
 
 void NukeDiligent::Impl::CreateDecalResources()
 {
-	decalPSO.Release(); decalPSOAdd.Release(); decalSRB.Release(); decalSRBAdd.Release(); decalCB.Release();
-	decalTexVar = decalDepthVar = decalTexVarAdd = decalDepthVarAdd = nullptr;
+	decalPSO.Release(); decalPSOAdd.Release(); decalPSOMod.Release();
+	decalSRB.Release(); decalSRBAdd.Release(); decalSRBMod.Release(); decalCB.Release();
+	decalTexVar = decalDepthVar = decalTexVarAdd = decalDepthVarAdd = decalTexVarMod = decalDepthVarMod = nullptr;
 	std::string vs = shaderSource("decal.vs"), ps = shaderSource("decal.ps");
 	if (vs.empty() || ps.empty()) { std::cout << "[NukeDiligent]\tdecal shaders missing" << std::endl; return; }
 
@@ -55,7 +56,7 @@ void NukeDiligent::Impl::CreateDecalResources()
 		{SHADER_TYPE_PIXEL, "g_Depth",    smp},
 	};
 
-	auto build = [&](bool additive, const char* nm, RefCntAutoPtr<IPipelineState>& pso,
+	auto build = [&](int blendMode, const char* nm, RefCntAutoPtr<IPipelineState>& pso,
 	                 RefCntAutoPtr<IShaderResourceBinding>& srb, IShaderResourceVariable*& tv, IShaderResourceVariable*& dv)
 	{
 		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = nm;
@@ -69,8 +70,12 @@ void NukeDiligent::Impl::CreateDecalResources()
 		gp.SmplDesc.Count = samples;
 		auto& rt = gp.BlendDesc.RenderTargets[0];
 		rt.BlendEnable = True; rt.BlendOp = BLEND_OPERATION_ADD; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
-		if (additive) { rt.SrcBlend = BLEND_FACTOR_SRC_ALPHA; rt.DestBlend = BLEND_FACTOR_ONE; }
-		else          { rt.SrcBlend = BLEND_FACTOR_SRC_ALPHA; rt.DestBlend = BLEND_FACTOR_INV_SRC_ALPHA; }
+		// PS outputs PREMULTIPLIED color. Albedo = classic alpha on top (bright decals stay
+		// bright); Additive = glow; Stain = dest * lerp(1, tex.rgb, a) - tints the LIT
+		// surface, so lighting and shadows show through it.
+		if      (blendMode == 1) { rt.SrcBlend = BLEND_FACTOR_ONE;        rt.DestBlend = BLEND_FACTOR_ONE; }
+		else if (blendMode == 2) { rt.SrcBlend = BLEND_FACTOR_DEST_COLOR; rt.DestBlend = BLEND_FACTOR_INV_SRC_ALPHA; }
+		else                     { rt.SrcBlend = BLEND_FACTOR_ONE;        rt.DestBlend = BLEND_FACTOR_INV_SRC_ALPHA; }
 		rt.SrcBlendAlpha = BLEND_FACTOR_ZERO; rt.DestBlendAlpha = BLEND_FACTOR_ONE;
 		gp.InputLayout.LayoutElements = layout; gp.InputLayout.NumElements = 1;
 		ci.pVS = v; ci.pPS = p;
@@ -86,13 +91,15 @@ void NukeDiligent::Impl::CreateDecalResources()
 			if (srb) { tv = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_DecalTex"); dv = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); }
 		}
 	};
-	build(false, "Decal PSO",     decalPSO,    decalSRB,    decalTexVar,    decalDepthVar);
-	build(true,  "Decal PSO Add", decalPSOAdd, decalSRBAdd, decalTexVarAdd, decalDepthVarAdd);
+	build(0, "Decal PSO",       decalPSO,    decalSRB,    decalTexVar,    decalDepthVar);
+	build(1, "Decal PSO Add",   decalPSOAdd, decalSRBAdd, decalTexVarAdd, decalDepthVarAdd);
+	build(2, "Decal PSO Stain", decalPSOMod, decalSRBMod, decalTexVarMod, decalDepthVarMod);
 	std::cout << "[NukeDiligent]\tdecal pipeline" << (decalPSO ? " ready" : " FAILED") << std::endl;
 }
 
 void NukeDiligent::drawDecal(Texture* tex, const float pos[3], const float quat[4], const float scale[3],
-                             const float tint[4], float intensity, float angleFade, int mode)
+                             const float tint[4], float intensity, float angleFade, int mode,
+                             float appear, int appearMode)
 {
 	m_impl->lastInstBind.pso = nullptr;   // decal pipeline replaces the instanced VB/PSO state
 	if (!m_impl->decalPSO || !m_impl->decalStamp.current(m_impl->samples, m_impl->SceneFmt()) || !tex) return;
@@ -109,7 +116,7 @@ void NukeDiligent::drawDecal(Texture* tex, const float pos[3], const float quat[
 	cb.invWorld    = world.Inverse();
 	cb.invViewProj = vp.Inverse();
 	cb.tint        = float4(tint[0], tint[1], tint[2], tint[3]);
-	cb.params      = float4(intensity, angleFade, 0.f, 0.f);
+	cb.params      = float4(intensity, angleFade, appear, (float)appearMode);
 	// projection axis = the box's local +Z in world (row 2 of the world matrix), normalized.
 	float3 axis(world.m[2][0], world.m[2][1], world.m[2][2]);
 	float  al = length(axis); if (al < 1e-6f) al = 1.f; axis = axis / al;
@@ -117,10 +124,10 @@ void NukeDiligent::drawDecal(Texture* tex, const float pos[3], const float quat[
 	cb.res         = float4((float)(m_impl->curRTW > 0 ? m_impl->curRTW : 1), (float)(m_impl->curRTH > 0 ? m_impl->curRTH : 1), 0.f, 0.f);
 	{ MapHelper<DecalCBData> m(m_impl->context, m_impl->decalCB, MAP_WRITE, MAP_FLAG_DISCARD); *m = cb; }
 
-	IPipelineState*         pso = (mode == 1) ? m_impl->decalPSOAdd    : m_impl->decalPSO;
-	IShaderResourceBinding* srb = (mode == 1) ? m_impl->decalSRBAdd    : m_impl->decalSRB;
-	IShaderResourceVariable* tv = (mode == 1) ? m_impl->decalTexVarAdd : m_impl->decalTexVar;
-	IShaderResourceVariable* dv = (mode == 1) ? m_impl->decalDepthVarAdd : m_impl->decalDepthVar;
+	IPipelineState*         pso = (mode == 1) ? m_impl->decalPSOAdd      : (mode == 2) ? m_impl->decalPSOMod      : m_impl->decalPSO;
+	IShaderResourceBinding* srb = (mode == 1) ? m_impl->decalSRBAdd      : (mode == 2) ? m_impl->decalSRBMod      : m_impl->decalSRB;
+	IShaderResourceVariable* tv = (mode == 1) ? m_impl->decalTexVarAdd   : (mode == 2) ? m_impl->decalTexVarMod   : m_impl->decalTexVar;
+	IShaderResourceVariable* dv = (mode == 1) ? m_impl->decalDepthVarAdd : (mode == 2) ? m_impl->decalDepthVarMod : m_impl->decalDepthVar;
 	if (!pso || !srb) return;
 	if (tv) tv->Set(dtex);
 	if (dv) dv->Set(m_impl->gbufDepthSRV);

@@ -129,7 +129,11 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	gp.RTVFormats[2] = TEX_FORMAT_R8_UNORM;   // generic per-object id
 	gp.DSVFormat = TEX_FORMAT_D32_FLOAT;
 	gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-	gp.RasterizerDesc.CullMode = CULL_MODE_BACK;
+	// The prepass depth must match what the beauty pass SHOWS — and the world PSO is
+	// two-sided (CULL_NONE). Back-culling here made reversed-winding meshes (builtin
+	// sphere) write their INNER wall into the depth: decals/SSR then reconstructed the
+	// inside of the surface. Nearest-depth wins either way, so two-sided is simply correct.
+	gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
 	gp.DepthStencilDesc.DepthEnable = True; gp.DepthStencilDesc.DepthWriteEnable = True;
 	gp.SmplDesc.Count = 1;   // 1x — its own depth, no MSAA resolve needed for SSR
 	LayoutElement layout[] = { {0, 0, 3, VT_FLOAT32}, {1, 1, 3, VT_FLOAT32}, {2, 2, 2, VT_FLOAT32} };

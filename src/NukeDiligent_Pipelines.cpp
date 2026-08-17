@@ -464,6 +464,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		vars.push_back({SHADER_TYPE_PIXEL, n.c_str(), SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	// BRDF pack (LM-6): flow map + the pre-transparent scene snapshot (shared sampler too).
 	vars.push_back({SHADER_TYPE_PIXEL, "g_Flow",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+	vars.push_back({SHADER_TYPE_PIXEL, "g_MskStamp",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	vars.push_back({SHADER_TYPE_PIXEL, "g_SceneRefr", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	ci.PSODesc.ResourceLayout.Variables    = vars.data();
 	ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
@@ -673,6 +674,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	for (int k = 0; k < kOvTexCount; ++k)
 		wp.ovVar[k] = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, OvTexNames()[k].c_str());
 	wp.flowVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Flow");
+	wp.mskVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_MskStamp");
 	wp.refrVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneRefr");
 
 	// Instanced variants — only for shaders that opt in by handling NUKE_INSTANCED. Same sources
@@ -764,6 +766,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				for (int k = 0; k < kOvTexCount; ++k)
 					wp.ovVarI[k] = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, OvTexNames()[k].c_str());
 				wp.flowVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Flow");
+				wp.mskVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_MskStamp");
 				wp.refrVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneRefr");
 			}
 			else

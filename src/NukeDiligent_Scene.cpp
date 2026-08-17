@@ -171,7 +171,17 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	{
 		const float4x4 inv = m_impl->curView.Inverse();
 		const float dx = inv.m30 - pos[0], dy = inv.m31 - pos[1], dz = inv.m32 - pos[2];
-		const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+		float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+		// Distance to the SURFACE, not the pivot: a big floor's centre sits far away while the
+		// camera stands right on it — subtract the world-space bounding radius.
+		if (mesh)
+		{
+			mesh->EnsureBounds();
+			const float ex = std::max(fabsf(mesh->aabbMin[0]), fabsf(mesh->aabbMax[0])) * fabsf(scale[0]);
+			const float ey = std::max(fabsf(mesh->aabbMin[1]), fabsf(mesh->aabbMax[1])) * fabsf(scale[1]);
+			const float ez = std::max(fabsf(mesh->aabbMin[2]), fabsf(mesh->aabbMax[2])) * fabsf(scale[2]);
+			dist = std::max(dist - sqrtf(ex * ex + ey * ey + ez * ez), 1.0f);
+		}
 		const float f = std::min(48.0f / std::max(dist, 1.0f), 12.0f);
 		if (f > 1.05f) tessF = f;
 	}
@@ -266,6 +276,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 			bindIf(wp.ovVar[k], ovsrv[k] ? ovsrv[k] : (((k < Impl::kOvSlots * 4 && (k & 3) == 1) || k == Impl::kOvSlots * 4 + 2) ? flatN : whiteSRV), wp.lastBind[13 + k]);
 		bindIf(wp.flowVar, (mat && mat->flow) ? m_impl->GetTexSRV(mat->flow) : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount]);
 		bindIf(wp.refrVar, m_impl->refrSRV ? m_impl->refrSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 1]);
+	bindIf(wp.mskVar, (mat && mat->mskStamp) ? m_impl->GetTexSRV(mat->mskStamp) : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 2]);
 	}
 
 	IDeviceContext* ctx = m_impl->context;
@@ -312,6 +323,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		for (int k = 0; k < Impl::kOvTexCount; ++k)
 			TP(SHADER_TYPE_PIXEL, Impl::OvTexNames()[k].c_str(), ovsrv[k] ? ovsrv[k] : (((k < Impl::kOvSlots * 4 && (k & 3) == 1) || k == Impl::kOvSlots * 4 + 2) ? (IDeviceObject*)flatN : (IDeviceObject*)whiteSRV));
 		TP(SHADER_TYPE_PIXEL, "g_Flow",      (mat && mat->flow) ? (IDeviceObject*)m_impl->GetTexSRV(mat->flow) : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_MskStamp",  (mat && mat->mskStamp) ? (IDeviceObject*)m_impl->GetTexSRV(mat->mskStamp) : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_SceneRefr", m_impl->refrSRV ? (IDeviceObject*)m_impl->refrSRV : (IDeviceObject*)whiteSRV);
 	}
 	ctx->SetPipelineState(pso);
@@ -1235,6 +1247,7 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 			bindIf(wp.ovVarI[k], ovsrv[k] ? ovsrv[k] : (((k < Impl::kOvSlots * 4 && (k & 3) == 1) || k == Impl::kOvSlots * 4 + 2) ? flatN : whiteSRV), wp.lastBindI[13 + k]);
 		bindIf(wp.flowVarI, (mat && mat->flow) ? m_impl->GetTexSRV(mat->flow) : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount]);
 		bindIf(wp.refrVarI, m_impl->refrSRV ? m_impl->refrSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 1]);
+		bindIf(wp.mskVarI, (mat && mat->mskStamp) ? m_impl->GetTexSRV(mat->mskStamp) : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 2]);
 	}
 
 	IDeviceContext* ctx = m_impl->context;
