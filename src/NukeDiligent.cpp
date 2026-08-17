@@ -771,6 +771,10 @@ int NukeDiligent::init(const WindowDesc& desc)
 	                      (m_impl->device->GetAdapterInfo().RayTracing.CapFlags & RAY_TRACING_CAP_FLAG_STANDALONE_SHADERS) != 0;
 	cout << "[NukeDiligent]\tbackend=" << (m_impl->useD3D12 ? "D3D12" : m_impl->useVulkan ? "Vulkan" : "D3D11")
 	     << " rayTracing=" << (m_impl->rtSupported ? "yes" : (desc.rayTracing ? "no" : "off (config)")) << endl;
+	// T3 texture streaming: the config budget (0 = off) — live-adjustable via setTextureStreaming.
+	m_impl->streamBudget = (long long)(desc.textureStreamMB < 0 ? 0 : desc.textureStreamMB) << 20;
+	if (m_impl->streamBudget > 0)
+		cout << "[NukeDiligent]\ttexture streaming: " << desc.textureStreamMB << " MB budget" << endl;
 	// The RT fallback TLAS is built at the top of the first frame, not here: on Vulkan an
 	// AS build before the frame loop deadlocks in the upload path (fence with no submission).
 
@@ -819,6 +823,7 @@ int NukeDiligent::render()
 	// GPU lifetime: advance the frame clock, free trash no in-flight command list can reference.
 	++m_impl->frameId;
 	m_impl->PurgeTrash();
+	m_impl->StreamPump();   // T3 texture streaming: residency step (budgeted rebuilds/evictions)
 	// Queued secondary-swap-chain creations/resizes must run BEFORE anything is recorded.
 	m_impl->ApplyPendingViewportOps();
 	// RT fallback TLAS on the first frame (idempotent): building it at init deadlocks Vulkan's upload path.

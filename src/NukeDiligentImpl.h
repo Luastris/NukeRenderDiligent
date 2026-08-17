@@ -831,6 +831,32 @@ struct NukeDiligent::Impl
 	void LodRange(Mesh* mesh, int lod, uint32_t& first, uint32_t& count);
 	float lodCamPos[3] = { 0, 0, 0 };   // latched in beginCamera (shadow/probe passes reuse it)
 	std::unordered_map<Texture*, RefCntAutoPtr<ITexture>> texCache;   // engine Texture -> GPU texture
+
+	// ---- T3 texture streaming: mip residency pool -------------------------------------------
+	// A WORLD-DRAWN BC texture with a real mip chain streams: only mips [residentBase..last]
+	// live on the GPU (the texture object is created at that size — normalized UVs make the
+	// swap invisible to shaders). Distance feedback comes from the draw submit (StreamTouch);
+	// the per-frame pump re-targets residency under the VRAM budget and rebuilds a bounded
+	// number of textures per frame. UI/sprite textures never get touched -> never stream.
+	struct StreamTex
+	{
+		int   residentBase = 0;      // current first-resident mip (0 = full res)
+		float minDist = 1e30f;       // nearest use this frame (reset by the pump)
+		float lastDist = 1e30f;      // nearest use of the LAST touched frame
+		uint64_t lastTouch = 0;      // frameId of the last draw feedback
+		int   wantLowerFrames = 0;   // consecutive frames the target sat BELOW resident detail
+	};
+	std::unordered_map<Texture*, StreamTex> streamTex;
+	long long streamBudget = 0;      // bytes; 0 = streaming off
+	long long streamResident = 0;    // resident bytes across streamed textures
+	long long streamFullBytes = 0;   // full-chain bytes across streamed textures (saved = full - resident)
+	void StreamTouch(Texture* t, float dist);        // per-draw feedback (world passes)
+	void StreamPump();                               // per-frame residency step
+	bool StreamEligible(Texture* t) const;           // BC + mip chain + not animated/RT
+	static int StreamTailBase(Texture* t);           // base where max dim <= 64 (always resident)
+	static long long StreamBytes(Texture* t, int base);   // GPU bytes of mips [base..last]
+	int  StreamDesiredBase(Texture* t, float dist) const; // distance -> first-resident mip
+	RefCntAutoPtr<ITexture> CreateEngineTex(Texture* t, int baseMip);   // factored BC/RGBA8 upload
 	std::unordered_map<Texture*, std::vector<RefCntAutoPtr<ITexture>>> animTex;   // GIF: one Texture2D per frame
 	float4x4 curView, curProj;   // set in beginCamera, used in renderObject
 

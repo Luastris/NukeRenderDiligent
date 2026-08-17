@@ -83,39 +83,16 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 	if (it != texCache.end())
 		return it->second ? it->second->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
 	{
-		RefCntAutoPtr<ITexture> tex;
-		if (t->format == Texture::FMT_BC1 || t->format == Texture::FMT_BC3 || t->format == Texture::FMT_BC5)
+		// T3 streaming: a world-drawn (touched) BC texture is born at its DISTANCE-desired mip
+		// range; the pump re-targets it later. Untouched textures (UI, previews) stay full.
+		int base = 0;
+		if (streamBudget > 0 && StreamEligible(t))
 		{
-			// Pre-compressed BC with a stored mip chain — upload every level (no GenerateMips for BC).
-			const int  blockBytes = (t->format == Texture::FMT_BC1) ? 8 : 16;   // BC3/BC5 = 16
-			const int  mips = t->mipCount < 1 ? 1 : t->mipCount;
-			TextureDesc td; td.Type = RESOURCE_DIM_TEX_2D; td.Width = t->width; td.Height = t->height;
-			td.MipLevels = mips; td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
-			td.Format = (t->format == Texture::FMT_BC1) ? TEX_FORMAT_BC1_UNORM
-			          : (t->format == Texture::FMT_BC5) ? TEX_FORMAT_BC5_UNORM : TEX_FORMAT_BC3_UNORM;
-			std::vector<TextureSubResData> subs(mips);
-			size_t off = 0; int mw = t->width, mh = t->height;
-			for (int m = 0; m < mips; ++m)
-			{
-				int bx = (mw + 3) / 4, by = (mh + 3) / 4;
-				subs[m].pData  = t->pixels.data() + off;
-				subs[m].Stride = (Uint64)bx * blockBytes;
-				off += (size_t)bx * by * blockBytes;
-				mw = mw > 1 ? mw / 2 : 1; mh = mh > 1 ? mh / 2 : 1;
-			}
-			TextureData data; data.pSubResources = subs.data(); data.NumSubresources = (Uint32)mips;
-			device->CreateTexture(td, &data, &tex);
+			auto st = streamTex.find(t);
+			if (st != streamTex.end())
+				base = st->second.residentBase = StreamDesiredBase(t, st->second.lastDist);
 		}
-		else   // RGBA8 (non-BC fallback, e.g. odd sizes / GIF frames) — single level, no GPU mip-gen
-		{
-			if (t->pixels.size() < (size_t)t->width * t->height * 4) return nullptr;   // guard malformed data
-			TextureDesc td; td.Type = RESOURCE_DIM_TEX_2D; td.Width = t->width; td.Height = t->height;
-			td.MipLevels = 1; td.Format = TEX_FORMAT_RGBA8_UNORM;
-			td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
-			TextureSubResData sub; sub.pData = t->pixels.data(); sub.Stride = (Uint64)t->width * 4;
-			TextureData data; data.pSubResources = &sub; data.NumSubresources = 1;
-			device->CreateTexture(td, &data, &tex);
-		}
+		RefCntAutoPtr<ITexture> tex = CreateEngineTex(t, base);
 		// Never cache a failed upload: the cache must only ever hold a live SRV, so it self-heals on retry.
 		if (!tex)
 		{
@@ -127,6 +104,198 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 		it = texCache.emplace(t, tex).first;
 	}
 	return it->second ? it->second->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
+}
+
+// One engine texture -> one GPU texture, uploading mips [baseMip..last] (BC) or the single
+// RGBA8 level. baseMip shrinks the OBJECT — normalized UVs keep shaders oblivious.
+RefCntAutoPtr<ITexture> NukeDiligent::Impl::CreateEngineTex(Texture* t, int baseMip)
+{
+	RefCntAutoPtr<ITexture> tex;
+	if (t->format == Texture::FMT_BC1 || t->format == Texture::FMT_BC3 || t->format == Texture::FMT_BC5)
+	{
+		// Pre-compressed BC with a stored mip chain — upload the resident levels (no GenerateMips for BC).
+		const int  blockBytes = (t->format == Texture::FMT_BC1) ? 8 : 16;   // BC3/BC5 = 16
+		const int  mips = t->mipCount < 1 ? 1 : t->mipCount;
+		if (baseMip < 0) baseMip = 0;
+		if (baseMip > mips - 1) baseMip = mips - 1;
+		TextureDesc td; td.Type = RESOURCE_DIM_TEX_2D;
+		td.Width  = (Uint32)std::max(1, t->width  >> baseMip);
+		td.Height = (Uint32)std::max(1, t->height >> baseMip);
+		td.MipLevels = mips - baseMip; td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
+		td.Format = (t->format == Texture::FMT_BC1) ? TEX_FORMAT_BC1_UNORM
+		          : (t->format == Texture::FMT_BC5) ? TEX_FORMAT_BC5_UNORM : TEX_FORMAT_BC3_UNORM;
+		std::vector<TextureSubResData> subs((size_t)mips - baseMip);
+		size_t off = 0; int mw = t->width, mh = t->height;
+		for (int m = 0; m < mips; ++m)
+		{
+			int bx = (mw + 3) / 4, by = (mh + 3) / 4;
+			if (m >= baseMip)
+			{
+				subs[m - baseMip].pData  = t->pixels.data() + off;
+				subs[m - baseMip].Stride = (Uint64)bx * blockBytes;
+			}
+			off += (size_t)bx * by * blockBytes;
+			mw = mw > 1 ? mw / 2 : 1; mh = mh > 1 ? mh / 2 : 1;
+		}
+		if (off > t->pixels.size()) return tex;   // malformed chain
+		TextureData data; data.pSubResources = subs.data(); data.NumSubresources = (Uint32)subs.size();
+		device->CreateTexture(td, &data, &tex);
+	}
+	else   // RGBA8 (non-BC fallback, e.g. odd sizes / GIF frames) — single level, no GPU mip-gen
+	{
+		if (t->pixels.size() < (size_t)t->width * t->height * 4) return tex;   // guard malformed data
+		TextureDesc td; td.Type = RESOURCE_DIM_TEX_2D; td.Width = t->width; td.Height = t->height;
+		td.MipLevels = 1; td.Format = TEX_FORMAT_RGBA8_UNORM;
+		td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
+		TextureSubResData sub; sub.pData = t->pixels.data(); sub.Stride = (Uint64)t->width * 4;
+		TextureData data; data.pSubResources = &sub; data.NumSubresources = 1;
+		device->CreateTexture(td, &data, &tex);
+	}
+	return tex;
+}
+
+// ---- T3 texture streaming -----------------------------------------------------------------------
+
+// Streamable: BC with a real mip chain and enough levels that dropping some actually saves
+// memory; animated frames, render textures and tiny maps never stream.
+bool NukeDiligent::Impl::StreamEligible(Texture* t) const
+{
+	if (!t || t->renderTexture || t->frameCount > 1) return false;
+	if (t->format != Texture::FMT_BC1 && t->format != Texture::FMT_BC3 && t->format != Texture::FMT_BC5) return false;
+	return t->mipCount >= 4 && std::max(t->width, t->height) >= 256;
+}
+
+// The always-resident tail: first mip whose larger dimension is <= 64.
+int NukeDiligent::Impl::StreamTailBase(Texture* t)
+{
+	int base = 0, dim = std::max(t->width, t->height);
+	while (dim > 64 && base < t->mipCount - 1) { dim >>= 1; ++base; }
+	return base;
+}
+
+long long NukeDiligent::Impl::StreamBytes(Texture* t, int base)
+{
+	const int blockBytes = (t->format == Texture::FMT_BC1) ? 8 : 16;
+	long long bytes = 0; int mw = t->width, mh = t->height;
+	for (int m = 0; m < t->mipCount; ++m)
+	{
+		if (m >= base) bytes += (long long)((mw + 3) / 4) * ((mh + 3) / 4) * blockBytes;
+		mw = mw > 1 ? mw / 2 : 1; mh = mh > 1 ? mh / 2 : 1;
+	}
+	return bytes;
+}
+
+// Distance -> first-resident mip: full res inside kFullResDist, one level per doubling after.
+int NukeDiligent::Impl::StreamDesiredBase(Texture* t, float dist) const
+{
+	static constexpr float kFullResDist = 24.0f;
+	int b = 0; float d = dist;
+	while (d > kFullResDist && b < 30) { d *= 0.5f; ++b; }
+	const int tail = StreamTailBase(t);
+	return b > tail ? tail : b;
+}
+
+// Per-draw feedback from the world passes: the nearest use this frame drives residency.
+void NukeDiligent::Impl::StreamTouch(Texture* t, float dist)
+{
+	if (streamBudget <= 0 || !StreamEligible(t)) return;
+	StreamTex& s = streamTex[t];
+	if (dist < s.minDist) s.minDist = dist;
+	if (dist < s.lastDist) s.lastDist = dist;   // a fresh entry gets a real distance BEFORE the first pump
+	s.lastTouch = frameId;
+}
+
+void NukeDiligent::Impl::StreamPump()
+{
+	if (streamTex.empty()) return;
+
+	// Merge this frame's feedback; long-untouched textures decay to the tail.
+	static constexpr uint64_t kDecayFrames = 600;
+	struct Cand { Texture* t; StreamTex* s; int target; };
+	std::vector<Cand> cands;
+	cands.reserve(streamTex.size());
+	long long wantBytes = 0;
+	for (auto& kv : streamTex)
+	{
+		StreamTex& s = kv.second;
+		if (s.minDist < 1e29f) { s.lastDist = s.minDist; s.minDist = 1e30f; }
+		int target;
+		if (streamBudget <= 0)
+			target = 0;   // streaming turned off live: walk everything back to full res
+		else if (frameId - s.lastTouch > kDecayFrames)
+			target = StreamTailBase(kv.first);
+		else
+			target = StreamDesiredBase(kv.first, s.lastDist);
+		cands.push_back(Cand{ kv.first, &s, target });
+		wantBytes += StreamBytes(kv.first, target);
+	}
+
+	// Over budget: push the FARTHEST textures to their tails until the target set fits.
+	if (streamBudget > 0 && wantBytes > streamBudget)
+	{
+		std::sort(cands.begin(), cands.end(),
+		          [](const Cand& a, const Cand& b) { return a.s->lastDist > b.s->lastDist; });
+		for (Cand& c : cands)
+		{
+			if (wantBytes <= streamBudget) break;
+			const int tail = StreamTailBase(c.t);
+			if (c.target >= tail) continue;
+			wantBytes -= StreamBytes(c.t, c.target) - StreamBytes(c.t, tail);
+			c.target = tail;
+		}
+	}
+
+	// Rebuilds, bounded per frame: upgrades (more detail) go immediately, nearest first;
+	// downgrades wait ~2s of stable lower need (no flapping at ring boundaries).
+	static constexpr int kMaxRebuilds = 6;
+	static constexpr long long kMaxUploadBytes = 24ll << 20;
+	std::sort(cands.begin(), cands.end(),
+	          [](const Cand& a, const Cand& b) { return a.s->lastDist < b.s->lastDist; });
+	int rebuilds = 0; long long uploaded = 0;
+	for (Cand& c : cands)
+	{
+		StreamTex& s = *c.s;
+		if (c.target == s.residentBase) { s.wantLowerFrames = 0; continue; }
+		if (c.target > s.residentBase)   // dropping detail
+		{
+			if (++s.wantLowerFrames < 120) continue;
+		}
+		else s.wantLowerFrames = 0;
+		if (rebuilds >= kMaxRebuilds || uploaded >= kMaxUploadBytes) continue;
+		auto tc = texCache.find(c.t);
+		if (tc == texCache.end()) { s.residentBase = c.target; continue; }   // not on GPU yet: born at target
+		RefCntAutoPtr<ITexture> fresh = CreateEngineTex(c.t, c.target);
+		if (!fresh) continue;
+		Trash(tc->second);
+		tc->second = fresh;
+		uploaded += StreamBytes(c.t, c.target);
+		++rebuilds;
+		s.residentBase = c.target;
+		s.wantLowerFrames = 0;
+	}
+
+	// Stats by recomputation (incremental deltas drift across invalidate/reload cycles).
+	streamResident = 0; streamFullBytes = 0;
+	for (auto& kv : streamTex)
+	{
+		streamResident  += StreamBytes(kv.first, kv.second.residentBase);
+		streamFullBytes += StreamBytes(kv.first, 0);
+	}
+}
+
+void NukeDiligent::setTextureStreaming(long long budgetBytes)
+{
+	m_impl->streamBudget = budgetBytes < 0 ? 0 : budgetBytes;
+	std::cout << "[NukeDiligent]\ttexture streaming budget = "
+	          << (m_impl->streamBudget >> 20) << " MB" << std::endl;
+}
+
+void NukeDiligent::textureStreamInfo(long long& residentBytes, long long& savedBytes, int& streamedCount)
+{
+	residentBytes = m_impl->streamResident;
+	savedBytes = m_impl->streamFullBytes - m_impl->streamResident;
+	if (savedBytes < 0) savedBytes = 0;
+	streamedCount = (int)m_impl->streamTex.size();
 }
 
 NukeDiligent::Impl::RT NukeDiligent::Impl::MakeRT(int w, int h)
@@ -521,6 +690,7 @@ void NukeDiligent::invalidateTexture(Texture* t)   // re-uploaded on next GetTex
 		for (auto& f : at->second) m_impl->Trash(f);
 		m_impl->animTex.erase(at);
 	}
+	m_impl->streamTex.erase(t);   // the pointer may be about to die; feedback re-registers it
 }
 
 void NukeDiligent::invalidateMesh(Mesh* m)

@@ -131,6 +131,19 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		metallic = mat->metallic; roughness = mat->roughness; specF = mat->specular;
 		emissive[0] = (float)mat->emissive.r; emissive[1] = (float)mat->emissive.g; emissive[2] = (float)mat->emissive.b;
 		emissiveI = mat->emissiveIntensity;
+		// T3 streaming feedback: this draw's camera distance drives the material maps' residency.
+		if (m_impl->streamBudget > 0)
+		{
+			const float dx = pos[0] - m_impl->curCamPos[0], dy = pos[1] - m_impl->curCamPos[1],
+			            dz = pos[2] - m_impl->curCamPos[2];
+			const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+			if (mat->diff) m_impl->StreamTouch(mat->diff, dist);
+			if (mat->norm) m_impl->StreamTouch(mat->norm, dist);
+			if (mat->mr)   m_impl->StreamTouch(mat->mr, dist);
+			if (mat->ao)   m_impl->StreamTouch(mat->ao, dist);
+			if (mat->em)   m_impl->StreamTouch(mat->em, dist);
+			if (mat->spec) m_impl->StreamTouch(mat->spec, dist);
+		}
 		if (mat->diff) srv   = m_impl->GetTexSRV(mat->diff);
 		if (mat->norm) nsrv  = m_impl->GetTexSRV(mat->norm);
 		if (mat->mr)   mrsrv = m_impl->GetTexSRV(mat->mr);
@@ -1125,6 +1138,16 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 		metallic = mat->metallic; roughness = mat->roughness; specF = mat->specular;
 		emissive[0] = (float)mat->emissive.r; emissive[1] = (float)mat->emissive.g; emissive[2] = (float)mat->emissive.b;
 		emissiveI = mat->emissiveIntensity;
+		// Instanced draws span space (no single distance): pin their maps at full residency.
+		if (m_impl->streamBudget > 0)
+		{
+			if (mat->diff) m_impl->StreamTouch(mat->diff, 0.0f);
+			if (mat->norm) m_impl->StreamTouch(mat->norm, 0.0f);
+			if (mat->mr)   m_impl->StreamTouch(mat->mr, 0.0f);
+			if (mat->ao)   m_impl->StreamTouch(mat->ao, 0.0f);
+			if (mat->em)   m_impl->StreamTouch(mat->em, 0.0f);
+			if (mat->spec) m_impl->StreamTouch(mat->spec, 0.0f);
+		}
 		if (mat->diff) srv   = m_impl->GetTexSRV(mat->diff);
 		if (mat->norm) nsrv  = m_impl->GetTexSRV(mat->norm);
 		if (mat->mr)   mrsrv = m_impl->GetTexSRV(mat->mr);
