@@ -472,6 +472,9 @@ struct NukeDiligent::Impl
 	// Auto-generated per-shader RT closest-hits: a material shader with a "<name>.surf.hlsl" gets its
 	// own hit group, built by GenChitSource() from the shader's MatCB schema + that surface file.
 	std::unordered_map<std::string, std::string> rtSurfShaders;  // shader name -> its PS source (has the MatCB schema)
+	// Surface bodies registered from CODE (module-embedded shaders have no file on the include
+	// path); GenChitSource inlines these instead of the #include.
+	std::unordered_map<std::string, std::string> rtSurfSources;  // shader name -> Surface() HLSL body
 	std::unordered_map<std::string, std::string> shaderHitGroup; // shader name -> hit-group name in the RT PSO
 	std::string GenChitSource(const std::string& name, const std::string& psSource);  // codegen the closest-hit HLSL
 	bool rtPipelineDirty = false;                              // a new surf shader appeared -> rebuild rtPSO

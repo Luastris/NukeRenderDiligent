@@ -24,9 +24,17 @@ std::string NukeDiligent::Impl::GenChitSource(const std::string& name, const std
 		if (open != std::string::npos && close != std::string::npos)
 		{
 			std::string raw = ps.substr(open + 1, close - open - 1), b;
-			for (size_t i = 0; i < raw.size(); )   // strip // comments
-			{ if (raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '/') { while (i < raw.size() && raw[i] != '\n') ++i; } else b += raw[i++]; }
-			uint32_t off = 0;
+			for (size_t i = 0; i < raw.size(); )   // strip // comments + preprocessor lines (no ';' — they'd swallow the next decl)
+			{
+				if ((raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '/') || raw[i] == '#')
+					{ while (i < raw.size() && raw[i] != '\n') ++i; }
+				else b += raw[i++];
+			}
+			// A cbuffer that #includes the std block (matcb_std): the RT mat block carries the
+			// hardcoded std head (Color/Params/Params2/Emissive2 = 64 bytes) and then the shader's
+			// OWN decls packed compactly — both this codegen and the CPU pack (AddRTInstanceRange)
+			// start those at 64.
+			uint32_t off = (raw.find("#include") != std::string::npos) ? 64u : 0u;
 			for (size_t p = 0; p < b.size(); )
 			{
 				size_t sc = b.find(';', p); if (sc == std::string::npos) break;
@@ -51,8 +59,12 @@ std::string NukeDiligent::Impl::GenChitSource(const std::string& name, const std
 	std::ostringstream s;
 	s << "#include \"rt_common.hlsl\"\n" << decls << "static uint __texIndex;\n"
 	  << "void __LoadMat(uint o){\n" << loads << "}\n"
-	  << "#define MAT_BASE_TEX(uv) ((__texIndex!=0xFFFFFFFFu)? g_MatTex[NonUniformResourceIndex(__texIndex)].SampleLevel(g_MatTex_sampler,(uv),0) : float4(1,1,1,1))\n"
-	  << "#include \"" << name << ".surf.hlsl\"\n"
+	  << "#define MAT_BASE_TEX(uv) ((__texIndex!=0xFFFFFFFFu)? g_MatTex[NonUniformResourceIndex(__texIndex)].SampleLevel(g_MatTex_sampler,(uv),0) : float4(1,1,1,1))\n";
+	// Code-registered surface body (module-embedded shaders) beats the file include.
+	auto reg = rtSurfSources.find(name);
+	if (reg != rtSurfSources.end()) s << reg->second << "\n";
+	else s << "#include \"" << name << ".surf.hlsl\"\n";
+	s
 	  << "[shader(\"closesthit\")] void main(inout RTPayload p, in BuiltInTriangleIntersectionAttributes attr){\n"
 	  << "  RTInstanceData inst = g_Instances[InstanceID()];\n"
 	  << "  __texIndex = inst.texIndex; __LoadMat(inst.matByteOffset);\n"
@@ -399,13 +411,28 @@ void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
 	mb[10] = (emI > 0.0f) ? 1.0f : 0.0f; mb[11] = specF;                                  // g_Params2 (hasMR,hasAO,hasEm,specularFactor)
 	mb[12] = em[0] * emI; mb[13] = em[1] * emI; mb[14] = em[2] * emI; mb[15] = emI;       // g_Emissive2@48
 	if (mat && mat->shader)                                                              // custom props overlay
+	{
+		// Std-included MatCB (module shaders, e.g. "terrain"): raster offsets sit past the
+		// 256-byte RT block, so the block carries the hardcoded std head (64 bytes) + the
+		// shader's OWN props packed compactly — the same walk GenChitSource emits.
+		const bool stdIncluded = !mat->shader->includeProps.empty();
+		uint32_t coff = 64;
 		for (const nuke::ShaderProp& sp : mat->shader->props)
 		{
+			uint32_t dst = sp.offset;
+			if (stdIncluded)
+			{
+				if (mat->shader->FromInclude(sp.name)) continue;   // std head is hardcoded above
+				if ((coff % 16) + (uint32_t)sp.components * 4 > 16) coff = (coff + 15u) & ~15u;
+				dst = coff;
+				coff += (uint32_t)sp.components * 4;
+			}
 			auto pv = mat->props.find(sp.name);
 			const float* v = (pv != mat->props.end()) ? pv->second.data() : sp.def;
-			if (sp.offset + (uint32_t)sp.components * 4 <= Impl::kMatBlock)
-				memcpy(m_impl->allMatCPU.data() + d.matByteOffset + sp.offset, v, (size_t)sp.components * 4);
+			if (dst + (uint32_t)sp.components * 4 <= Impl::kMatBlock)
+				memcpy(m_impl->allMatCPU.data() + d.matByteOffset + dst, v, (size_t)sp.components * 4);
 		}
+	}
 
 	m_impl->rtInstShaderGuid.push_back(mat ? mat->shaderGuid : std::string());
 	m_impl->rtInstData.push_back(d);

@@ -21,6 +21,7 @@ public:
 	// Water passes live in NukeWater via the native hatch (include/NukeDiligentNative.h);
 	// only the generic ortho bottom capture remains here.
 	uint64_t createShaderPipeline(const char* name, const char* vs, const char* ps) override;
+	void registerRTSurface(const char* shaderName, const char* surfHlsl) override;
 	int  init(const WindowDesc& desc) override;
 	int  render() override;
 	void renderObject(Mesh* mesh, Material* mat,

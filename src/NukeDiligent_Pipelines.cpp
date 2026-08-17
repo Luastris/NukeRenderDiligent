@@ -861,17 +861,34 @@ uint64_t NukeDiligent::createShaderPipeline(const char* name, const char* vs, co
 {
 	if (!vs || !ps) return 0;
 	uint64_t h = m_impl->MakeWorldPSO(vs, ps, "Shader");   // world-type PSO (layout/CBs) from custom VS+PS
-	// A shader shipping "<name>.surf.hlsl" gets an auto-generated RT closest-hit group.
+	// A shader shipping "<name>.surf.hlsl" (file OR code-registered) gets an auto-generated
+	// RT closest-hit group.
 	if (h && name && *name && m_impl->rtSupported && m_impl->shaderFactory)
 	{
-		RefCntAutoPtr<IFileStream> stream;
-		m_impl->shaderFactory->CreateInputStream2((std::string(name) + ".surf.hlsl").c_str(),
-		                                          CREATE_SHADER_SOURCE_INPUT_STREAM_FLAG_SILENT, &stream);
-		if (stream)
+		bool hasSurf = m_impl->rtSurfSources.count(name) != 0;
+		if (!hasSurf)
+		{
+			RefCntAutoPtr<IFileStream> stream;
+			m_impl->shaderFactory->CreateInputStream2((std::string(name) + ".surf.hlsl").c_str(),
+			                                          CREATE_SHADER_SOURCE_INPUT_STREAM_FLAG_SILENT, &stream);
+			hasSurf = stream != nullptr;
+		}
+		if (hasSurf)
 		{
 			std::string& slot = m_impl->rtSurfShaders[name];
 			if (slot != ps) { slot = ps; m_impl->rtPipelineDirty = true; }   // (re)build the RT pipeline to add/refresh this hit group
 		}
 	}
 	return h;
+}
+
+void NukeDiligent::registerRTSurface(const char* shaderName, const char* surfHlsl)
+{
+	// No rtSupported gate: modules register during boot, before the device exists.
+	if (!shaderName || !*shaderName || !surfHlsl) return;
+	std::string& slot = m_impl->rtSurfSources[shaderName];
+	if (slot == surfHlsl) return;
+	slot = surfHlsl;
+	// The pipeline may already exist (registration can land after the first material use).
+	if (m_impl->rtSurfShaders.count(shaderName)) m_impl->rtPipelineDirty = true;
 }
