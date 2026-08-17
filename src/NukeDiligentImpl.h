@@ -626,7 +626,7 @@ struct NukeDiligent::Impl
 	uint64_t                              nextShaderHandle   = 1;   // handles handed to the engine
 	RefCntAutoPtr<IBuffer>                worldCB;     // VS: WVP + World   (shared)
 	RefCntAutoPtr<IBuffer>                worldMatCB;  // PS: color + params + custom shader props (shared)
-	static const uint32_t                 kMatCBBytes = 1024;   // MatCB capacity (color/params + props + 8 overlay slots)
+	static const uint32_t                 kMatCBBytes = 1280;   // MatCB capacity (std block 1024 + custom shader props, e.g. terrain splat)
 	float                                 tessFillFactor = 0.0f;   // per-draw tess factor patched into g_Disp.w
 	Diligent::RefCntAutoPtr<Diligent::IBuffer> drawFlagsCB;    // per-draw flags (x = receiveShadows)
 	RefCntAutoPtr<ITexture>               whiteTex;    // 1x1 fallback when a material has no texture
