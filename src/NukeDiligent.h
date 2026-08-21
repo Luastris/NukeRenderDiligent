@@ -102,6 +102,10 @@ public:
 	                       const float pos[3], const float quat[4], const float scale[3],
 	                       uint32_t firstIndex, uint32_t indexCount) override;
 	void getFrustum(float planes[24]) override;
+	void setOcclusionId(uint64_t id, const float mn[3], const float mx[3]) override;
+	void endOpaque() override;
+	void setOcclusionCulling(bool enable, bool freeze) override;
+	void getOcclusionStats(int& tracked, int& culled) override;
 	void setLights(const NukeLight* lights, int count) override;
 	void setSky(const NukeSky& sky) override;
 	void setMSAA(int samples) override;

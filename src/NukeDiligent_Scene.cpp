@@ -60,6 +60,7 @@ bool NukeDiligent::Impl::CameraSize(const NukeCameraDesc& cam, int& w, int& h)
 void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
                                 const float pos[3], const float quat[4], const float scale[3])
 {
+	Impl::TagScope tag(m_impl);   // R4: the armed occlusion tag covers this one submit
 	if (!mesh) return;
 	// One material for the whole mesh: the active LOD is one contiguous IB range = one draw.
 	uint32_t first = 0, count = 0;
@@ -72,6 +73,7 @@ void NukeDiligent::renderObjectRange(Mesh* mesh, Material* mat,
                                      const float pos[3], const float quat[4], const float scale[3],
                                      uint32_t firstIndex, uint32_t indexCount)
 {
+	Impl::TagScope tag(m_impl);
 	if (!mesh || indexCount == 0) return;
 	RenderObjectRange(mesh, mat, pos, quat, scale, firstIndex, indexCount);
 }
@@ -101,16 +103,17 @@ void NukeDiligent::renderObjectMulti(Mesh* mesh, Material* const* mats, int matC
                                      const float pos[3], const float quat[4], const float scale[3],
                                      int blendPass)
 {
-	if (!mesh) return;
+	if (!mesh) { m_impl->occlPending = false; return; }
 	if (mesh->numIndices <= 0 || mesh->sections.empty())   // slot-less mesh: plain draw with slot 0
 	{
 		Material* m = matCount > 0 ? mats[0] : nullptr;
 		const int bm = m ? m->blendMode : 0;
-		if (blendPass == 0 && bm != 0) return;
-		if (blendPass == 1 && bm == 0) return;
-		renderObject(mesh, m, pos, quat, scale);
+		if (blendPass == 0 && bm != 0) { m_impl->occlPending = false; return; }
+		if (blendPass == 1 && bm == 0) { m_impl->occlPending = false; return; }
+		renderObject(mesh, m, pos, quat, scale);   // takes the tag itself
 		return;
 	}
+	Impl::TagScope tag(m_impl);   // one tag = the whole sectioned object
 	MeshLOD L = mesh->Lod(m_impl->SelectLod(mesh, pos, scale));
 	for (int s = 0; s < L.sectionCount; ++s)
 	{
@@ -131,6 +134,29 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	if (m_impl->worldPipes.empty() || indexCount == 0) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
+	// R4 occlusion: a tagged draw resolves its verdict once (every section shares it); a draw
+	// the history holds back is recorded for the indirect replay after the pyramid.
+	if (m_impl->occlDrawTag && m_impl->occlReplay < 0)
+	{
+		int slot = -1; bool defer = false;
+		m_impl->OcclArm(slot, defer);
+		if (defer)
+		{
+			Impl::OcclDeferred d; d.tag = slot; d.mesh = mesh; d.mat = mat;
+			memcpy(d.pos, pos, sizeof(d.pos)); memcpy(d.quat, quat, sizeof(d.quat)); memcpy(d.scale, scale, sizeof(d.scale));
+			d.firstIndex = firstIndex; d.indexCount = indexCount;
+			d.recCount = indexCount; d.recFirst = firstIndex; d.recInst = 1; d.recFirstInst = 0; d.recIndexed = gp->IdxBuf() != nullptr;
+			if (mat && mat->liveDrawSet)
+			{
+				d.liveSet = true;
+				memcpy(d.liveVal, mat->liveDrawValue, sizeof(d.liveVal)); memcpy(d.liveChan, mat->liveDrawMaskChan, sizeof(d.liveChan));
+				memcpy(d.liveXf, mat->liveDrawMaskXform, sizeof(d.liveXf)); d.liveRes = mat->liveDrawMaskRes; d.liveMask = mat->liveDrawMask3D;
+				mat->liveDrawSet = false;   // consumed by the record, as a real draw would
+			}
+			m_impl->occlDeferred.push_back(d);
+			return;
+		}
+	}
 	++m_impl->statDraws;                              // frame stats (status bar)
 	m_impl->statTris += (int)indexCount / 3;
 	Impl::MeshGPU& g = *gp;
@@ -439,7 +465,27 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		ctx->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		m_impl->sceneCommitSrb = srb; m_impl->sceneCommitPass = m_impl->passSerial;
 	}
-	if (g.IdxBuf())
+	if (m_impl->occlReplay >= 0)
+	{
+		// Deferred replay: the occlusion test wrote this record's arguments (0 instances = culled).
+		const Uint64 off = (Uint64)m_impl->occlReplay * 20;
+		if (g.IdxBuf())
+		{
+			ctx->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			DrawIndexedIndirectAttribs ia;
+			ia.pAttribsBuffer = m_impl->occlArgsBuf; ia.DrawArgsOffset = off; ia.IndexType = VT_UINT32;
+			ia.Flags = DRAW_FLAG_VERIFY_STATES; ia.AttribsBufferStateTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+			ctx->DrawIndexedIndirect(ia);
+		}
+		else
+		{
+			DrawIndirectAttribs ia;
+			ia.pAttribsBuffer = m_impl->occlArgsBuf; ia.DrawArgsOffset = off;
+			ia.Flags = DRAW_FLAG_VERIFY_STATES; ia.AttribsBufferStateTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+			ctx->DrawIndirect(ia);
+		}
+	}
+	else if (g.IdxBuf())
 	{
 		ctx->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		DrawIndexedAttribs da{(Uint32)indexCount, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
@@ -718,6 +764,8 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
 	m_impl->WriteFrameCB(P);
 
+	m_impl->OcclBeginCamera();   // R4: open the tag scope, consume matured visibility readbacks
+
 	m_impl->DrawSky();   // procedural sky behind the scene (after clear, before geometry)
 }
 
@@ -989,6 +1037,7 @@ void NukeDiligent::Impl::DrawEditorGridPass()
 
 void NukeDiligent::endCamera()
 {
+	if (m_impl->occlPassActive) endOpaque();   // engine skipped the opaque-scope close: never drop geometry
 	m_impl->DrawEditorGridPass();    // the infinite grid, under the gizmo lines
 	m_impl->DrawDepthDebugLines();   // depth-tested gizmos: against this camera's still-bound MS depth
 	m_impl->FlushSprites();     // draw any pending sprite batch WHILE the (MS) camera targets are still bound
@@ -1202,12 +1251,35 @@ void NukeDiligent::destroyInstanceBuffer(uint64_t id)
 // world transform comes from per-instance attributes, so the CB carries VIEW*PROJ and identity world.
 void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count)
 {
+	Impl::TagScope tag(m_impl);   // R4: one tag = one chunk
 	if (m_impl->worldPipes.empty() || count <= 0) return;
 	auto bit = m_impl->instBufs.find(instBuf);
 	if (bit == m_impl->instBufs.end() || !bit->second.buf) return;
 	if (first < 0 || first + count > bit->second.count) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
+	// R4 occlusion: a tagged chunk the history holds back is recorded for the indirect replay.
+	if (m_impl->occlDrawTag && m_impl->occlReplay < 0)
+	{
+		int slot = -1; bool defer = false;
+		m_impl->OcclArm(slot, defer);
+		if (defer)
+		{
+			Impl::OcclDeferred d; d.tag = slot; d.instanced = true; d.mesh = mesh; d.mat = mat;
+			d.instBuf = instBuf; d.first = first; d.count = count;
+			if (gp->IdxBuf()) { uint32_t f0 = 0, c0 = 0; m_impl->LodRange(mesh, 0, f0, c0); d.recCount = c0; d.recFirst = f0; d.recIndexed = true; }
+			else              { d.recCount = (uint32_t)gp->numVerts; d.recFirst = 0; d.recIndexed = false; }
+			d.recInst = (uint32_t)count; d.recFirstInst = (uint32_t)first;
+			if (mat && mat->liveDrawSet)
+			{
+				d.liveSet = true;
+				memcpy(d.liveVal, mat->liveDrawValue, sizeof(d.liveVal)); memcpy(d.liveChan, mat->liveDrawMaskChan, sizeof(d.liveChan));
+				memcpy(d.liveXf, mat->liveDrawMaskXform, sizeof(d.liveXf)); d.liveRes = mat->liveDrawMaskRes; d.liveMask = mat->liveDrawMask3D;
+			}
+			m_impl->occlDeferred.push_back(d);
+			return;
+		}
+	}
 	++m_impl->statDraws;
 	m_impl->statTris += mesh ? mesh->TriCount() * count : 0;
 	Impl::MeshGPU& g = *gp;
@@ -1395,11 +1467,28 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 		uint32_t l0First = 0, l0Count = 0;
 		m_impl->LodRange(mesh, 0, l0First, l0Count);
 		ctx->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-		DrawIndexedAttribs da{(Uint32)l0Count, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
-		da.FirstIndexLocation    = (Uint32)l0First;
-		da.NumInstances          = (Uint32)count;
-		da.FirstInstanceLocation = (Uint32)first;
-		ctx->DrawIndexed(da);
+		if (m_impl->occlReplay >= 0)
+		{
+			DrawIndexedIndirectAttribs ia;
+			ia.pAttribsBuffer = m_impl->occlArgsBuf; ia.DrawArgsOffset = (Uint64)m_impl->occlReplay * 20; ia.IndexType = VT_UINT32;
+			ia.Flags = DRAW_FLAG_VERIFY_STATES; ia.AttribsBufferStateTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+			ctx->DrawIndexedIndirect(ia);
+		}
+		else
+		{
+			DrawIndexedAttribs da{(Uint32)l0Count, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
+			da.FirstIndexLocation    = (Uint32)l0First;
+			da.NumInstances          = (Uint32)count;
+			da.FirstInstanceLocation = (Uint32)first;
+			ctx->DrawIndexed(da);
+		}
+	}
+	else if (m_impl->occlReplay >= 0)
+	{
+		DrawIndirectAttribs ia;
+		ia.pAttribsBuffer = m_impl->occlArgsBuf; ia.DrawArgsOffset = (Uint64)m_impl->occlReplay * 20;
+		ia.Flags = DRAW_FLAG_VERIFY_STATES; ia.AttribsBufferStateTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ctx->DrawIndirect(ia);
 	}
 	else
 	{

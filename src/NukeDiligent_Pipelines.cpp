@@ -284,6 +284,7 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	CreateSpriteResources();   // 2D sprite quad pipeline (SceneFmt + MSAA -> rebuild with them)
 	CreateDecalResources();    // screen-space decal pipeline (SceneFmt + MSAA)
 	CreatePostResources();     // final tonemap / post-process pass
+	CreateOcclResources();     // Hi-Z pyramid + occlusion test (R4)
 	const TEXTURE_FORMAT fmt0 = SceneFmt();
 	skyStamp.stamp(samples, fmt0); debugStamp.stamp(samples, fmt0); spriteStamp.stamp(samples, fmt0);
 	decalStamp.stamp(samples, fmt0); outlineStamp.stamp(samples, fmt0);

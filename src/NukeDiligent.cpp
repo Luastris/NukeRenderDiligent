@@ -836,6 +836,7 @@ int NukeDiligent::render()
 	m_impl->statTrisOut  = m_impl->statTris;
 	m_impl->statDraws = 0;
 	m_impl->statTris  = 0;
+	++m_impl->occlFrame;
 
 	// Follow the window: resize the swap chain when the framebuffer changes; skip when minimized.
 	int fbw = 0, fbh = 0;

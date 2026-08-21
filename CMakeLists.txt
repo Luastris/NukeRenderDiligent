@@ -135,6 +135,7 @@ add_library(NukeRenderDiligent SHARED
     src/NukeDiligent_Decal.cpp
     src/NukeDiligent_Profile.cpp
     src/NukeDiligent_Native.cpp
+    src/NukeDiligent_Occlusion.cpp
 )
 if(APPLE)
     target_sources(NukeRenderDiligent PRIVATE src/NukeDiligent_Cocoa.mm)   # CAMetalLayer shim

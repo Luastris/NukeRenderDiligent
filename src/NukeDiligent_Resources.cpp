@@ -323,7 +323,8 @@ NukeDiligent::Impl::RT NukeDiligent::Impl::MakeRT(int w, int h)
 		device->CreateTexture(cm, nullptr, &rt.colorMS);
 		if (rt.colorMS) rt.rtv = rt.colorMS->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
 		TextureDesc dm; dm.Name = "RT Depth MS"; dm.Type = RESOURCE_DIM_TEX_2D; dm.Width = (Uint32)w; dm.Height = (Uint32)h;
-		dm.Format = TEX_FORMAT_D32_FLOAT; dm.BindFlags = BIND_DEPTH_STENCIL; dm.SampleCount = samples;
+		// Sampleable: the Hi-Z occlusion pyramid reads the farthest sample per pixel at endOpaque.
+		dm.Format = TEX_FORMAT_D32_FLOAT; dm.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE; dm.SampleCount = samples;
 		device->CreateTexture(dm, nullptr, &rt.depthMS);
 		if (rt.depthMS) rt.dsv = rt.depthMS->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
 	}
@@ -331,7 +332,7 @@ NukeDiligent::Impl::RT NukeDiligent::Impl::MakeRT(int w, int h)
 	{
 		if (rt.color) rt.rtv = rt.color->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
 		TextureDesc dd; dd.Name = "RT Depth"; dd.Type = RESOURCE_DIM_TEX_2D; dd.Width = (Uint32)w; dd.Height = (Uint32)h;
-		dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL;
+		dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE;   // Hi-Z source
 		device->CreateTexture(dd, nullptr, &rt.depth);
 		if (rt.depth) rt.dsv = rt.depth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
 	}

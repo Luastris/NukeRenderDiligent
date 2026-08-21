@@ -382,6 +382,76 @@ struct NukeDiligent::Impl
 	float4x4                            curProjNoJitter;       // curProj before jitter (for TAA reprojection)
 	void RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params);
 
+	// --- R4 Hi-Z occlusion culling -----------------------------------------------------------------------
+	// Two-phase per camera: draws whose id the visibility history calls visible go straight through
+	// (phase 1); the rest are deferred. endOpaque builds a MAX depth pyramid from what was drawn,
+	// tests EVERY tagged box in a compute pass, replays the deferred draws as indirect draws whose
+	// arguments that pass wrote (survivors render this same frame) and copies the verdicts into a
+	// staging ring — read back a few frames later into the per-target history.
+	struct OcclTag { uint64_t id; float mn[3], mx[3]; };
+	struct OcclDeferred
+	{
+		int       tag = -1;            // index into occlTags
+		bool      instanced = false;
+		Mesh*     mesh = nullptr; Material* mat = nullptr;
+		float     pos[3], quat[4], scale[3];
+		uint32_t  firstIndex = 0, indexCount = 0;
+		uint64_t  instBuf = 0; int first = 0, count = 0;
+		// Indirect-argument seed the test pass copies through (instance count zeroed when culled).
+		uint32_t  recCount = 0, recFirst = 0, recInst = 1, recFirstInst = 0; bool recIndexed = true;
+		// Per-draw overlay context snapshot (Surface::PushDrawContext): the material is shared, so
+		// the values set for THIS draw must be restored before the replay.
+		bool      liveSet = false; float liveVal[8], liveChan[8], liveXf[12], liveRes = 0.0f; Texture* liveMask = nullptr;
+	};
+	struct OcclHist { bool visible = true; uint64_t frame = 0; };
+	struct OcclView
+	{
+		std::unordered_map<uint64_t, OcclHist> hist;
+		RefCntAutoPtr<ITexture>                 hiz;        // R32F, full mip chain (MAX reduce)
+		RefCntAutoPtr<ITexture>                 hizScratch; // per-level source copy (single-texture state tracking)
+		std::vector<RefCntAutoPtr<ITextureView>> hizRTV;    // hiz: one RTV per mip
+		std::vector<RefCntAutoPtr<ITextureView>> hizSrcSRV; // scratch: one SRV per mip
+		int hizW = 0, hizH = 0, hizMips = 0;
+		struct Ring { RefCntAutoPtr<IBuffer> staging; std::vector<uint64_t> ids; int pending = -1; };
+		Ring     ring[3]; int ringHead = 0;
+		uint64_t lastUsed = 0;
+	};
+	std::map<uint64_t, OcclView>        occlViews;            // keyed by curTarget
+	bool                                occlEnabled = false, occlFreeze = false;
+	bool                                occlPassActive = false; // tags accepted: beginCamera .. endOpaque
+	bool                                occlPending = false;    // setOcclusionId armed for the next draw
+	bool                                occlDrawTag = false;    // the submit in progress carries the tag
+	OcclTag                             occlPendingTag{};
+	// One public submit = one tag, whatever its early exits or section count: the scope moves the
+	// armed tag onto the submit and drops it on the way out, so nothing leaks onto the next draw.
+	struct TagScope
+	{
+		Impl* im;
+		explicit TagScope(Impl* i) : im(i)
+		{ im->occlDrawTag = im->occlPending && im->occlReplay < 0; im->occlPending = false; im->occlPendingSlot = -1; }
+		~TagScope() { im->occlDrawTag = false; }
+	};
+	int                                 occlPendingSlot = -1;   // tag slot the pending draw resolved to (-1 = not yet)
+	bool                                occlPendingDefer = false;
+	int                                 occlReplay = -1;        // deferred record being replayed (draws go indirect)
+	std::vector<OcclTag>                occlTags;
+	std::vector<OcclDeferred>           occlDeferred;
+	RefCntAutoPtr<IBuffer>              occlAabbBuf, occlRecBuf, occlVisBuf, occlArgsBuf, occlCB;
+	Uint32                              occlCap = 0;            // element capacity of the buffers above
+	RefCntAutoPtr<IPipelineState>       occlCSPSO, hizCopyPSO, hizCopyMSPSO, hizDownPSO;
+	RefCntAutoPtr<IShaderResourceBinding> occlCSSRB, hizCopySRB, hizCopyMSSRB, hizDownSRB;
+	IShaderResourceVariable*            hizCopyVar = nullptr; IShaderResourceVariable* hizCopyMSVar = nullptr; IShaderResourceVariable* hizDownVar = nullptr;
+	uint64_t                            occlFrame = 0;          // frames rendered (history aging)
+	int                                 statOcclTracked = 0, statOcclCulled = 0;   // last completed camera
+	void CreateOcclResources();
+	void OcclBeginCamera();             // reset per-pass lists, consume matured readbacks
+	int  OcclEndOpaque();               // pyramid + test + readback copy; 0 = drop deferred, 1 = replay indirect, 2 = replay plain
+	bool OcclDecide(uint64_t id);       // history verdict (true = draw now)
+	bool OcclArm(int& slot, bool& defer);   // resolve the pending tag for the draw being submitted
+	void OcclEnsureBuffers(Uint32 n);
+	void OcclBuildHiZ(OcclView& v, ITexture* depth, int w, int h);
+	void OcclDebugBoxes();              // frozen view: wire boxes of the culled draws
+
 	// --- Ray tracing (D3D12) ---------------------------------------------------------------------------------
 	std::unordered_map<Mesh*, RefCntAutoPtr<IBottomLevelAS>> blasCache;   // BLAS per mesh (built once, reused)
 	// v4 indexed meshes: BLAS per IB range (a section, or the whole LOD0). Key packs
