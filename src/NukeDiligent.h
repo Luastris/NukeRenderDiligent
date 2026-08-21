@@ -21,6 +21,8 @@ public:
 	// Water passes live in NukeWater via the native hatch (include/NukeDiligentNative.h);
 	// only the generic ortho bottom capture remains here.
 	uint64_t createShaderPipeline(const char* name, const char* vs, const char* ps) override;
+	uint64_t createShaderPipelineTess(const char* name, const char* vs, const char* ps,
+	                                  const char* hs, const char* ds) override;
 	void registerRTSurface(const char* shaderName, const char* surfHlsl) override;
 	void setTextureStreaming(long long budgetBytes) override;
 	void textureStreamInfo(long long& residentBytes, long long& savedBytes, int& streamedCount) override;
@@ -96,6 +98,10 @@ public:
 	void bindRenderTarget(uint64_t rtId) override;
 	void invalidateTexture(Texture* t) override;
 	void invalidateMesh(Mesh* m) override;
+	void renderObjectRange(Mesh* mesh, Material* mat,
+	                       const float pos[3], const float quat[4], const float scale[3],
+	                       uint32_t firstIndex, uint32_t indexCount) override;
+	void getFrustum(float planes[24]) override;
 	void setLights(const NukeLight* lights, int count) override;
 	void setSky(const NukeSky& sky) override;
 	void setMSAA(int samples) override;

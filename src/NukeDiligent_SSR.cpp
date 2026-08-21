@@ -509,14 +509,15 @@ void NukeDiligent::RenderGBufferRange(Mesh* mesh, Material* mat, const float pos
 	}
 	else
 	{
-		IBuffer* vbs[] = { g.pos, g.nrm, g.uv }; Uint64 offs[] = { 0, 0, 0 };
+		IBuffer* vbs[] = { g.PosBuf(), g.NrmBuf(), g.UVBuf() };
+		Uint64 offs[] = { g.PosOfs(), g.NrmOfs(), g.UVOfs() };
 		ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 		ctx->SetPipelineState(m_impl->gbufPSO);
 		ctx->CommitShaderResources(m_impl->gbufSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	}
-	if (g.idx)
+	if (g.IdxBuf())
 	{
-		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		DrawIndexedAttribs da{ (Uint32)indexCount, VT_UINT32, DRAW_FLAG_VERIFY_STATES };
 		da.FirstIndexLocation = (Uint32)firstIndex;
 		ctx->DrawIndexed(da);
@@ -597,16 +598,17 @@ void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t in
 	}
 
 	IDeviceContext* ctx = m_impl->context;
-	IBuffer* vbs[] = { g.pos, g.nrm, g.uv, bit->second.buf }; Uint64 offs[] = { 0, 0, 0, 0 };
+	IBuffer* vbs[] = { g.PosBuf(), g.NrmBuf(), g.UVBuf(), bit->second.buf };
+	Uint64 offs[] = { g.PosOfs(), g.NrmOfs(), g.UVOfs(), 0 };
 	ctx->SetVertexBuffers(0, 4, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	ctx->SetPipelineState(m_impl->gbufPSOInst);
 	ctx->CommitShaderResources(m_impl->gbufSRBInst, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	if (g.idx)
+	if (g.IdxBuf())
 	{
 		// LOD0 range only: the whole IB also carries the appended LOD shells.
 		uint32_t l0First = 0, l0Count = 0;
 		m_impl->LodRange(mesh, 0, l0First, l0Count);
-		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		DrawIndexedAttribs da{ (Uint32)l0Count, VT_UINT32, DRAW_FLAG_VERIFY_STATES };
 		da.FirstIndexLocation    = (Uint32)l0First;
 		da.NumInstances          = (Uint32)count;

@@ -440,6 +440,9 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	};
 	gp.InputLayout.NumElements    = vsSrc.find("NUKE_VCOLOR") != std::string::npos ? 4 : 3;
 	gp.InputLayout.LayoutElements = layout;
+	// A 4-slot layout DEMANDS a color stream at draw time; colorless meshes (preview sphere)
+	// then bind a shared dummy buffer — the flag tells RenderObjectRange to do that.
+	wp.wantsVcol = gp.InputLayout.NumElements == 4;
 
 	ShaderResourceVariableDesc varsBase[] = {
 		{SHADER_TYPE_PIXEL, "g_Tex",        SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
@@ -466,6 +469,23 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	vars.push_back({SHADER_TYPE_PIXEL, "g_Flow",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	vars.push_back({SHADER_TYPE_PIXEL, "g_MskStamp",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	vars.push_back({SHADER_TYPE_PIXEL, "g_SceneRefr", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+	// Generic per-layer maps: any PS SRV named g_LayerN*/g_LayerMR*/g_LayerH* becomes a DYNAMIC
+	// var, filled from Material::extraTex by name (one shared sampler on g_LayerN0 below).
+	std::vector<std::string> extraNames;
+	{
+		ps->GetStatus(true);   // reflection needs the finished shader
+		const Uint32 nr = ps->GetResourceCount();
+		for (Uint32 r = 0; r < nr; ++r)
+		{
+			ShaderResourceDesc rd; ps->GetResourceDesc(r, rd);
+			if (rd.Type == SHADER_RESOURCE_TYPE_TEXTURE_SRV && rd.Name
+			    && (std::strncmp(rd.Name, "g_LayerN", 8) == 0 || std::strncmp(rd.Name, "g_LayerMR", 9) == 0
+			        || std::strncmp(rd.Name, "g_LayerH", 8) == 0))
+				extraNames.push_back(rd.Name);
+		}
+	}
+	for (const std::string& n : extraNames)
+		vars.push_back({SHADER_TYPE_PIXEL, n.c_str(), SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	ci.PSODesc.ResourceLayout.Variables    = vars.data();
 	ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
@@ -473,8 +493,9 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	// Combined-sampler mode on D3D12 samples texture X via X_sampler, so each map needs its OWN
 	// immutable sampler, and only for the maps this shader actually declares (unassigned ones warn).
 	static const char* const kMapTex[] = { "g_Tex", "g_Normal", "g_MetalRough", "g_Occlusion", "g_Emissive", "g_Spec", "g_WipeMask", "g_Height",
-	                                       "g_Ov0Alb" };   // ONE sampler serves the whole overlay block (D3D11 sampler cap)
-	ImmutableSamplerDesc immSamp[9]; Uint32 nImm = 0;
+	                                       "g_Ov0Alb",     // ONE sampler serves the whole overlay block (D3D11 sampler cap)
+	                                       "g_LayerN0" };  // ...and one for the whole g_Layer* block
+	ImmutableSamplerDesc immSamp[10]; Uint32 nImm = 0;
 	ps->GetStatus(true);   // async compile (cache miss): reflection needs the FINISHED shader
 	const Uint32 nRes = ps->GetResourceCount();
 	for (const char* nm : kMapTex)
@@ -596,10 +617,19 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	//    device-gated. Opaque state, patch-list topology; the DS displaces along the normal by
 	//    g_Height and emits the same PSIn, so the SAME pixel shader lights the result.
 	wp.psoTess.Release(); wp.srbTess.Release();
-	if (device->GetDeviceInfo().Features.Tessellation
-	    && vsSrc.find("NUKE_TESS") != std::string::npos && psSrc.find("g_Disp") != std::string::npos)
+	const bool tessOptIn = vsSrc.find("NUKE_TESS") != std::string::npos
+	                    && psSrc.find("g_Disp") != std::string::npos;
+	if (!wp.hsSrc.empty() && (!device->GetDeviceInfo().Features.Tessellation || !tessOptIn))
+		// A shader SHIPPING custom hull/domain stages expects tessellation — say WHY it's off
+		// instead of silently rendering flat (undebuggable from the editor).
+		cout << "[NukeDiligent]\ttess SKIPPED ('" << dbg << "'): "
+		     << (!device->GetDeviceInfo().Features.Tessellation ? "device has no tessellation"
+		                                                        : "sources lack NUKE_TESS/g_Disp") << endl;
+	if (device->GetDeviceInfo().Features.Tessellation && tessOptIn)
 	{
-		const std::string hsSrc = shaderSource("world.hs"), dsSrc = shaderSource("world.ds");
+		// Custom hull/domain sources (terrain splat displacement) override the shared pair.
+		const std::string hsSrc = wp.hsSrc.empty() ? shaderSource("world.hs") : wp.hsSrc;
+		const std::string dsSrc = wp.dsSrc.empty() ? shaderSource("world.ds") : wp.dsSrc;
 		if (!hsSrc.empty() && !dsSrc.empty())
 		{
 			const std::string vsT = "#define NUKE_TESS 1\n" + vsSrc;
@@ -620,11 +650,25 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = True;
 				ci.GraphicsPipeline.PrimitiveTopology = PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST;
 				std::vector<ShaderResourceVariableDesc> varsT(vars);
-				varsT.push_back({SHADER_TYPE_DOMAIN, "g_Height", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+				std::vector<ImmutableSamplerDesc> immT(immSamp, immSamp + nImm);
+				// The DOMAIN stage samples whatever textures its source declares — the shared
+				// DS reads g_Height, a custom one (terrain) the per-layer g_LayerH* set. Reflect
+				// the compiled DS: every SRV becomes a DYNAMIC domain var; g_Height/g_LayerH0
+				// carry the stage's immutable samplers (combined-sampler mode, shared blocks).
+				{
+					dst->GetStatus(true);
+					const Uint32 nr = dst->GetResourceCount();
+					for (Uint32 r = 0; r < nr; ++r)
+					{
+						ShaderResourceDesc rd; dst->GetResourceDesc(r, rd);
+						if (rd.Type != SHADER_RESOURCE_TYPE_TEXTURE_SRV || !rd.Name) continue;
+						varsT.push_back({SHADER_TYPE_DOMAIN, rd.Name, SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+						if (std::strcmp(rd.Name, "g_Height") == 0 || std::strcmp(rd.Name, "g_LayerH0") == 0)
+							immT.push_back(ImmutableSamplerDesc{SHADER_TYPE_DOMAIN, rd.Name, samp});
+					}
+				}
 				ci.PSODesc.ResourceLayout.Variables    = varsT.data();
 				ci.PSODesc.ResourceLayout.NumVariables = (Uint32)varsT.size();
-				std::vector<ImmutableSamplerDesc> immT(immSamp, immSamp + nImm);
-				immT.push_back(ImmutableSamplerDesc{SHADER_TYPE_DOMAIN, "g_Height", samp});
 				ci.PSODesc.ResourceLayout.ImmutableSamplers    = immT.data();
 				ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)immT.size();
 				ci.PSODesc.Name = "World (tess)";
@@ -640,16 +684,21 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				if (wp.psoTess)
 				{
 					setStatics(wp.psoTess);
-					// HS/DS see MatCB (tess factor + displacement params) and the DS projects via CB.
-					if (auto* m = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_HULL,   "MatCB")) m->Set(worldMatCB);
-					if (auto* m = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_DOMAIN, "MatCB")) m->Set(worldMatCB);
-					if (auto* c = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_DOMAIN, "CB"))    c->Set(worldCB);
+					// HS/DS see MatCB (displacement params); the DS projects via CB; an ADAPTIVE
+					// hull (terrain) additionally reads CB (world) + FrameCB (camera) per edge.
+					if (auto* m = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_HULL,   "MatCB"))   m->Set(worldMatCB);
+					if (auto* c = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_HULL,   "CB"))      c->Set(worldCB);
+					if (auto* f = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_HULL,   "FrameCB")) f->Set(worldFrameCB);
+					if (auto* m = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_DOMAIN, "MatCB"))   m->Set(worldMatCB);
+					if (auto* c = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_DOMAIN, "CB"))      c->Set(worldCB);
 					wp.psoTess->CreateShaderResourceBinding(&wp.srbTess, true);
 					// Vulkan: cbuffers may reflect MUTABLE — bind through the SRB as well.
 					if (auto* d = wp.srbTess->GetVariableByName(SHADER_TYPE_PIXEL,  "DrawFlagsCB")) d->Set(drawFlagsCB);
-					if (auto* m = wp.srbTess->GetVariableByName(SHADER_TYPE_HULL,   "MatCB")) m->Set(worldMatCB);
-					if (auto* m = wp.srbTess->GetVariableByName(SHADER_TYPE_DOMAIN, "MatCB")) m->Set(worldMatCB);
-					if (auto* c = wp.srbTess->GetVariableByName(SHADER_TYPE_DOMAIN, "CB"))    c->Set(worldCB);
+					if (auto* m = wp.srbTess->GetVariableByName(SHADER_TYPE_HULL,   "MatCB"))   m->Set(worldMatCB);
+					if (auto* c = wp.srbTess->GetVariableByName(SHADER_TYPE_HULL,   "CB"))      c->Set(worldCB);
+					if (auto* f = wp.srbTess->GetVariableByName(SHADER_TYPE_HULL,   "FrameCB")) f->Set(worldFrameCB);
+					if (auto* m = wp.srbTess->GetVariableByName(SHADER_TYPE_DOMAIN, "MatCB"))   m->Set(worldMatCB);
+					if (auto* c = wp.srbTess->GetVariableByName(SHADER_TYPE_DOMAIN, "CB"))      c->Set(worldCB);
 				}
 			}
 		}
@@ -676,6 +725,10 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.flowVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Flow");
 	wp.mskVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_MskStamp");
 	wp.refrVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneRefr");
+	wp.extraVars.clear();
+	for (const std::string& n : extraNames)
+		if (auto* v = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, n.c_str()))
+			wp.extraVars.push_back({ n, v, nullptr });
 
 	// Instanced variants — only for shaders that opt in by handling NUKE_INSTANCED. Same sources
 	// with the define prepended; the layout gains 5 per-instance float4 attributes in slot 3.
@@ -779,10 +832,12 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 // Registers a world pipeline for a shader pair. The build itself is left to the warm-up pump:
 // a material arriving with a world load must not compile inside the frame that loads it. Until
 // it is ready the draw uses the default world pipeline, so the object is shaded, not missing.
-uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg)
+uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg,
+                                          const std::string& hsSrc, const std::string& dsSrc)
 {
 	WorldPipe wp;
 	wp.vsSrc = vsSrc; wp.psSrc = psSrc; wp.dbg = dbg;   // kept so the warm-up can (re)build it
+	wp.hsSrc = hsSrc; wp.dsSrc = dsSrc;                 // custom tess stages (terrain)
 	// The default pipeline is the fallback for everything else, so it cannot be deferred.
 	const bool isDefault = (defaultWorldHandle == 0);
 	if (isDefault)
@@ -855,6 +910,20 @@ void NukeDiligent::Impl::RebuildForMSAA()
 	// Cached UI SRBs key views that were just replaced — park them all; the cache refills on next draw.
 	for (auto& kv : uiSRBCache) Trash(kv.second.srb);
 	uiSRBCache.clear();
+}
+
+uint64_t NukeDiligent::createShaderPipelineTess(const char* name, const char* vs, const char* ps,
+                                                const char* hs, const char* ds)
+{
+	if (!vs || !ps || !hs || !ds || !*hs || !*ds) return createShaderPipeline(name, vs, ps);
+	uint64_t h = m_impl->MakeWorldPSO(vs, ps, name && *name ? name : "Shader", hs, ds);
+	// Same RT surf wiring as the plain path (the hit group shades from the PS body).
+	if (h && name && *name && m_impl->rtSupported && m_impl->rtSurfSources.count(name))
+	{
+		std::string& slot = m_impl->rtSurfShaders[name];
+		if (slot != ps) { slot = ps; m_impl->rtPipelineDirty = true; }
+	}
+	return h;
 }
 
 uint64_t NukeDiligent::createShaderPipeline(const char* name, const char* vs, const char* ps)

@@ -418,7 +418,8 @@ struct NukeDiligent::Impl
 	uint32_t                           tlasFrameCtr = 0;       // periodic full rebuild counter (refit hygiene)
 	uint64_t                           lastRTFullSig = 0;      // full scene hash (BLASes+transforms+masks+data) -> SKIP build when identical
 	std::vector<TLASBuildInstanceData> rtInstances;           // accumulated between beginRTScene/buildRTScene
-	std::vector<std::string>           rtInstanceNames;        // stable storage backing TLASBuildInstanceData::InstanceName
+	std::vector<std::string>           rtInstanceNames;        // grow-only "i<n>" pool backing TLASBuildInstanceData::InstanceName
+	std::map<Material*, uint32_t>      rtMatBlockCache;        // material -> allMatCPU offset of its built block (per accumulation)
 	bool                               rtSceneReady = false;   // a valid TLAS is built for the current frame
 	RefCntAutoPtr<ITopLevelAS>         fallbackTLAS;           // empty TLAS bound to g_TLAS when no scene TLAS (rays miss)
 	RefCntAutoPtr<IBuffer>             fbTlasScratch, fbTlasInst;
@@ -512,6 +513,10 @@ struct NukeDiligent::Impl
 	// --- 3D world pipelines (one per shader; all share the layout + CBs + white fallback) ---
 	struct WorldPipe
 	{
+		bool wantsVcol = false;   // 4-element input layout (NUKE_VCOLOR): draws need a color VB
+		// Shader-declared g_Layer* SRVs beyond the fixed set: filled from Material::extraTex by name.
+		struct ExtraVar { std::string name; IShaderResourceVariable* var = nullptr; IDeviceObject* last = nullptr; };
+		std::vector<ExtraVar> extraVars;
 		RefCntAutoPtr<IPipelineState>         pso;        // opaque (blend off, depth write on)
 		RefCntAutoPtr<IPipelineState>         psoBlend;   // transparent: alpha blend, depth test on / write off
 		RefCntAutoPtr<IPipelineState>         psoAdd;     // additive: add blend, depth write off
@@ -561,6 +566,7 @@ struct NukeDiligent::Impl
 		IDeviceObject* lastBind[13 + kOvTexCount + 3]  = {};
 		IDeviceObject* lastBindI[13 + kOvTexCount + 3] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
+		std::string hsSrc, dsSrc;        // CUSTOM tess stages (empty = shared world.hs/world.ds)
 		// What this pipeline was built for. Stale or never-built pipes are skipped by the draw
 		// and rebuilt by the warm-up; the draw falls back to the default world pipeline.
 		Uint8          builtSamples = 0;
@@ -600,6 +606,15 @@ struct NukeDiligent::Impl
 	uint32_t        passSerial = 1;                 // bumped by every begin*Pass / beginCamera / beginCubeFace
 	const Material* matCBFor   = nullptr;           // material whose bytes sit in worldMatCB + drawFlagsCB
 	uint32_t        matCBPass  = 0;                 // ...valid while == passSerial
+	float           matCBTessF = 0.0f;              // quantized tess factor those bytes carry in g_Disp.w
+	// Tess SRB name-bind gate: the bound set is per MATERIAL, not per draw (terrain = dozens
+	// of draws sharing one palette; per-draw GetVariableByName sweeps were a CPU sink).
+	const Material* tessBindMat  = nullptr;
+	uint32_t        tessBindPass = ~0u;
+	IShaderResourceBinding* sceneCommitSrb = nullptr;   // last SRB committed by RenderObjectRange...
+	uint32_t                sceneCommitPass = 0;        // ...valid while == passSerial and no new Set()
+	RefCntAutoPtr<IBuffer>  dummyColVB;                 // zero vcolors for vcol pipes on colorless meshes
+	uint32_t                dummyColVerts = 0;          // ...grown on demand to the largest such mesh
 	uint32_t        instWorldCBPass = 0;            // pass in which worldCB holds the instanced VP (identity world)
 	struct { const void* mesh = nullptr; uint64_t buf = 0; void* pso = nullptr; uint32_t pass = 0; } lastInstBind;
 
@@ -629,7 +644,10 @@ struct NukeDiligent::Impl
 	uint64_t                              nextShaderHandle   = 1;   // handles handed to the engine
 	RefCntAutoPtr<IBuffer>                worldCB;     // VS: WVP + World   (shared)
 	RefCntAutoPtr<IBuffer>                worldMatCB;  // PS: color + params + custom shader props (shared)
-	static const uint32_t                 kMatCBBytes = 1280;   // MatCB capacity (std block 1024 + custom shader props, e.g. terrain splat)
+	// MatCB capacity: std block 1024 + custom shader props. The terrain splat shader now packs
+	// 17 float4s past the std block (1296 bytes total) — an overflowing prop is SILENTLY
+	// dropped and the shader goes black, so keep headroom.
+	static const uint32_t                 kMatCBBytes = 2048;
 	float                                 tessFillFactor = 0.0f;   // per-draw tess factor patched into g_Disp.w
 	Diligent::RefCntAutoPtr<Diligent::IBuffer> drawFlagsCB;    // per-draw flags (x = receiveShadows)
 	RefCntAutoPtr<ITexture>               whiteTex;    // 1x1 fallback when a material has no texture
@@ -806,12 +824,48 @@ struct NukeDiligent::Impl
 	int                                   lightCube[kMaxLights];       // per-light cube index (-1 = none)
 	void CreateShadowResources();
 	// Build a world-type PSO (fixed layout/CBs) from VS+PS source; store it under a handle.
-	uint64_t MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg);
+	uint64_t MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg,
+	                      const std::string& hsSrc = std::string(), const std::string& dsSrc = std::string());
 	bool     BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg);
 	void     RebuildForMSAA();   // rebuild all sample-count-dependent pipelines + targets after `samples` changes
+	// ---- pooled mesh streams (TB-5) -----------------------------------------------------------
+	// Churn-free residency for pooled meshes (Mesh::pooled — terrain nodes): streams live as
+	// RANGES inside shared arena buffers, so (re)serving/freeing a node allocates ranges and
+	// never creates or destroys GPU objects. Element-granular first-fit free lists, coalescing.
+	struct PoolArena
+	{
+		RefCntAutoPtr<IBuffer> pos, nrm, uv, col, idx;   // uv stays zero-filled (pooled meshes have none)
+		uint32_t vertCap = 0, idxCap = 0;
+		std::map<uint32_t, uint32_t> vFree, iFree;       // offset -> count (elements)
+	};
+	std::vector<std::unique_ptr<PoolArena>> meshPool;
+	static bool PoolAlloc(std::map<uint32_t, uint32_t>& fm, uint32_t count, uint32_t& off);
+	static void PoolFree(std::map<uint32_t, uint32_t>& fm, uint32_t off, uint32_t count);
+	PoolArena* PoolAllocMesh(uint32_t verts, uint32_t inds, uint32_t& vOff, uint32_t& iOff);
+	// Shared grow-only BLAS build scratch: one-shot builds (static meshes) reuse it instead of
+	// creating and destroying a committed resource per build (heap churn on terrain streaming).
+	RefCntAutoPtr<IBuffer> blasSharedScratch;
+	Uint64 blasSharedScratchSize = 0;
+	IBuffer* BlasScratchFor(Uint64 size);
+
 	struct MeshGPU { RefCntAutoPtr<IBuffer> pos, nrm, uv; int numVerts = 0; int version = 0;
 	                 RefCntAutoPtr<IBuffer> col;   // optional vertex-color stream (Mesh::colorArray) — slot 3, ATTRIB3
 	                 RefCntAutoPtr<IBuffer> idx; int numIndices = 0;   // v4 indexed meshes (null = soup)
+	                 // Pooled residency: streams are ranges in `arena` (pos/... above stay null).
+	                 // Consumers MUST go through the accessors below — a pooled mesh's data does
+	                 // NOT start at byte 0 of its buffers.
+	                 PoolArena* arena = nullptr;
+	                 uint32_t vOff = 0, iOff = 0;          // element offsets inside the arena
+	                 IBuffer* PosBuf() const { return arena ? arena->pos.RawPtr() : pos.RawPtr(); }
+	                 IBuffer* NrmBuf() const { return arena ? arena->nrm.RawPtr() : nrm.RawPtr(); }
+	                 IBuffer* UVBuf()  const { return arena ? arena->uv.RawPtr()  : uv.RawPtr(); }
+	                 IBuffer* ColBuf() const { return arena ? arena->col.RawPtr() : col.RawPtr(); }
+	                 IBuffer* IdxBuf() const { return arena ? arena->idx.RawPtr() : idx.RawPtr(); }
+	                 Uint64 PosOfs() const { return arena ? (Uint64)vOff * 12 : 0; }
+	                 Uint64 NrmOfs() const { return arena ? (Uint64)vOff * 12 : 0; }
+	                 Uint64 UVOfs()  const { return arena ? (Uint64)vOff * 8  : 0; }
+	                 Uint64 ColOfs() const { return arena ? (Uint64)vOff * 16 : 0; }
+	                 Uint64 IdxOfs() const { return arena ? (Uint64)iOff * 4  : 0; }
 	                 // RT wind bend: NukeBend compute inputs + the BENT position buffer the BLAS builds over.
 	                 RefCntAutoPtr<IBuffer> bendSrc, bendData, bendPivot, posBent, blasScratch;
 	                 // GPU skinning: skinned INSTANCE = UAV-writable pos/nrm (pos doubles as the

@@ -348,10 +348,112 @@ void NukeDiligent::Impl::EnsureBackbufferMS(int w, int h)
 	backbufferMS = MakeRT(w, h);
 }
 
+// ---- pooled mesh streams (TB-5) -----------------------------------------------------------------
+
+bool NukeDiligent::Impl::PoolAlloc(std::map<uint32_t, uint32_t>& fm, uint32_t count, uint32_t& off)
+{
+	for (auto it = fm.begin(); it != fm.end(); ++it)
+		if (it->second >= count)
+		{
+			off = it->first;
+			const uint32_t rem = it->second - count;
+			const uint32_t rOff = it->first + count;
+			fm.erase(it);
+			if (rem) fm[rOff] = rem;
+			return true;
+		}
+	return false;
+}
+
+void NukeDiligent::Impl::PoolFree(std::map<uint32_t, uint32_t>& fm, uint32_t off, uint32_t count)
+{
+	if (!count) return;
+	auto next = fm.lower_bound(off);
+	// Coalesce with the previous block...
+	if (next != fm.begin())
+	{
+		auto prev = std::prev(next);
+		if (prev->first + prev->second == off) { off = prev->first; count += prev->second; fm.erase(prev); }
+	}
+	// ...and with the following one.
+	if (next != fm.end() && off + count == next->first) { count += next->second; fm.erase(next); }
+	fm[off] = count;
+}
+
+NukeDiligent::Impl::PoolArena* NukeDiligent::Impl::PoolAllocMesh(uint32_t verts, uint32_t inds,
+                                                                 uint32_t& vOff, uint32_t& iOff)
+{
+	static constexpr uint32_t kArenaVerts = 1u << 20;   // 48 MB of streams per arena
+	static constexpr uint32_t kArenaIdx   = 4u << 20;   // 16 MB of indices
+	if (verts > kArenaVerts || inds > kArenaIdx) return nullptr;   // absurd mesh: dedicated path
+	for (auto& a : meshPool)
+	{
+		uint32_t v, i;
+		if (!PoolAlloc(a->vFree, verts, v)) continue;
+		if (!PoolAlloc(a->iFree, inds, i)) { PoolFree(a->vFree, v, verts); continue; }
+		vOff = v; iOff = i;
+		return a.get();
+	}
+	// Grow: one more arena.
+	auto a = std::make_unique<PoolArena>();
+	a->vertCap = kArenaVerts;
+	a->idxCap = kArenaIdx;
+	BufferDesc bd; bd.Usage = USAGE_DEFAULT; bd.BindFlags = BIND_VERTEX_BUFFER;
+	BufferDesc pbd = bd; if (rtSupported) pbd.BindFlags = BIND_VERTEX_BUFFER | BIND_RAY_TRACING;
+	pbd.Size = (Uint64)kArenaVerts * 12; pbd.Name = "mesh pool pos"; device->CreateBuffer(pbd, nullptr, &a->pos);
+	bd.Size = (Uint64)kArenaVerts * 12; bd.Name = "mesh pool nrm"; device->CreateBuffer(bd, nullptr, &a->nrm);
+	{
+		// The uv stream must READ as zeros (pooled meshes carry no uvs) — init it explicitly.
+		std::vector<float> zero((size_t)kArenaVerts * 2, 0.0f);
+		bd.Size = (Uint64)kArenaVerts * 8; bd.Name = "mesh pool uv";
+		BufferData zd{ zero.data(), bd.Size };
+		device->CreateBuffer(bd, &zd, &a->uv);
+	}
+	bd.Size = (Uint64)kArenaVerts * 16; bd.Name = "mesh pool col"; device->CreateBuffer(bd, nullptr, &a->col);
+	BufferDesc ib; ib.Usage = USAGE_DEFAULT; ib.Name = "mesh pool idx";
+	ib.BindFlags = rtSupported ? (BIND_INDEX_BUFFER | BIND_RAY_TRACING) : BIND_INDEX_BUFFER;
+	ib.Size = (Uint64)kArenaIdx * 4;
+	device->CreateBuffer(ib, nullptr, &a->idx);
+	if (!a->pos || !a->nrm || !a->uv || !a->col || !a->idx) return nullptr;
+	a->vFree[0] = kArenaVerts;
+	a->iFree[0] = kArenaIdx;
+	meshPool.push_back(std::move(a));
+	PoolArena* pa = meshPool.back().get();
+	uint32_t v, i;
+	if (!PoolAlloc(pa->vFree, verts, v) || !PoolAlloc(pa->iFree, inds, i)) return nullptr;
+	vOff = v; iOff = i;
+	std::cout << "[NukeDiligent]\tmesh pool arena #" << meshPool.size() << " (64 MB)" << std::endl;
+	return pa;
+}
+
 NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 {
 	if (!mesh || mesh->numVerts <= 0) return nullptr;
 	auto it = meshCache.find(mesh);
+	// Pooled residency (Mesh::pooled): plain static indexed geometry lives as arena ranges —
+	// the whole (re)serve cycle allocates and uploads, never creates GPU objects.
+	const bool wantPool = mesh->pooled && mesh->indexArray && mesh->numIndices > 0
+	                   && mesh->vertexArray && mesh->normalArray && mesh->colorArray
+	                   && !skinRecs.count(mesh) && !mesh->rtBendArray;
+	if (it == meshCache.end() && wantPool)
+	{
+		MeshGPU g;
+		g.numVerts = mesh->numVerts;
+		g.numIndices = mesh->numIndices;
+		g.version = mesh->version;
+		g.arena = PoolAllocMesh((uint32_t)mesh->numVerts, (uint32_t)mesh->numIndices, g.vOff, g.iOff);
+		if (g.arena)
+		{
+			const Uint64 sz3 = (Uint64)mesh->numVerts * 3 * sizeof(float);
+			context->UpdateBuffer(g.arena->pos, g.PosOfs(), sz3, mesh->vertexArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			context->UpdateBuffer(g.arena->nrm, g.NrmOfs(), sz3, mesh->normalArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			context->UpdateBuffer(g.arena->col, g.ColOfs(), (Uint64)mesh->numVerts * 16, mesh->colorArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			context->UpdateBuffer(g.arena->idx, g.IdxOfs(), (Uint64)mesh->numIndices * 4, mesh->indexArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			it = meshCache.emplace(mesh, std::move(g)).first;
+			return &it->second;
+		}
+		// Pool refused (absurd size / device OOM): the dedicated path below still works.
+	}
 	if (it == meshCache.end())
 	{
 		if (!mesh->vertexArray || !mesh->normalArray)   // immutable buffers need init data
@@ -429,11 +531,17 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 		it = meshCache.emplace(mesh, std::move(g)).first;
 	}
 	MeshGPU& g = it->second;
-	if (!g.pos || !g.nrm || !g.uv) return nullptr;
+	if (!g.PosBuf() || !g.NrmBuf() || !g.UVBuf()) return nullptr;
 	if (g.version != mesh->version)
 	{
 		if (g.numVerts != mesh->numVerts || g.numIndices != mesh->numIndices)   // topology changed: rebuild from scratch
 		{
+			// Pooled: the ranges return to the arena, the buffers themselves stay put.
+			if (g.arena)
+			{
+				PoolFree(g.arena->vFree, g.vOff, (uint32_t)g.numVerts);
+				PoolFree(g.arena->iFree, g.iOff, (uint32_t)g.numIndices);
+			}
 			// Park EVERYTHING the erase would inline-release — this frame's earlier draws
 			// (and in-flight BLAS builds) may still reference the buffers.
 			Trash(g.pos); Trash(g.nrm); Trash(g.uv); Trash(g.col); Trash(g.idx);
@@ -451,6 +559,24 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 			return GetMeshGPU(mesh);
 		}
 		const Uint64 sz3 = (Uint64)mesh->numVerts * 3 * sizeof(float);
+		if (g.arena)
+		{
+			// Same-count re-serve of a pooled mesh: rewrite the ranges in place — including the
+			// INDICES (a baked node's face-mask reselect can keep the count and change the list).
+			if (mesh->vertexArray) context->UpdateBuffer(g.arena->pos, g.PosOfs(), sz3, mesh->vertexArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			if (mesh->normalArray) context->UpdateBuffer(g.arena->nrm, g.NrmOfs(), sz3, mesh->normalArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			if (mesh->colorArray)  context->UpdateBuffer(g.arena->col, g.ColOfs(), (Uint64)mesh->numVerts * 16, mesh->colorArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			if (mesh->indexArray)  context->UpdateBuffer(g.arena->idx, g.IdxOfs(), (Uint64)mesh->numIndices * 4, mesh->indexArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			// The BLAS geometry references the range contents: drop BOTH caches (indexed meshes
+			// live in the SECTION cache) or RT keeps tracing the pre-rewrite triangles.
+			auto bit = blasCache.find(mesh);
+			if (bit != blasCache.end()) { Trash(bit->second); blasCache.erase(bit); }
+			for (auto sit = blasSectionCache.lower_bound({mesh, 0ull});
+			     sit != blasSectionCache.end() && sit->first.first == mesh; )
+			{ Trash(sit->second); sit = blasSectionCache.erase(sit); }
+			g.version = mesh->version;
+			return &g;
+		}
 		if (mesh->vertexArray) context->UpdateBuffer(g.pos, 0, sz3, mesh->vertexArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		if (mesh->normalArray) context->UpdateBuffer(g.nrm, 0, sz3, mesh->normalArray, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		if (mesh->colorArray && g.col)
@@ -699,8 +825,16 @@ void NukeDiligent::invalidateMesh(Mesh* m)
 	auto it = m_impl->meshCache.find(m);
 	if (it != m_impl->meshCache.end())
 	{
+		if (it->second.arena)
+		{
+			// Pooled mesh: give the ranges back — the arena buffers themselves never die here.
+			// The GPU may still read them for kTrashFrames, but a reused range is only ever
+			// REWRITTEN via UpdateBuffer, which serializes against prior draws.
+			Impl::PoolFree(it->second.arena->vFree, it->second.vOff, (uint32_t)it->second.numVerts);
+			Impl::PoolFree(it->second.arena->iFree, it->second.iOff, (uint32_t)it->second.numIndices);
+		}
 		m_impl->Trash(it->second.pos); m_impl->Trash(it->second.nrm); m_impl->Trash(it->second.uv);
-		m_impl->Trash(it->second.idx);
+		m_impl->Trash(it->second.col); m_impl->Trash(it->second.idx);
 		m_impl->Trash(it->second.bendSrc); m_impl->Trash(it->second.bendData); m_impl->Trash(it->second.bendPivot);
 		m_impl->Trash(it->second.posBent); m_impl->Trash(it->second.blasScratch);
 		m_impl->Trash(it->second.skinPosPrev);

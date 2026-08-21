@@ -67,6 +67,36 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	RenderObjectRange(mesh, mat, pos, quat, scale, first, count);
 }
 
+// Terrain cluster culling (TB-5): one index range with the full material pipeline.
+void NukeDiligent::renderObjectRange(Mesh* mesh, Material* mat,
+                                     const float pos[3], const float quat[4], const float scale[3],
+                                     uint32_t firstIndex, uint32_t indexCount)
+{
+	if (!mesh || indexCount == 0) return;
+	RenderObjectRange(mesh, mat, pos, quat, scale, firstIndex, indexCount);
+}
+
+// Current camera frustum planes (world space, inward normals) via Gribb-Hartmann from the
+// view*proj latched in beginCamera.
+void NukeDiligent::getFrustum(float planes[24])
+{
+	const float4x4 m = m_impl->curView * m_impl->curProj;
+	// Rows of the transposed matrix combine into the clip planes.
+	auto put = [&](int i, float a, float b, float c, float d)
+	{
+		const float len = std::sqrt(a * a + b * b + c * c);
+		const float inv = len > 1e-12f ? 1.0f / len : 0.0f;
+		planes[i * 4 + 0] = a * inv; planes[i * 4 + 1] = b * inv;
+		planes[i * 4 + 2] = c * inv; planes[i * 4 + 3] = d * inv;
+	};
+	put(0, m.m03 + m.m00, m.m13 + m.m10, m.m23 + m.m20, m.m33 + m.m30);   // left
+	put(1, m.m03 - m.m00, m.m13 - m.m10, m.m23 - m.m20, m.m33 - m.m30);   // right
+	put(2, m.m03 + m.m01, m.m13 + m.m11, m.m23 + m.m21, m.m33 + m.m31);   // bottom
+	put(3, m.m03 - m.m01, m.m13 - m.m11, m.m23 - m.m21, m.m33 - m.m31);   // top
+	put(4, m.m02, m.m12, m.m22, m.m32);                                    // near (D3D z in [0,1])
+	put(5, m.m03 - m.m02, m.m13 - m.m12, m.m23 - m.m22, m.m33 - m.m32);   // far
+}
+
 void NukeDiligent::renderObjectMulti(Mesh* mesh, Material* const* mats, int matCount,
                                      const float pos[3], const float quat[4], const float scale[3],
                                      int blendPass)
@@ -196,10 +226,14 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 			dist = std::max(dist - sqrtf(ex * ex + ey * ey + ez * ez), 1.0f);
 		}
 		const float f = std::min(48.0f / std::max(dist, 1.0f), 12.0f);
-		if (f > 1.05f) tessF = f;
+		// QUANTIZED to integers: the factor only gates/caps the adaptive hull, and terrain is
+		// dozens of same-material draws — per-draw unique factors forced a full MatCB refill
+		// and SRB commit on EVERY one of them (the 70 ms "slideshow" was CPU, not the GPU).
+		if (f > 1.05f) tessF = std::ceil(f);
 	}
 	m_impl->tessFillFactor = tessF;
-	if (tessF > 0.0f) m_impl->matCBFor = nullptr;   // the factor is per-DRAW: force the refill
+	// Refill only when the factor (or the material) actually changed.
+	if (tessF > 0.0f && (m_impl->matCBFor != mat || m_impl->matCBTessF != tessF)) m_impl->matCBFor = nullptr;
 	// Overlay draw context (per-atom values + painted mask) is per-DRAW too.
 	if (mat && mat->liveOvCount > 0 && mat->liveDrawSet) m_impl->matCBFor = nullptr;
 
@@ -207,6 +241,11 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	if (m_impl->matCBFor != mat || m_impl->matCBPass != m_impl->passSerial)
 	{
 		m_impl->matCBFor = mat; m_impl->matCBPass = m_impl->passSerial;
+		m_impl->matCBTessF = m_impl->tessFillFactor;   // the factor this refill patches into g_Disp.w
+		// A MAP_DISCARD moves the dynamic CB to a NEW ring version: draws only see it after a
+		// CommitShaderResources. Without this the old version's ring memory gets recycled by
+		// later maps and the terrain reads whatever landed there (seconds-old material data).
+		m_impl->sceneCommitSrb = nullptr;
 		if (m_impl->drawFlagsCB)
 		{
 			MapHelper<float> fc(m_impl->context, m_impl->drawFlagsCB, MAP_WRITE, MAP_FLAG_DISCARD);
@@ -267,8 +306,9 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	}
 
 	// Gate on the pointer changing: Diligent rewrites the descriptor cache on every DYNAMIC-var Set().
-	auto bindIf = [](IShaderResourceVariable* v, IDeviceObject* o, IDeviceObject*& cached)
-	{ if (v && o && o != cached) { v->Set(o); cached = o; } };
+	bool boundNew = false;   // any Set() this draw -> the SRB must be re-committed
+	auto bindIf = [&boundNew](IShaderResourceVariable* v, IDeviceObject* o, IDeviceObject*& cached)
+	{ if (v && o && o != cached) { v->Set(o); cached = o; boundNew = true; } };
 	ITextureView* whiteSRV = m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 	bindIf(wp.texVar,  srv  ? srv  : whiteSRV, wp.lastBind[0]);
 	bindIf(wp.normVar, nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE), wp.lastBind[1]);
@@ -290,19 +330,48 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		bindIf(wp.flowVar, (mat && mat->flow) ? m_impl->GetTexSRV(mat->flow) : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount]);
 		bindIf(wp.refrVar, m_impl->refrSRV ? m_impl->refrSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 1]);
 	bindIf(wp.mskVar, (mat && mat->mskStamp) ? m_impl->GetTexSRV(mat->mskStamp) : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 2]);
+	// Generic named textures (terrain layer normal/MR maps): shader-declared g_Layer* SRVs fill
+	// from the material's extraTex by name; pointer-gated like everything else.
+	for (auto& ex : wp.extraVars)
+	{
+		IDeviceObject* o = whiteSRV;
+		if (mat)
+			for (const auto& et : mat->extraTex)
+				if (et.second && et.first == ex.name)
+				{ if (auto* s = m_impl->GetTexSRV(et.second)) o = s; break; }
+		if (ex.var && o != ex.last) { ex.var->Set(o); ex.last = o; boundNew = true; }
+	}
 	}
 
 	IDeviceContext* ctx = m_impl->context;
 	// Slot 3 = optional vertex colors; extra bound buffers are ignored by 3-element layouts.
-	IBuffer* vbs[]    = { g.pos, g.nrm, g.uv, g.col };
-	Uint64   offs[]   = { 0, 0, 0, 0 };
-	ctx->SetVertexBuffers(0, g.col ? 4 : 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	// A vcol-layout pipe (NUKE_VCOLOR shader) on a COLORLESS mesh (preview sphere,
+	// hand-assigned terrain shader) still needs slot 3 filled: bind shared zero colors.
+	IBuffer* colVB = g.ColBuf();
+	if (!colVB && wp.wantsVcol)
+	{
+		if (m_impl->dummyColVerts < (uint32_t)mesh->numVerts)
+		{
+			m_impl->Trash(m_impl->dummyColVB);
+			m_impl->dummyColVB.Release();
+			std::vector<float> z((size_t)mesh->numVerts * 4, 0.0f);
+			BufferDesc bd; bd.Name = "dummy vcol"; bd.Usage = USAGE_IMMUTABLE; bd.BindFlags = BIND_VERTEX_BUFFER;
+			bd.Size = (Uint64)(z.size() * sizeof(float));
+			BufferData bdata{ z.data(), bd.Size };
+			m_impl->device->CreateBuffer(bd, &bdata, &m_impl->dummyColVB);
+			m_impl->dummyColVerts = (uint32_t)mesh->numVerts;
+		}
+		colVB = m_impl->dummyColVB;
+	}
+	IBuffer* vbs[]    = { g.PosBuf(), g.NrmBuf(), g.UVBuf(), colVB };
+	Uint64   offs[]   = { g.PosOfs(), g.NrmOfs(), g.UVOfs(), g.ColBuf() ? g.ColOfs() : 0 };
+	ctx->SetVertexBuffers(0, colVB ? 4 : 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	// Blend variant for this material; wireframe draw mode overrides them all.
 	IPipelineState* pso = wp.pso;
 	IShaderResourceBinding* srb = wp.srb;
 	// Vertex-color variant: mesh has a color stream + the material asks for tint/overlay-mask.
 	// Displacement tessellation takes precedence (same materials still render, un-tinted).
-	const bool vcolDraw = mat && mat->vcolorMode > 0 && g.col && wp.psoVcol && tessF <= 0.0f && !m_impl->wireframe;
+	const bool vcolDraw = mat && mat->vcolorMode > 0 && g.ColBuf() && wp.psoVcol && tessF <= 0.0f && !m_impl->wireframe;
 	if (m_impl->wireframe && wp.psoWire) pso = wp.psoWire;
 	else if (vcolDraw)
 	{
@@ -314,8 +383,14 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	else if (mat && mat->blendMode == 2 && wp.psoAdd)   pso = wp.psoAdd;
 	else if (tessF > 0.0f)
 	{
-		// Tess draws are rare: bind the whole set by NAME on the tess SRB, no redundancy gates.
 		pso = wp.psoTess; srb = wp.srbTess;
+		// Rebind by NAME only when the MATERIAL (or pass) changed: terrain is DOZENS of draws
+		// sharing one palette material, and per-draw name lookups over the whole set were a
+		// pure CPU sink. Same material -> the SRB already holds everything.
+		if (m_impl->tessBindMat != mat || m_impl->tessBindPass != m_impl->passSerial)
+		{
+		m_impl->tessBindMat = mat; m_impl->tessBindPass = m_impl->passSerial;
+		boundNew = true;
 		ITextureView* flatN = m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 		auto TP = [&](SHADER_TYPE st, const char* nm, IDeviceObject* o)
 		{ if (o) if (auto* v = wp.srbTess->GetVariableByName(st, nm)) v->Set(o); };
@@ -338,12 +413,35 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		TP(SHADER_TYPE_PIXEL, "g_Flow",      (mat && mat->flow) ? (IDeviceObject*)m_impl->GetTexSRV(mat->flow) : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_MskStamp",  (mat && mat->mskStamp) ? (IDeviceObject*)m_impl->GetTexSRV(mat->mskStamp) : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_SceneRefr", m_impl->refrSRV ? (IDeviceObject*)m_impl->refrSRV : (IDeviceObject*)whiteSRV);
+		// Generic named textures (terrain layer maps): EVERY declared g_Layer* var gets bound —
+		// absent maps fall back to white, or Diligent's validation floods the console with
+		// "No resource is bound" on every draw (a slideshow of its own). PIXEL + DOMAIN (the
+		// custom DS samples the per-layer heights).
+		for (auto& ex : wp.extraVars)
+		{
+			IDeviceObject* o = whiteSRV;
+			if (mat)
+				for (const auto& et : mat->extraTex)
+					if (et.second && et.first == ex.name)
+					{ if (auto* s = m_impl->GetTexSRV(et.second)) o = s; break; }
+			TP(SHADER_TYPE_PIXEL,  ex.name.c_str(), o);
+			TP(SHADER_TYPE_DOMAIN, ex.name.c_str(), o);
+		}
+		}
 	}
 	ctx->SetPipelineState(pso);
-	ctx->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	if (g.idx)
+	// Commit only when the SRB actually changed: same SRB + same pass + no Set() means the
+	// descriptor tables and resource states are already in place, and Diligent resolves dynamic-CB
+	// versions (worldCB/matCB remaps) at draw time — the repeat commit's TRANSITION walk over the
+	// whole texture set is pure per-draw overhead (terrain: dozens of same-material draws).
+	if (boundNew || m_impl->sceneCommitSrb != srb || m_impl->sceneCommitPass != m_impl->passSerial)
 	{
-		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		m_impl->sceneCommitSrb = srb; m_impl->sceneCommitPass = m_impl->passSerial;
+	}
+	if (g.IdxBuf())
+	{
+		ctx->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		DrawIndexedAttribs da{(Uint32)indexCount, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
 		da.FirstIndexLocation = (Uint32)firstIndex;
 		ctx->DrawIndexed(da);
@@ -431,16 +529,16 @@ void NukeDiligent::selectionOutlineAdd(Mesh* mesh, const float pos[3], const flo
 	struct CBData { float4x4 wvp; float4x4 world; };
 	{ MapHelper<CBData> cb(ctx, m_impl->worldCB, MAP_WRITE, MAP_FLAG_DISCARD); cb->wvp = wvp; cb->world = world; }
 
-	IBuffer* vbs[]  = { g.pos, g.nrm, g.uv };
-	Uint64   offs[] = { 0, 0, 0 };
+	IBuffer* vbs[]  = { g.PosBuf(), g.NrmBuf(), g.UVBuf() };
+	Uint64   offs[] = { g.PosOfs(), g.NrmOfs(), g.UVOfs() };
 	ctx->SetVertexBuffers(0, 3, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	ctx->SetPipelineState(m_impl->outlineMaskPSO);
 	ctx->CommitShaderResources(m_impl->outlineMaskSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	if (g.idx)
+	if (g.IdxBuf())
 	{
 		uint32_t l0First = 0, l0Count = 0;
 		m_impl->LodRange(mesh, 0, l0First, l0Count);
-		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		DrawIndexedAttribs da{(Uint32)l0Count, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
 		da.FirstIndexLocation = (Uint32)l0First;
 		ctx->DrawIndexed(da);
@@ -1180,6 +1278,9 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	if (m_impl->matCBFor != mat || m_impl->matCBPass != m_impl->passSerial)
 	{
 		m_impl->matCBFor = mat; m_impl->matCBPass = m_impl->passSerial;
+		// MAP_DISCARD = new dynamic ring version: draws see it only after a fresh commit (the
+		// stale version's memory gets recycled by later maps — seconds-old material data).
+		m_impl->sceneCommitSrb = nullptr;
 		if (m_impl->drawFlagsCB)
 		{
 			MapHelper<float> fc(m_impl->context, m_impl->drawFlagsCB, MAP_WRITE, MAP_FLAG_DISCARD);
@@ -1281,19 +1382,19 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	if (m_impl->lastInstBind.mesh != (const void*)gp || m_impl->lastInstBind.buf != instBuf ||
 	    m_impl->lastInstBind.pso != (void*)pso || m_impl->lastInstBind.pass != m_impl->passSerial)
 	{
-		IBuffer* vbs[]  = { g.pos, g.nrm, g.uv, bit->second.buf };
-		Uint64   offs[] = { 0, 0, 0, 0 };
+		IBuffer* vbs[]  = { g.PosBuf(), g.NrmBuf(), g.UVBuf(), bit->second.buf };
+		Uint64   offs[] = { g.PosOfs(), g.NrmOfs(), g.UVOfs(), 0 };
 		ctx->SetVertexBuffers(0, 4, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 		ctx->SetPipelineState(pso);
 		m_impl->lastInstBind = { gp, instBuf, (void*)pso, m_impl->passSerial };
 	}
 	ctx->CommitShaderResources(wp.srbInst, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-	if (g.idx)
+	if (g.IdxBuf())
 	{
 		// LOD0 range only: the whole IB also carries the appended LOD shells.
 		uint32_t l0First = 0, l0Count = 0;
 		m_impl->LodRange(mesh, 0, l0First, l0Count);
-		ctx->SetIndexBuffer(g.idx, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		DrawIndexedAttribs da{(Uint32)l0Count, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
 		da.FirstIndexLocation    = (Uint32)l0First;
 		da.NumInstances          = (Uint32)count;

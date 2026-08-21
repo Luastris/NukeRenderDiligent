@@ -87,6 +87,21 @@ std::string NukeDiligent::Impl::GenChitSource(const std::string& name, const std
 	return s.str();
 }
 
+// Shared grow-only scratch for one-shot BLAS builds (bend/dynamic meshes keep their own —
+// they refit per frame and the scratch must outlive the mesh's builds).
+IBuffer* NukeDiligent::Impl::BlasScratchFor(Uint64 size)
+{
+	if (size > blasSharedScratchSize)
+	{
+		Trash(blasSharedScratch);
+		blasSharedScratch.Release();
+		BufferDesc sbd; sbd.Name = "BLAS shared scratch"; sbd.Usage = USAGE_DEFAULT; sbd.BindFlags = BIND_RAY_TRACING;
+		sbd.Size = blasSharedScratchSize = (size * 5) / 4;   // slack: nearby nodes vary in size
+		device->CreateBuffer(sbd, nullptr, &blasSharedScratch);
+	}
+	return blasSharedScratch;
+}
+
 // Get-or-build the bottom-level AS for a mesh from its position buffer (non-indexed triangle
 // soup, numVerts/3 triangles). Cached for the mesh's lifetime; null if not buildable.
 IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
@@ -94,7 +109,7 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
 	auto it = blasCache.find(mesh);
 	if (it != blasCache.end()) return it->second;
 	MeshGPU* gp = GetMeshGPU(mesh);
-	if (!gp || !gp->pos || gp->numVerts < 3) { blasCache[mesh] = {}; return nullptr; }
+	if (!gp || !gp->PosBuf() || gp->numVerts < 3) { blasCache[mesh] = {}; return nullptr; }
 
 	BLASTriangleDesc tri;
 	tri.GeometryName        = "geo";
@@ -114,14 +129,23 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
 	if (!blas) { blasCache[mesh] = {}; return nullptr; }
 
 	RefCntAutoPtr<IBuffer> scratch;
-	BufferDesc sbd; sbd.Name = "BLAS scratch"; sbd.Usage = USAGE_DEFAULT; sbd.BindFlags = BIND_RAY_TRACING;
-	sbd.Size = blas->GetScratchBufferSizes().Build;
-	device->CreateBuffer(sbd, nullptr, &scratch);
-	if (gp->posBent || mesh->rtDynamic) gp->blasScratch = scratch;   // per-frame BLAS rebuilds keep the scratch
+	IBuffer* scratchPtr = nullptr;
+	if (gp->posBent || mesh->rtDynamic)
+	{
+		// Per-frame BLAS rebuilds keep a dedicated scratch alive with the mesh.
+		BufferDesc sbd; sbd.Name = "BLAS scratch"; sbd.Usage = USAGE_DEFAULT; sbd.BindFlags = BIND_RAY_TRACING;
+		sbd.Size = blas->GetScratchBufferSizes().Build;
+		device->CreateBuffer(sbd, nullptr, &scratch);
+		gp->blasScratch = scratch;
+		scratchPtr = scratch;
+	}
+	else
+		scratchPtr = BlasScratchFor(blas->GetScratchBufferSizes().Build);
 
 	BLASBuildTriangleData td;
 	td.GeometryName         = "geo";
-	td.pVertexBuffer        = gp->posBent ? gp->posBent : gp->pos;   // bend meshes trace the BENT positions
+	td.pVertexBuffer        = gp->posBent ? gp->posBent.RawPtr() : gp->PosBuf();   // bend meshes trace the BENT positions
+	td.VertexOffset         = gp->posBent ? 0 : gp->PosOfs();
 	td.VertexStride         = 3 * sizeof(float);
 	td.VertexCount          = (Uint32)gp->numVerts;
 	td.VertexValueType      = VT_FLOAT32;
@@ -134,7 +158,7 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
 	ba.pBLAS                  = blas;
 	ba.pTriangleData          = &td;
 	ba.TriangleDataCount      = 1;
-	ba.pScratchBuffer         = scratch;
+	ba.pScratchBuffer         = scratchPtr;
 	ba.BLASTransitionMode     = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
 	ba.GeometryTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
 	ba.ScratchBufferTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
@@ -152,7 +176,7 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLASRange(Mesh* mesh, uint32_t firstI
 	auto it = blasSectionCache.find(key);
 	if (it != blasSectionCache.end()) return it->second;
 	MeshGPU* gp = GetMeshGPU(mesh);
-	if (!gp || !gp->pos || !gp->idx || indexCount < 3) { blasSectionCache[key] = {}; return nullptr; }
+	if (!gp || !gp->PosBuf() || !gp->IdxBuf() || indexCount < 3) { blasSectionCache[key] = {}; return nullptr; }
 
 	BLASTriangleDesc tri;
 	tri.GeometryName         = "geo";
@@ -171,20 +195,18 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLASRange(Mesh* mesh, uint32_t firstI
 	device->CreateBLAS(desc, &blas);
 	if (!blas) { blasSectionCache[key] = {}; return nullptr; }
 
-	RefCntAutoPtr<IBuffer> scratch;
-	BufferDesc sbd; sbd.Name = "BLAS scratch"; sbd.Usage = USAGE_DEFAULT; sbd.BindFlags = BIND_RAY_TRACING;
-	sbd.Size = blas->GetScratchBufferSizes().Build;
-	device->CreateBuffer(sbd, nullptr, &scratch);
+	IBuffer* scratchPtr = BlasScratchFor(blas->GetScratchBufferSizes().Build);
 
 	BLASBuildTriangleData td;
 	td.GeometryName         = "geo";
-	td.pVertexBuffer        = gp->pos;
+	td.pVertexBuffer        = gp->PosBuf();
+	td.VertexOffset         = gp->PosOfs();
 	td.VertexStride         = 3 * sizeof(float);
 	td.VertexCount          = (Uint32)gp->numVerts;
 	td.VertexValueType      = VT_FLOAT32;
 	td.VertexComponentCount = 3;
-	td.pIndexBuffer         = gp->idx;
-	td.IndexOffset          = (Uint64)firstIndex * sizeof(uint32_t);   // 4-aligned by construction
+	td.pIndexBuffer         = gp->IdxBuf();
+	td.IndexOffset          = gp->IdxOfs() + (Uint64)firstIndex * sizeof(uint32_t);   // 4-aligned by construction
 	td.IndexType            = VT_UINT32;
 	td.PrimitiveCount       = (Uint32)(indexCount / 3);
 	td.Flags                = mesh->rtAlphaTested ? RAYTRACING_GEOMETRY_FLAG_NONE : RAYTRACING_GEOMETRY_FLAG_OPAQUE;
@@ -193,7 +215,7 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLASRange(Mesh* mesh, uint32_t firstI
 	ba.pBLAS                  = blas;
 	ba.pTriangleData          = &td;
 	ba.TriangleDataCount      = 1;
-	ba.pScratchBuffer         = scratch;
+	ba.pScratchBuffer         = scratchPtr;
 	ba.BLASTransitionMode     = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
 	ba.GeometryTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
 	ba.ScratchBufferTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
@@ -243,10 +265,12 @@ void NukeDiligent::beginRTScene()
 	m_impl->rtBendMeshes.clear();
 	m_impl->rtDynMeshes.clear();
 	m_impl->rtDynColCPU.clear();
-	m_impl->rtInstanceNames.clear();
+	// rtInstanceNames is a grow-only pool ("i0","i1",...) — instance i always maps to "i<i>",
+	// so re-accumulating never needs fresh strings.
 	m_impl->rtInstData.clear();
 	m_impl->rtInstShaderGuid.clear();
 	m_impl->allMatCPU.clear();
+	m_impl->rtMatBlockCache.clear();
 	m_impl->rtSceneReady = false;
 }
 
@@ -401,8 +425,19 @@ void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
 	d.shadowAlpha = alb[3];
 	d.pad0 = 0;
 
-	// MatCB block: must match the raster MatCB packing (NukeDiligent_Scene.cpp).
+	// MatCB block: must match the raster MatCB packing (NukeDiligent_Scene.cpp). The block is
+	// a pure function of the Material — repeats within one accumulation just copy the first
+	// build (terrain re-adds dozens of nodes sharing one material every frame).
 	d.matByteOffset = (uint32_t)m_impl->allMatCPU.size();
+	auto blockIt = mat ? m_impl->rtMatBlockCache.find(mat) : m_impl->rtMatBlockCache.end();
+	if (blockIt != m_impl->rtMatBlockCache.end())
+	{
+		m_impl->allMatCPU.resize(m_impl->allMatCPU.size() + Impl::kMatBlock, 0);
+		memcpy(m_impl->allMatCPU.data() + d.matByteOffset,
+		       m_impl->allMatCPU.data() + blockIt->second, Impl::kMatBlock);
+	}
+	else
+	{
 	m_impl->allMatCPU.resize(m_impl->allMatCPU.size() + Impl::kMatBlock, 0);
 	float* mb = reinterpret_cast<float*>(m_impl->allMatCPU.data() + d.matByteOffset);
 	mb[0] = alb[0]; mb[1] = alb[1]; mb[2] = alb[2]; mb[3] = alb[3];                       // g_Color@0
@@ -433,6 +468,8 @@ void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
 				memcpy(m_impl->allMatCPU.data() + d.matByteOffset + dst, v, (size_t)sp.components * 4);
 		}
 	}
+	if (mat) m_impl->rtMatBlockCache[mat] = d.matByteOffset;
+	}
 
 	m_impl->rtInstShaderGuid.push_back(mat ? mat->shaderGuid : std::string());
 	m_impl->rtInstData.push_back(d);
@@ -441,7 +478,8 @@ void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
 		for (int c = 0; c < 4; ++c)
 			inst.Transform.data[r][c] = world.m[c][r];
 
-	m_impl->rtInstanceNames.push_back("i" + std::to_string(m_impl->rtInstances.size()));
+	if (m_impl->rtInstanceNames.size() <= m_impl->rtInstances.size())
+		m_impl->rtInstanceNames.push_back("i" + std::to_string(m_impl->rtInstances.size()));
 	m_impl->rtInstances.push_back(inst);
 }
 
@@ -547,8 +585,15 @@ void NukeDiligent::buildRTScene()
 
 	// Static skip: a byte-identical scene keeps last frame's TLAS/buffers untouched.
 	{
+		// FNV over 8-byte words (byte tail): the scene blob is tens of KB and this runs every
+		// frame, so the byte-at-a-time walk was itself showing up in the profile.
 		auto fnv = [](uint64_t h, const void* p, size_t n)
-		{ const unsigned char* b = (const unsigned char*)p; for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; } return h; };
+		{
+			const unsigned char* b = (const unsigned char*)p;
+			for (; n >= 8; b += 8, n -= 8) { uint64_t w; memcpy(&w, b, 8); h ^= w; h *= 1099511628211ull; }
+			for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+			return h;
+		};
 		uint64_t full = 1469598103934665603ull;
 		for (Uint32 i = 0; i < count; ++i)
 		{
