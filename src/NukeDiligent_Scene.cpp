@@ -405,8 +405,8 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		else if (mat->blendMode == 2 && wp.psoVcolAdd)   pso = wp.psoVcolAdd;
 		else                                             pso = wp.psoVcol;
 	}
-	else if (mat && mat->blendMode == 1 && wp.psoBlend) pso = wp.psoBlend;
-	else if (mat && mat->blendMode == 2 && wp.psoAdd)   pso = wp.psoAdd;
+	else if (mat && mat->blendMode == 1) { if (!wp.psoBlend) return; pso = wp.psoBlend; }   // blend stage not landed: no opaque flash
+	else if (mat && mat->blendMode == 2) { if (!wp.psoAdd) return;   pso = wp.psoAdd; }
 	else if (tessF > 0.0f)
 	{
 		pso = wp.psoTess; srb = wp.srbTess;
@@ -1449,7 +1449,8 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	IDeviceContext* ctx = m_impl->context;
 	IPipelineState* pso = wp.psoInst;
 	if (m_impl->wireframe && wp.psoInstWire) pso = wp.psoInstWire;
-	else if (mat) { if (mat->blendMode == 1 && wp.psoInstBlend) pso = wp.psoInstBlend; else if (mat->blendMode == 2 && wp.psoInstAdd) pso = wp.psoInstAdd; }
+	else if (mat && mat->blendMode == 1) { if (!wp.psoInstBlend) return; pso = wp.psoInstBlend; }   // blend stage pending
+	else if (mat && mat->blendMode == 2) { if (!wp.psoInstAdd) return;   pso = wp.psoInstAdd; }
 	// Consecutive chunks share vertex buffers + PSO — bind once; any plain draw resets lastInstBind.
 	if (m_impl->lastInstBind.mesh != (const void*)gp || m_impl->lastInstBind.buf != instBuf ||
 	    m_impl->lastInstBind.pso != (void*)pso || m_impl->lastInstBind.pass != m_impl->passSerial)

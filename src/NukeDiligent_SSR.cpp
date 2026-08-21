@@ -342,7 +342,7 @@ void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 	// selects LODs against the PREVIOUS camera and mismatches the beauty pass geometry.
 	m_impl->lodCamPos[0] = cam.camPos[0]; m_impl->lodCamPos[1] = cam.camPos[1]; m_impl->lodCamPos[2] = cam.camPos[2];
 	m_impl->gbufActive = false;
-	if (!m_impl->gbufPSO) return;
+	if (!m_impl->gbufPSO || m_impl->gbufBuilding) return;   // not built yet / being (re)built in the background
 	int w = 0, h = 0;
 	if (!m_impl->CameraSize(cam, w, h)) return;
 	m_impl->EnsureGBuffer(w, h);

@@ -1,4 +1,5 @@
 #include "NukeDiligentImpl.h"
+#include "API/Model/StatusBar.h"   // "compiling: ..." field while the builder thread works
 
 // Overlay-slot texture names, generated to stay in lock-step with kOvSlots (the HLSL declares
 // g_Ov{slot}{Alb|Nrm|MR|Mask} + g_Mask3D; the G-buffer set has no albedos).
@@ -146,6 +147,10 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	dfbd.BindFlags = BIND_UNIFORM_BUFFER; dfbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(dfbd, nullptr, &drawFlagsCB);
 
+	// The boot stand-in world pipeline: synchronous and tiny, so the very first frame draws the
+	// scene unlit-textured while the real world pipelines build in the background.
+	BuildBootPipe();
+
 	// Foliage bend compute (bend.cs): bends merged chunk meshes so their BLAS sways with the wind.
 	// Shares nukebend.hlsl with the raster VS shaders and BendCB with setWind. RT-only.
 	if (rtSupported)
@@ -172,7 +177,7 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 				};
 				cci.PSODesc.ResourceLayout.Variables = cvars; cci.PSODesc.ResourceLayout.NumVariables = 4;
 				cci.pCS = csh;
-				device->CreateComputePipelineState(cci, &bendCSPSO);
+				CreateComputePipelineStateCached(cci, &bendCSPSO);
 				if (bendCSPSO)
 				{
 					if (auto* v = bendCSPSO->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "BendCB"))       v->Set(bendCB);
@@ -220,7 +225,7 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 				};
 				cci.PSODesc.ResourceLayout.Variables = cvars; cci.PSODesc.ResourceLayout.NumVariables = 10;
 				cci.pCS = csh;
-				device->CreateComputePipelineState(cci, &skinCSPSO);
+				CreateComputePipelineStateCached(cci, &skinCSPSO);
 				if (skinCSPSO)
 				{
 					if (auto* v = skinCSPSO->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "SkinCSParams")) v->Set(skinCSParamsCB);
@@ -404,12 +409,14 @@ void NukeDiligent::Impl::EnsureOutlineMask(int w, int h)
 
 // Build (or rebuild in place) the blend-variant PSOs + SRB into `wp` at the current `samples`.
 // Rebuilding in place keeps existing material->shader handles valid.
-bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg)
+bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg,
+                                        IShaderSourceInputStreamFactory* factory, int stages)
 {
 	if (vsSrc.empty() || psSrc.empty()) return false;
+	if (!factory) factory = shaderFactory;
 	ShaderCreateInfo sci;
 	sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
-	sci.pShaderSourceStreamFactory = shaderFactory;   // resolves #include "nukebend.hlsl"
+	sci.pShaderSourceStreamFactory = factory;   // resolves #include "nukebend.hlsl"
 	// Inline RayQuery needs DXC at SM6.5; unsupported devices keep the default FXC SM5 path.
 	ShaderMacro rtMacro[] = {{"RT_ENABLED", "1"}};
 	if (rtSupported)
@@ -522,10 +529,14 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.pso.Release(); wp.psoBlend.Release(); wp.psoAdd.Release(); wp.psoWire.Release(); wp.srb.Release();
 	memset(wp.lastBind, 0, sizeof(wp.lastBind)); memset(wp.lastBindI, 0, sizeof(wp.lastBindI));   // fresh SRBs hold nothing
 
-	// 1) Opaque — blend off, depth write on.
-	CreateGraphicsPipelineStateCached(ci, &wp.pso);
-	if (!wp.pso) { cout << "[NukeDiligent]\tPSO build failed for shader '" << dbg << "'" << endl; return false; }
-	setStatics(wp.pso);
+	// 1) Opaque — blend off, depth write on. (Stage gating: a later-stage build skips the
+	//    variants another stage owns; the state setup still runs so each block sees the same ci.)
+	if (stages & kStageBase)
+	{
+		CreateGraphicsPipelineStateCached(ci, &wp.pso);
+		if (!wp.pso) { cout << "[NukeDiligent]\tPSO build failed for shader '" << dbg << "'" << endl; return false; }
+		setStatics(wp.pso);
+	}
 
 	// 2) Transparent — straight-alpha blend, depth test on but no depth write.
 	{
@@ -535,7 +546,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		rt.SrcBlendAlpha = BLEND_FACTOR_ONE;  rt.DestBlendAlpha = BLEND_FACTOR_INV_SRC_ALPHA; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
 		ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = False;
 		ci.PSODesc.Name = "World (blend)";
-		CreateGraphicsPipelineStateCached(ci, &wp.psoBlend);
+		if (stages & kStageBlend) CreateGraphicsPipelineStateCached(ci, &wp.psoBlend);
 		if (wp.psoBlend) setStatics(wp.psoBlend);
 	}
 	// 3) Additive — src*a + dst, depth write off.
@@ -545,7 +556,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		rt.SrcBlend = BLEND_FACTOR_SRC_ALPHA; rt.DestBlend = BLEND_FACTOR_ONE; rt.BlendOp = BLEND_OPERATION_ADD;
 		rt.SrcBlendAlpha = BLEND_FACTOR_ONE;  rt.DestBlendAlpha = BLEND_FACTOR_ONE; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
 		ci.PSODesc.Name = "World (add)";
-		CreateGraphicsPipelineStateCached(ci, &wp.psoAdd);
+		if (stages & kStageBlend) CreateGraphicsPipelineStateCached(ci, &wp.psoAdd);
 		if (wp.psoAdd) setStatics(wp.psoAdd);
 	}
 	// 4) Wireframe — opaque state with line fill.
@@ -554,7 +565,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = True;
 		ci.GraphicsPipeline.RasterizerDesc.FillMode = FILL_MODE_WIREFRAME;
 		ci.PSODesc.Name = "World (wire)";
-		CreateGraphicsPipelineStateCached(ci, &wp.psoWire);
+		if (stages & kStageWire) CreateGraphicsPipelineStateCached(ci, &wp.psoWire);
 		if (wp.psoWire) setStatics(wp.psoWire);
 	}
 
@@ -562,7 +573,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	//     the plain PSOs, so wp.srb serves them; chosen per draw when the mesh has a color
 	//     stream and the material asks for tint/overlay-mask.
 	wp.psoVcol.Release(); wp.psoVcolBlend.Release(); wp.psoVcolAdd.Release();
-	if (vsSrc.find("NUKE_VCTINT") != std::string::npos && psSrc.find("NUKE_VCTINT") != std::string::npos)
+	if ((stages & kStageExtra) && vsSrc.find("NUKE_VCTINT") != std::string::npos && psSrc.find("NUKE_VCTINT") != std::string::npos)
 	{
 		const std::string vsV = "#define NUKE_VCTINT 1\n" + vsSrc;
 		const std::string psV = "#define NUKE_VCTINT 1\n" + psSrc;
@@ -626,7 +637,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		cout << "[NukeDiligent]\ttess SKIPPED ('" << dbg << "'): "
 		     << (!device->GetDeviceInfo().Features.Tessellation ? "device has no tessellation"
 		                                                        : "sources lack NUKE_TESS/g_Disp") << endl;
-	if (device->GetDeviceInfo().Features.Tessellation && tessOptIn)
+	if ((stages & kStageExtra) && device->GetDeviceInfo().Features.Tessellation && tessOptIn)
 	{
 		// Custom hull/domain sources (terrain splat displacement) override the shared pair.
 		const std::string hsSrc = wp.hsSrc.empty() ? shaderSource("world.hs") : wp.hsSrc;
@@ -635,7 +646,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		{
 			const std::string vsT = "#define NUKE_TESS 1\n" + vsSrc;
 			ShaderCreateInfo sciT; sciT.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
-			sciT.pShaderSourceStreamFactory = shaderFactory;
+			sciT.pShaderSourceStreamFactory = factory;
 			// ALL tess-PSO stages through DXC (water precedent): glslang hull/domain SPIR-V
 			// breaks on NVIDIA — the driver dies inside pipeline creation.
 			sciT.ShaderCompiler = SHADER_COMPILER_DXC;
@@ -705,6 +716,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		}
 	}
 
+	if (stages & kStageBase)
+	{
 	wp.pso->CreateShaderResourceBinding(&wp.srb, true);
 	// Vulkan: cbuffers may reflect as MUTABLE, so bind through the SRB as well as the statics.
 	if (auto* d = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "DrawFlagsCB")) d->Set(drawFlagsCB);
@@ -730,6 +743,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	for (const std::string& n : extraNames)
 		if (auto* v = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, n.c_str()))
 			wp.extraVars.push_back({ n, v, nullptr });
+	}
 
 	// Instanced variants — only for shaders that opt in by handling NUKE_INSTANCED. Same sources
 	// with the define prepended; the layout gains 5 per-instance float4 attributes in slot 3.
@@ -765,10 +779,13 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 			ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = True;
 			ci.GraphicsPipeline.RasterizerDesc.FillMode = FILL_MODE_SOLID;
 			ci.PSODesc.Name = "World (inst)";
-			CreateGraphicsPipelineStateCached(ci, &wp.psoInst);
-			if (wp.psoInst)
+			if (stages & kStageBase)
 			{
-				setStatics(wp.psoInst);
+				CreateGraphicsPipelineStateCached(ci, &wp.psoInst);
+				if (wp.psoInst) setStatics(wp.psoInst);
+				else cout << "[NukeDiligent]\tinstanced PSO build failed for shader '" << dbg << "'" << endl;
+			}
+			{
 				// 2) Transparent.
 				{
 					auto& rt = ci.GraphicsPipeline.BlendDesc.RenderTargets[0];
@@ -777,7 +794,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 					rt.SrcBlendAlpha = BLEND_FACTOR_ONE;  rt.DestBlendAlpha = BLEND_FACTOR_INV_SRC_ALPHA; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
 					ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = False;
 					ci.PSODesc.Name = "World (inst blend)";
-					CreateGraphicsPipelineStateCached(ci, &wp.psoInstBlend);
+					if (stages & kStageBlend) CreateGraphicsPipelineStateCached(ci, &wp.psoInstBlend);
 					if (wp.psoInstBlend) setStatics(wp.psoInstBlend);
 				}
 				// 3) Additive.
@@ -787,7 +804,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 					rt.SrcBlend = BLEND_FACTOR_SRC_ALPHA; rt.DestBlend = BLEND_FACTOR_ONE; rt.BlendOp = BLEND_OPERATION_ADD;
 					rt.SrcBlendAlpha = BLEND_FACTOR_ONE;  rt.DestBlendAlpha = BLEND_FACTOR_ONE; rt.BlendOpAlpha = BLEND_OPERATION_ADD;
 					ci.PSODesc.Name = "World (inst add)";
-					CreateGraphicsPipelineStateCached(ci, &wp.psoInstAdd);
+					if (stages & kStageBlend) CreateGraphicsPipelineStateCached(ci, &wp.psoInstAdd);
 					if (wp.psoInstAdd) setStatics(wp.psoInstAdd);
 				}
 				// 4) Wireframe.
@@ -796,9 +813,11 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 					ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = True;
 					ci.GraphicsPipeline.RasterizerDesc.FillMode = FILL_MODE_WIREFRAME;
 					ci.PSODesc.Name = "World (inst wire)";
-					CreateGraphicsPipelineStateCached(ci, &wp.psoInstWire);
+					if (stages & kStageWire) CreateGraphicsPipelineStateCached(ci, &wp.psoInstWire);
 					if (wp.psoInstWire) setStatics(wp.psoInstWire);
 				}
+				if (wp.psoInst)
+				{
 				wp.psoInst->CreateShaderResourceBinding(&wp.srbInst, true);
 				// Vulkan: cbuffers may reflect as MUTABLE, and one unbound descriptor invalidates
 				// the whole set — bind BendCB through the SRB as well as the statics.
@@ -822,9 +841,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				wp.flowVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Flow");
 				wp.mskVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_MskStamp");
 				wp.refrVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneRefr");
+				}
 			}
-			else
-				cout << "[NukeDiligent]\tinstanced PSO build failed for shader '" << dbg << "'" << endl;
 		}
 	}
 	return true;
@@ -839,15 +857,11 @@ uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::s
 	WorldPipe wp;
 	wp.vsSrc = vsSrc; wp.psSrc = psSrc; wp.dbg = dbg;   // kept so the warm-up can (re)build it
 	wp.hsSrc = hsSrc; wp.dsSrc = dsSrc;                 // custom tess stages (terrain)
-	// The default pipeline is the fallback for everything else, so it cannot be deferred.
-	const bool isDefault = (defaultWorldHandle == 0);
-	if (isDefault)
-	{
-		if (!BuildWorldPipe(wp, vsSrc, psSrc, dbg)) return 0;
-		wp.builtSamples = samples; wp.builtFmt = SceneFmt();
-	}
+	// Nothing is built here — not even the default pipeline: the builder thread takes every
+	// pipe in registration order (default first) and the draw path skips what is not ready.
 	uint64_t h = nextShaderHandle++;
 	worldPipes[h] = std::move(wp);
+	RequestPipeBuild(h, kStageBase);
 	// Custom shaders can register AFTER the warm pump finished its sweep (module OnLoad, shader
 	// hot-reload) — re-arm the renderer's own entry or the new pipe never builds and every draw
 	// silently falls back to the default pipeline.
@@ -855,24 +869,229 @@ uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::s
 	return h;
 }
 
-// Builds one stale pipeline set per call and returns false to be resumed next frame. Driven by
-// the warm-up pump — nothing here may run from a draw.
-bool NukeDiligent::Impl::WarmEnginePipelines()
+// The boot pipeline: boot.vs/boot.ps through the regular world-pipe builder, base stage only,
+// on the calling thread (tens of milliseconds — it is three tiny shaders).
+void NukeDiligent::Impl::BuildBootPipe()
 {
-	const TEXTURE_FORMAT fmt = SceneFmt();
-	for (auto& kv : worldPipes)
+	const std::string vs = shaderSource("boot.vs"), ps = shaderSource("boot.ps");
+	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tboot shaders missing — no stand-in while pipelines build" << endl; return; }
+	WorldPipe np;
+	np.vsSrc = vs; np.psSrc = ps; np.dbg = "World (boot)";
+	const double t0 = nuke::Log::Uptime();
+	if (!BuildWorldPipe(np, vs, ps, "World (boot)", nullptr, kStageBase)) { cout << "[NukeDiligent]\tboot pipeline FAILED" << endl; return; }
+	np.builtSamples = samples; np.builtFmt = SceneFmt(); np.builtStages = kStageBase;
+	TrashPipe(bootPipe);
+	bootPipe = std::move(np);
+	cout << "[NukeDiligent]\tboot pipeline ready in " << (int)((nuke::Log::Uptime() - t0) * 1000.0) << " ms" << endl;
+}
+
+// ---- background pipeline builder ----------------------------------------------------------------
+
+void NukeDiligent::Impl::StartPipeBuilder()
+{
+	if (pipeThreadStarted) return;
+	pipeThreadStarted = true; pipeStop = false;
+	// ONE thread, measured: Vulkan pipeline creation is serialized inside the driver/Diligent,
+	// and a 4-thread pool made every set 3-4x slower (World 3.6 s -> 15 s) while also delaying
+	// the render thread. The vector stays so the pool can grow if a backend ever scales.
+	pipeThreads.emplace_back([this] { PipeBuilderLoop(); });
+}
+
+void NukeDiligent::Impl::StopPipeBuilder()
+{
+	if (!pipeThreadStarted) return;
 	{
-		WorldPipe& wp = kv.second;
-		if (wp.buildFailed || (wp.builtSamples == samples && wp.builtFmt == fmt)) continue;
-		if (!BuildWorldPipe(wp, wp.vsSrc, wp.psSrc, wp.dbg.c_str()))
+		boost::lock_guard<boost::mutex> l(pipeMutex);
+		pipeStop = true;
+		buildQueue.clear();
+	}
+	pipeCv.notify_all();
+	for (boost::thread& t : pipeThreads) if (t.joinable()) t.join();
+	pipeThreads.clear();
+	pipeThreadStarted = false;
+	boost::lock_guard<boost::mutex> l(pipeMutex);
+	pipeDone.clear(); jobDone.clear();   // never adopted: the objects die here, before the device does
+	nuke::StatusBar::Remove("build");
+}
+
+// Sorted insert: lower prio first, arrival order within a prio. Wakes the builder.
+void NukeDiligent::Impl::EnqueueItem(BuildItem&& it)
+{
+	StartPipeBuilder();
+	{
+		boost::lock_guard<boost::mutex> l(pipeMutex);
+		it.seq = ++buildSeq;
+		auto pos = buildQueue.begin();
+		while (pos != buildQueue.end() && pos->prio <= it.prio) ++pos;
+		buildQueue.insert(pos, std::move(it));
+	}
+	pipeCv.notify_one();
+}
+
+void NukeDiligent::Impl::EnqueueBuild(const boost::function<void()>& build, const boost::function<void()>& adopt,
+                                      int prio, const char* name)
+{
+	auto j = std::make_shared<BuildJob>();
+	j->build = build; j->adopt = adopt; j->name = name ? name : "";
+	BuildItem it; it.prio = prio; it.job = j;
+	EnqueueItem(std::move(it));
+}
+
+void NukeDiligent::Impl::PipeBuilderLoop()
+{
+	BuilderThreadFlag() = true;
+	for (;;)
+	{
+		BuildItem it;
+		size_t left = 0;
+		{
+			boost::unique_lock<boost::mutex> l(pipeMutex);
+			while (!pipeStop && buildQueue.empty()) pipeCv.wait(l);
+			if (pipeStop) return;
+			it = std::move(buildQueue.front());
+			buildQueue.erase(buildQueue.begin());
+			left = buildQueue.size();
+		}
+		// What the builder is on right now, for the status bar ("compiling: World (base) · 7 more").
+		{
+			std::string what = it.job ? it.job->name : (it.pipe->pipe.dbg + " (" +
+				(it.pipe->stage == kStageBase ? "base" : it.pipe->stage == kStageBlend ? "blend" : it.pipe->stage == kStageExtra ? "extra" : "wire") + ")");
+			if (what.empty()) what = "pipelines";
+			nuke::StatusBar::Message("build", "compiling: " + what + (left ? " (" + std::to_string(left) + " more)" : std::string()), 10, 0.0);
+		}
+		if (it.job)
+		{
+			if (it.job->build) it.job->build();
+			boost::lock_guard<boost::mutex> l(pipeMutex);
+			if (pipeStop) return;
+			jobDone.push_back(it.job);
+		}
+		else
+		{
+			std::shared_ptr<PipeBuild> b = it.pipe;
+			const double t0 = nuke::Log::Uptime();
+			b->ok = BuildWorldPipe(b->pipe, b->pipe.vsSrc, b->pipe.psSrc, b->pipe.dbg.c_str(), b->factory, b->stage);
+			std::cout << "[NukeDiligent]\tworld pipeline '" << b->pipe.dbg << "' stage " << b->stage << (b->ok ? " built" : " FAILED")
+			          << " in " << (int)((nuke::Log::Uptime() - t0) * 1000.0) << " ms (background)" << std::endl;
+			boost::lock_guard<boost::mutex> l(pipeMutex);
+			if (pipeStop) return;
+			pipeDone.push_back(b);
+		}
+		if (left == 0) nuke::StatusBar::Remove("build");
+	}
+}
+
+void NukeDiligent::Impl::RequestPipeBuild(uint64_t h, int stage)
+{
+	// Diagnostic (NUKE_NO_PIPE_BUILD=1): never build world pipes — everything stays on the boot
+	// stand-in, which is how the stand-in itself gets looked at.
+	static const bool noBuild = std::getenv("NUKE_NO_PIPE_BUILD") != nullptr;
+	if (noBuild) return;
+	auto it = worldPipes.find(h);
+	if (it == worldPipes.end() || it->second.building) return;
+	WorldPipe& wp = it->second;
+	wp.building = true;
+	auto b = std::make_shared<PipeBuild>();
+	b->handle = h; b->stage = stage;
+	b->pipe.vsSrc = wp.vsSrc; b->pipe.psSrc = wp.psSrc; b->pipe.dbg = wp.dbg;
+	// Shared tess pair resolved NOW: the builder must not read the source map the render
+	// thread may be rewriting (shader hot reload).
+	b->pipe.hsSrc = wp.hsSrc.empty() ? shaderSource("world.hs") : wp.hsSrc;
+	b->pipe.dsSrc = wp.dsSrc.empty() ? shaderSource("world.ds") : wp.dsSrc;
+	b->samples = samples; b->fmt = SceneFmt();
+	b->factory = shaderFactory;
+	BuildItem item;
+	item.prio = stage == kStageBase ? kPrioBase : stage == kStageBlend ? kPrioBlend : stage == kStageExtra ? kPrioExtra : kPrioWire;
+	item.pipe = b;
+	EnqueueItem(std::move(item));
+}
+
+void NukeDiligent::Impl::TrashPipe(WorldPipe& wp)
+{
+	Trash(wp.pso); Trash(wp.psoBlend); Trash(wp.psoAdd); Trash(wp.psoWire);
+	Trash(wp.psoVcol); Trash(wp.psoVcolBlend); Trash(wp.psoVcolAdd);
+	Trash(wp.psoTess); Trash(wp.srbTess); Trash(wp.srb);
+	Trash(wp.psoInst); Trash(wp.psoInstBlend); Trash(wp.psoInstAdd); Trash(wp.psoInstWire); Trash(wp.srbInst);
+}
+
+void NukeDiligent::Impl::AdoptBuiltPipes()
+{
+	std::vector<std::shared_ptr<PipeBuild>> done;
+	std::vector<std::shared_ptr<BuildJob>>  jobs;
+	{
+		boost::lock_guard<boost::mutex> l(pipeMutex);
+		if (pipeDone.empty() && jobDone.empty()) return;
+		done.swap(pipeDone); jobs.swap(jobDone);
+	}
+	for (auto& j : jobs) if (j->adopt) j->adopt();
+	for (auto& b : done)
+	{
+		auto it = worldPipes.find(b->handle);
+		if (it == worldPipes.end()) continue;   // shader unregistered meanwhile: objects die with the build
+		WorldPipe& wp = it->second;
+		wp.building = false;
+		if (!b->ok)
 		{
 			wp.buildFailed = true;   // latch: the draw keeps falling back to the default pipe
 			std::cout << "[NukeDiligent]\tworld pipeline FAILED: " << wp.dbg << std::endl;
 			continue;
 		}
-		wp.builtSamples = samples; wp.builtFmt = fmt;
-		return false;   // one pipeline per frame
+		// A build for another sample count / format than the current one is stale on arrival:
+		// drop it, the warm-up re-requests against the current pair.
+		if (b->samples != samples || b->fmt != SceneFmt()) { TrashPipe(b->pipe); continue; }
+		WorldPipe& np = b->pipe;
+		if (b->stage == kStageBase)
+		{
+			// Base replaces the pipe wholesale (SRBs + variable handles live here); the other
+			// stages are rebuilt on top of it. Old objects may still be in this frame's list.
+			TrashPipe(wp);
+			np.builtSamples = b->samples; np.builtFmt = b->fmt;
+			np.building = false; np.buildFailed = false; np.builtStages = kStageBase;
+			wp = std::move(np);
+		}
+		else
+		{
+			auto take = [&](RefCntAutoPtr<IPipelineState>& dst, RefCntAutoPtr<IPipelineState>& src) { Trash(dst); dst = std::move(src); };
+			auto takeS = [&](RefCntAutoPtr<IShaderResourceBinding>& dst, RefCntAutoPtr<IShaderResourceBinding>& src) { Trash(dst); dst = std::move(src); };
+			if (b->stage == kStageBlend)
+			{ take(wp.psoBlend, np.psoBlend); take(wp.psoAdd, np.psoAdd); take(wp.psoInstBlend, np.psoInstBlend); take(wp.psoInstAdd, np.psoInstAdd); }
+			else if (b->stage == kStageExtra)
+			{ take(wp.psoVcol, np.psoVcol); take(wp.psoVcolBlend, np.psoVcolBlend); take(wp.psoVcolAdd, np.psoVcolAdd); take(wp.psoTess, np.psoTess); takeS(wp.srbTess, np.srbTess); }
+			else if (b->stage == kStageWire)
+			{ take(wp.psoWire, np.psoWire); take(wp.psoInstWire, np.psoInstWire); }
+			wp.builtStages |= b->stage;
+		}
+		// Per-draw gates hold pointers into the retired set: drop them.
+		sceneCommitSrb = nullptr; matCBFor = nullptr; tessBindMat = nullptr; lastInstBind.pso = nullptr;
 	}
+}
+
+// Builds one stale pipeline set per call and returns false to be resumed next frame. Driven by
+// the warm-up pump — nothing here may run from a draw.
+bool NukeDiligent::Impl::WarmEnginePipelines()
+{
+	const TEXTURE_FORMAT fmt = SceneFmt();
+	AdoptBuiltPipes();
+	// Stale / never-built world pipes go to the builder thread stage by stage (base first —
+	// the queue orders by priority across ALL shaders, so every shader's opaque pipes land
+	// before anyone's blend/extra/wire); the pump stays pending until every stage is adopted.
+	bool pending = false;
+	auto consider = [&](uint64_t h, WorldPipe& wp)
+	{
+		if (wp.buildFailed) return;
+		const bool stale = !(wp.builtSamples == samples && wp.builtFmt == fmt);
+		if (stale) wp.builtStages = 0;   // a new sample count / format: everything again, base first
+		if (!stale && wp.builtStages == kStageAll) return;
+		pending = true;
+		if (wp.building) return;
+		const int next = !(wp.builtStages & kStageBase) || stale ? kStageBase
+		               : !(wp.builtStages & kStageBlend) ? kStageBlend
+		               : !(wp.builtStages & kStageExtra) ? kStageExtra : kStageWire;
+		RequestPipeBuild(h, next);
+	};
+	if (auto d = worldPipes.find(defaultWorldHandle); d != worldPipes.end()) consider(d->first, d->second);
+	for (auto& kv : worldPipes) if (kv.first != defaultWorldHandle) consider(kv.first, kv.second);
+	if (pending) return false;
 	if (!skyStamp.current(samples, fmt))     { CreateSkyResources();    skyStamp.stamp(samples, fmt);     return false; }
 	if (!debugStamp.current(samples, fmt))   { CreateDebugResources();  debugStamp.stamp(samples, fmt);   return false; }
 	if (!spriteStamp.current(samples, fmt))  { CreateSpriteResources(); spriteStamp.stamp(samples, fmt);  return false; }
@@ -888,16 +1107,9 @@ bool NukeDiligent::Impl::WarmEnginePipelines()
 void NukeDiligent::Impl::RebuildForMSAA()
 {
 	skyStamp = debugStamp = spriteStamp = decalStamp = outlineStamp = PipeStamp{};
-	// The default world pipeline is everyone's fallback: it is rebuilt here, not deferred.
-	auto dit = worldPipes.find(defaultWorldHandle);
-	if (dit != worldPipes.end())
-	{
-		WorldPipe& wp = dit->second;
-		if (BuildWorldPipe(wp, wp.vsSrc, wp.psSrc, wp.dbg.c_str()))
-		{
-			wp.builtSamples = samples; wp.builtFmt = SceneFmt();
-		}
-	}
+	BuildBootPipe();   // synchronous (tiny): the stand-in must match the new sample count at once
+	// World pipes (the default first) are rebuilt by the builder thread via the warm-up pump;
+	// until they land the draw skips them — a moment of things fading back in, no frozen frame.
 	for (WarmEntry& e : warmups) e.done = false;   // every builder gets another look
 	TrashRT(backbufferMS);
 	backbufferMS = RT{};   // recreated on next target-0 camera

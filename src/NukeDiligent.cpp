@@ -781,6 +781,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 	if (m_impl->hdrOutput && !m_impl->useVulkan)
 		m_impl->SetupHDROutput();   // HDR10 colour space via DXGI — D3D backends only for now
 
+	m_impl->InitPSOCache();   // before the first pipeline: every creation goes through the cache
 	const SwapChainDesc& scd = m_impl->swapChain->GetDesc();
 	m_impl->CreateUIPipeline(scd.ColorBufferFormat, scd.DepthBufferFormat);
 	m_impl->CreateWorldPipeline();
@@ -921,8 +922,10 @@ int NukeDiligent::render()
 	m_impl->vpPresentQueue.clear();
 	// D3D detached windows get their pixels via GDI from offscreen RTs (no secondary swap chains).
 	m_impl->BlitHostWindows();
+	m_impl->AdoptBuiltPipes();      // publish what the builder thread finished (pipes + jobs)
 	m_impl->PumpPipelineWarmup();   // build a slice of the pending pipelines, off the draw path
 	m_impl->PollShaderSaves();      // persist finished background compiles into the disk cache
+	m_impl->SavePSOCache(false);    // ...and the driver pipeline blobs (throttled, when new ones appeared)
 	return 1;
 }
 
@@ -991,6 +994,13 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 	const bfs::path file = dir / (std::string(hex) + ".bin");
 
 	boost::system::error_code ec;
+	const double t0 = nuke::Log::Uptime();
+	auto report = [&](const char* what)
+	{
+		const double ms = (nuke::Log::Uptime() - t0) * 1000.0;
+		if (ms > 30.0)
+			cout << "[NukeDiligent]\tshader '" << (ci.Desc.Name ? ci.Desc.Name : "?") << "' " << what << " " << (int)ms << " ms" << endl;
+	};
 	if (bfs::exists(file, ec))
 	{
 		bfs::ifstream f(file, std::ios::binary);
@@ -1002,7 +1012,7 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 			c2.ByteCode = bytes.data();
 			c2.ByteCodeSize = bytes.size();
 			device->CreateShader(c2, pp);
-			if (*pp) return;   // corrupt/stale bytecode falls through to a fresh compile
+			if (*pp) { report("cache load"); return; }   // corrupt/stale bytecode falls through to a fresh compile
 			cout << "[NukeDiligent]\tshader cache entry rejected, recompiling (" << hex << ")" << endl;
 		}
 	}
@@ -1013,7 +1023,11 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 		cc.CompileFlags |= SHADER_COMPILE_FLAG_ASYNCHRONOUS;
 	device->CreateShader(cc, pp);
 	if (*pp)
+	{
+		std::lock_guard<std::mutex> lock(shaderSaveMutex);
 		pendingShaderSaves.emplace_back(RefCntAutoPtr<IShader>(*pp), file.string());
+	}
+	report((cc.CompileFlags & SHADER_COMPILE_FLAG_ASYNCHRONOUS) ? "COMPILE submit" : "COMPILE sync");
 }
 
 // Runs pending pipeline builders under a time budget. Called once per frame after the passes,
@@ -1038,10 +1052,66 @@ void NukeDiligent::Impl::PumpPipelineWarmup()
 	}
 }
 
+// Persistent driver pipeline cache: config/psocache_<backend>.bin. D3D11 has no such object
+// (the driver caches on its own); a stale/foreign blob is simply ignored by the driver.
+static boost::filesystem::path PSOCacheFile(bool vk, bool d3d12)
+{
+	const char* tag = vk ? "vk" : (d3d12 ? "d3d12" : "d3d11");
+	return boost::filesystem::path(nuke::Config::writableDir()) / "config" / (std::string("psocache_") + tag + ".bin");
+}
+
+void NukeDiligent::Impl::InitPSOCache()
+{
+	if (!device || (!useVulkan && !useD3D12)) return;
+	namespace bfs = boost::filesystem;
+	std::vector<char> bytes;
+	boost::system::error_code ec;
+	const bfs::path file = PSOCacheFile(useVulkan, useD3D12);
+	if (bfs::exists(file, ec))
+	{
+		bfs::ifstream f(file, std::ios::binary);
+		bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+	}
+	PipelineStateCacheCreateInfo ci;
+	ci.Desc.Name = "Nuke PSO cache";
+	ci.Desc.Mode = PSO_CACHE_MODE_LOAD_STORE;
+	ci.pCacheData = bytes.empty() ? nullptr : bytes.data();
+	ci.CacheDataSize = (Uint32)bytes.size();
+	device->CreatePipelineStateCache(ci, &psoCache);
+	cout << "[NukeDiligent]\tpipeline cache " << (psoCache ? "ready" : "UNAVAILABLE")
+	     << " (" << bytes.size() / 1024 << " KB loaded)" << endl;
+	psoCacheSavedAt = nuke::Log::Uptime();
+}
+
+void NukeDiligent::Impl::SavePSOCache(bool force)
+{
+	if (!psoCache || !psoCacheDirty) return;
+	const double now = nuke::Log::Uptime();
+	if (!force && now - psoCacheSavedAt < 5.0) return;   // batch: new pipelines keep arriving during warm-up
+	RefCntAutoPtr<IDataBlob> blob;
+	psoCache->GetData(&blob);
+	psoCacheDirty = false; psoCacheSavedAt = now;
+	if (!blob || !blob->GetSize()) return;
+	namespace bfs = boost::filesystem;
+	boost::system::error_code ec;
+	const bfs::path file = PSOCacheFile(useVulkan, useD3D12);
+	bfs::create_directories(file.parent_path(), ec);
+	const bfs::path tmp = file.string() + ".tmp";
+	{
+		bfs::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+		if (!f) return;
+		f.write((const char*)blob->GetConstDataPtr(), (std::streamsize)blob->GetSize());
+	}
+	bfs::rename(tmp, file, ec);   // atomic swap: a crash mid-write never leaves a torn cache
+	if (ec) { bfs::remove(file, ec); bfs::rename(tmp, file, ec); }
+	cout << "[NukeDiligent]\tpipeline cache saved (" << blob->GetSize() / 1024 << " KB)" << endl;
+}
+
 // Writes finished cache-miss compiles to disk; called once per frame, since an async
 // shader's bytecode only exists after its worker finishes.
 void NukeDiligent::Impl::PollShaderSaves()
 {
+	std::lock_guard<std::mutex> lock(shaderSaveMutex);
 	if (pendingShaderSaves.empty()) return;
 	namespace bfs = boost::filesystem;
 	for (size_t i = 0; i < pendingShaderSaves.size(); )
@@ -1069,6 +1139,8 @@ void NukeDiligent::Impl::PollShaderSaves()
 void NukeDiligent::deinit()
 {
 	for (auto& cb : m_impl->onClose) cb();
+	m_impl->StopPipeBuilder();    // join: no device call may still run on the builder thread
+	m_impl->SavePSOCache(true);   // pipelines built this session -> next start creates them warm
 	// Drain the GPU trash AFTER the queue settles — parked objects must not outlive the device.
 	if (m_impl->context && m_impl->device)
 	{

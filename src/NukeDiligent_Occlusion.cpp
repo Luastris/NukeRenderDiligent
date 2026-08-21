@@ -70,7 +70,7 @@ void NukeDiligent::Impl::CreateOcclResources()
 			};
 			cci.PSODesc.ResourceLayout.Variables = cvars; cci.PSODesc.ResourceLayout.NumVariables = 5;
 			cci.pCS = csh;
-			device->CreateComputePipelineState(cci, &occlCSPSO);
+			CreateComputePipelineStateCached(cci, &occlCSPSO);
 			if (occlCSPSO)
 			{
 				if (auto* v = occlCSPSO->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "OcclCB")) v->Set(occlCB);

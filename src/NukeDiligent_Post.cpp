@@ -88,7 +88,10 @@ void NukeDiligent::Impl::CreatePostResources()
 	// 2 float4x4 + 5 float4 (camera, params, water level/fade, water scatter, water absorb).
 	if (!rtRefCB) { BufferDesc d; d.Name = "RTRefCB"; d.Size = sizeof(float) * (32 + 4 * 6); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &rtRefCB); }
 	if (!taaCB) { BufferDesc d; d.Name = "TAACB"; d.Size = sizeof(float) * (16 * 4 + 4 * 2); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &taaCB); }
-	BuildGBufferPipe();
+	// G-buffer pipes (3 PSOs, ~0.5 s of driver work): built on the builder thread; the prepass
+	// stays off until they land (beginGBufferPass gates on gbufBuilding).
+	if (!gbufBuilding.exchange(true))
+		EnqueueBuild([this] { BuildGBufferPipe(); }, [this] { gbufBuilding = false; }, kPrioGBuffer, "G-buffer pipelines");
 
 	// Build one post PSO per output format: RGBA8 for RT targets, swap-chain format for the backbuffer.
 	auto buildPost = [&](TEXTURE_FORMAT fmt, const char* name,
@@ -193,7 +196,10 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 {
 	if (name == "rtreflect")   // built-in: a real ray-tracing pipeline + SBT, not a post PS
 	{
-		if (!rtSupported || !BuildRTPipeline()) return 0;
+		if (!rtSupported) return 0;
+		// The DXR pipeline (~0.7 s) builds in the background; the pass blits through until ready.
+		if (!rtPSO && !rtBuilding.exchange(true))
+			EnqueueBuild([this] { BuildRTPipeline(); }, [this] { rtBuilding = false; }, kPrioRT, "RT reflection pipeline");
 		PostPipe pp; pp.isRTRef = true;
 		uint64_t h = nextShaderHandle++; postPipes[h] = std::move(pp);
 		return h;

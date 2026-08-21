@@ -1,0 +1,30 @@
+diff --git a/Graphics/GraphicsEngineVulkan/src/PipelineStateVkImpl.cpp b/Graphics/GraphicsEngineVulkan/src/PipelineStateVkImpl.cpp
+--- a/Graphics/GraphicsEngineVulkan/src/PipelineStateVkImpl.cpp
++++ b/Graphics/GraphicsEngineVulkan/src/PipelineStateVkImpl.cpp
+@@ -1013,12 +1013,23 @@
+                 //     SPIR-V module not valid: DecorateStringGOOGLE requires one of the following extensions: SPV_GOOGLE_decorate_string
+                 // Optimizer also performs validation and may catch problems with the byte code.
+                 // NB: SPIRV offsets become INVALID after this operation.
++                // NUKE PATCH: strip ONLY. The legalization passes ran once at shader creation
++                // (ShaderVkImpl, glslang path) or inside DXC; repeating them here cost hundreds
++                // of milliseconds PER PIPELINE on large shaders and no cache could skip it.
+                 SPIRV_OPTIMIZATION_FLAGS OptimizationFlags = SPIRV_OPTIMIZATION_FLAG_STRIP_REFLECTION;
+-                if (pShaderResources->IsHLSLSource())
++                // NUKE PATCH: the optimizer parses and re-serializes the whole module just to
++                // find the GOOGLE reflection decorations — scan for them first (a linear pass
++                // over the instruction words) and skip the optimizer when there is nothing to strip.
++                bool HasReflection = false;
++                for (size_t w = 5; w < SPIRV.size();)
+                 {
+-                    OptimizationFlags |= SPIRV_OPTIMIZATION_FLAG_LEGALIZATION;
++                    const uint32_t Op  = SPIRV[w] & 0xFFFFu;
++                    const uint32_t Len = SPIRV[w] >> 16;
++                    if (Len == 0) break;
++                    if (Op == 5632 /*OpDecorateStringGOOGLE*/ || Op == 5633 /*OpMemberDecorateStringGOOGLE*/) { HasReflection = true; break; }
++                    w += Len;
+                 }
+-                std::vector<uint32_t> StrippedSPIRV = OptimizeSPIRV(SPIRV, OptimizationFlags);
++                std::vector<uint32_t> StrippedSPIRV = HasReflection ? OptimizeSPIRV(SPIRV, OptimizationFlags) : SPIRV;
+                 if (!StrippedSPIRV.empty())
+                     SPIRV = std::move(StrippedSPIRV);
+                 else

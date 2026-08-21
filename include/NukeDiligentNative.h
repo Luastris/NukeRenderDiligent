@@ -7,6 +7,7 @@
 // All calls are main-thread (render thread) only.
 
 #include <cstdint>
+#include <boost/function.hpp>   // EnqueueBuild callbacks
 
 // The consumer must add the DiligentCore interface dirs to its include path.
 #include "RenderDevice.h"
@@ -81,6 +82,13 @@ NUKEDLG_API bool GetShaderSource(const char* name, std::string& out);
 
 // Disk-cached shader/PSO compilation. Cache keys on source + includeEpoch, so setShaderSource
 // pushes invalidate dependents.
+// Background build: `build` runs on the renderer's builder thread (device-object creation
+// ONLY — never the device context), `adopt` on the render thread once it finished. Modules
+// keep their draws gated on a flag that `adopt` flips, so a cold start never freezes a frame.
+// `prio`: lower runs sooner (renderer: 0 = world base pipes, 5 = G-buffer, 10 = blend variants,
+// 12 = module default, 20 = extras, 25 = RT, 30 = wireframe). `name` shows in the status bar.
+NUKEDLG_API void EnqueueBuild(const boost::function<void()>& build, const boost::function<void()>& adopt,
+                              int prio = 12, const char* name = "");
 NUKEDLG_API void CreateShaderCached(Diligent::ShaderCreateInfo& sci, Diligent::IShader** out);
 NUKEDLG_API void CreateGraphicsPSOCached(Diligent::GraphicsPipelineStateCreateInfo& ci,
                                          Diligent::IPipelineState** out);

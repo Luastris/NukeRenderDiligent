@@ -104,12 +104,50 @@ if(EXISTS "${_nuke_dc_patch2}" AND Git_FOUND)
     endif()
 endif()
 
+# ---- addendum patch: no per-pipeline SPIR-V legalization (Vulkan PSO creation cost) --------
+# Diligent re-ran spirv-opt's legalization passes over every stage's SPIR-V at EVERY pipeline
+# creation (PipelineStateVkImpl::RemapOrVerifyShaderResources) — 0.3-0.5 s per pipeline on the
+# big world shaders, immune to every cache. Shaders are legalized once at creation (or by DXC);
+# the per-pipeline pass keeps only the reflection strip.
+set(_nuke_dc_patch3 "${CMAKE_CURRENT_SOURCE_DIR}/patches/DiligentCore-pso-legalize.patch")
+if(EXISTS "${_nuke_dc_patch3}" AND Git_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_nuke_dc_dir}" apply --check "${_nuke_dc_patch3}"
+                    RESULT_VARIABLE _nuke_dc3_applies OUTPUT_QUIET ERROR_QUIET)
+    if(_nuke_dc3_applies EQUAL 0)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_nuke_dc_dir}" apply "${_nuke_dc_patch3}")
+        message(STATUS "DiligentCore: NUKE pso-legalize patch applied")
+    else()
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_nuke_dc_dir}" apply --check --reverse "${_nuke_dc_patch3}"
+                        RESULT_VARIABLE _nuke_dc3_applied OUTPUT_QUIET ERROR_QUIET)
+        if(_nuke_dc3_applied EQUAL 0)
+            message(STATUS "DiligentCore: NUKE pso-legalize patch already applied")
+        else()
+            message(FATAL_ERROR "DiligentCore: patches/DiligentCore-pso-legalize.patch neither applies nor is applied — rebase it")
+        endif()
+    endif()
+endif()
+
+# Third-party code is OPTIMIZED even in the Debug configuration. Diligent's Vulkan backend
+# re-patches every shader's SPIR-V (SPIRV-Tools) and validates resources at EACH pipeline
+# creation; unoptimized that was 0.4-1 s per pipeline = ~20 s of frozen startup. The debug
+# CRT (/MDd) and the asserts stay — only /Od and /RTC1 go — so nothing mixes CRTs with the
+# renderer's own Debug objects.
+if(MSVC)
+    set(_nuke_saved_cxx_debug "${CMAKE_CXX_FLAGS_DEBUG}")
+    set(_nuke_saved_c_debug   "${CMAKE_C_FLAGS_DEBUG}")
+    set(CMAKE_CXX_FLAGS_DEBUG "/MDd /Zi /O2 /Ob2")
+    set(CMAKE_C_FLAGS_DEBUG   "/MDd /Zi /O2 /Ob2")
+endif()
 # The Windows dev tree vendors the full DiligentEngine meta-repo; a fresh (macOS/Linux)
 # checkout needs only DiligentCore — include whichever is present.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/DiligentEngine/CMakeLists.txt")
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/deps/DiligentEngine DiligentEngine)
 else()
     add_subdirectory(${_nuke_dc_dir} DiligentCore)
+endif()
+if(MSVC)
+    set(CMAKE_CXX_FLAGS_DEBUG "${_nuke_saved_cxx_debug}")
+    set(CMAKE_C_FLAGS_DEBUG   "${_nuke_saved_c_debug}")
 endif()
 # DiligentCore's combined mega-archive (its "ar -M" script) chokes on universal fat .a
 # files, and this project links the individual Diligent-* targets anyway — drop it from ALL.

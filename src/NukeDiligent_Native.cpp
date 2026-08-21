@@ -66,6 +66,12 @@ void CreateGraphicsPSOCached(Diligent::GraphicsPipelineStateCreateInfo& ci, Dili
 	if (NukeDiligent::nativeImpl && out) NukeDiligent::nativeImpl->CreateGraphicsPipelineStateCached(ci, out);
 }
 
+void EnqueueBuild(const boost::function<void()>& build, const boost::function<void()>& adopt, int prio, const char* name)
+{
+	if (NukeDiligent::nativeImpl) NukeDiligent::nativeImpl->EnqueueBuild(build, adopt, prio, name ? name : "");
+	else { if (build) build(); if (adopt) adopt(); }   // no renderer: run inline, same contract
+}
+
 void AddPipelineWarmup(const char* name, WarmupFn fn, void* user)
 {
 	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;

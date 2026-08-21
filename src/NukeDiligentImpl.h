@@ -101,6 +101,13 @@ extern "C" void  NukeCocoaSetHiddenFromCapture(GLFWwindow* wnd, bool hide);
 #include <unordered_map>
 #include <algorithm>
 #include <iostream>
+#include <cstdlib>   // getenv (diagnostic switches)
+#include <deque>
+#include <memory>
+#include <atomic>
+#include <boost/thread.hpp>                      // background pipeline builder
+#include <boost/thread/condition_variable.hpp>
+#include "API/Model/Log.h"   // Log::Uptime — startup-time accounting (PSO/shader creation stamps)
 #include <string>
 
 using namespace Diligent;
@@ -134,16 +141,62 @@ struct NukeDiligent::Impl
 	// Disk shader-bytecode cache (Vulkan only): key = FNV-1a of the full compile inputs, value =
 	// compiled SPIR-V under config/shadercache_vk/. A hit feeds ByteCode straight to CreateShader.
 	void CreateShaderCached(const Diligent::ShaderCreateInfo& ci, Diligent::IShader** pp);
+	// Persistent pipeline cache (VkPipelineCache / D3D12 pipeline library) — the driver's
+	// SPIR-V/DXIL -> ISA work is the startup cost (0.4-1 s PER pipeline on Vulkan); with the
+	// blob reloaded from disk a warm start creates pipelines in milliseconds.
+	RefCntAutoPtr<IPipelineStateCache> psoCache;
+	std::atomic<bool> psoCacheDirty{false};   // set from the builder thread too
+	double psoCacheSavedAt = 0.0;
+	void InitPSOCache();   // load config/psocache_<backend>.bin (after device creation)
+	void SavePSOCache(bool force);   // write when dirty (throttled) / at shutdown
 	void CreateGraphicsPipelineStateCached(const Diligent::GraphicsPipelineStateCreateInfo& ci, Diligent::IPipelineState** pp)
 	{
 		// Cache-miss shaders compile ASYNC on the worker pool — the PSO needs them ready.
+		const double t0 = nuke::Log::Uptime();
 		auto wait = [](Diligent::IShader* s) { if (s) s->GetStatus(true); };
 		wait(ci.pVS); wait(ci.pPS); wait(ci.pGS); wait(ci.pHS); wait(ci.pDS);
-		device->CreateGraphicsPipelineState(ci, pp);
+		const double t1 = nuke::Log::Uptime();
+		Diligent::GraphicsPipelineStateCreateInfo c2 = ci;
+		c2.pPSOCache = psoCache;
+		device->CreateGraphicsPipelineState(c2, pp);
+		if (*pp && psoCache) psoCacheDirty = true;
+		const double t2 = nuke::Log::Uptime();
+		// Diagnostic (NUKE_PSO_TWICE=1): create the identical pipeline again — a warm driver
+		// cache makes the repeat ~free, so whatever remains is the backend's own CPU work.
+		static const bool twice = std::getenv("NUKE_PSO_TWICE") != nullptr;
+		if (twice && *pp)
+		{
+			Diligent::RefCntAutoPtr<Diligent::IPipelineState> again;
+			device->CreateGraphicsPipelineState(c2, &again);
+			std::cout << "[NukeDiligent]\tPSO '" << (ci.PSODesc.Name ? ci.PSODesc.Name : "?") << "' REPEAT "
+			          << (int)((nuke::Log::Uptime() - t2) * 1000.0) << " ms" << std::endl;
+		}
+		const double msWait = (t1 - t0) * 1000.0;
+		const double msPso  = (t2 - t1) * 1000.0;
+		// Startup-time accounting: anything slow ON THE RENDER THREAD is a line in the log
+		// (stamped), not a mystery; the builder thread reports per pipe set instead.
+		if (msWait + msPso > 30.0 && !IsBuilderThread())
+			std::cout << "[NukeDiligent]\tPSO '" << (ci.PSODesc.Name ? ci.PSODesc.Name : "?") << "' " << (int)(msWait + msPso)
+			          << " ms (shader wait " << (int)msWait << ", pipeline " << (int)msPso << ")" << std::endl;
+	}
+	void CreateComputePipelineStateCached(const Diligent::ComputePipelineStateCreateInfo& ci, Diligent::IPipelineState** pp)
+	{
+		const double t0 = nuke::Log::Uptime();
+		if (ci.pCS) ci.pCS->GetStatus(true);
+		Diligent::ComputePipelineStateCreateInfo c2 = ci;
+		c2.pPSOCache = psoCache;
+		device->CreateComputePipelineState(c2, pp);
+		if (*pp && psoCache) psoCacheDirty = true;
+		const double ms = (nuke::Log::Uptime() - t0) * 1000.0;
+		if (ms > 30.0)
+			std::cout << "[NukeDiligent]\tPSO '" << (ci.PSODesc.Name ? ci.PSODesc.Name : "?") << "' " << (int)ms << " ms (compute)" << std::endl;
 	}
 	// Async cache misses: bytecode grabbed and written to disk once the worker finishes.
+	// Fed from the builder thread as well — hence the lock.
 	std::vector<std::pair<Diligent::RefCntAutoPtr<Diligent::IShader>, std::string>> pendingShaderSaves;
+	std::mutex shaderSaveMutex;
 	void PollShaderSaves();
+
 
 	// Pipeline warm-up. Everything that owns pipelines registers a builder here instead of
 	// compiling on the draw path: the loop runs the pending ones under a per-frame time budget,
@@ -548,7 +601,7 @@ struct NukeDiligent::Impl
 	std::unordered_map<std::string, std::string> rtSurfSources;  // shader name -> Surface() HLSL body
 	std::unordered_map<std::string, std::string> shaderHitGroup; // shader name -> hit-group name in the RT PSO
 	std::string GenChitSource(const std::string& name, const std::string& psSource);  // codegen the closest-hit HLSL
-	bool rtPipelineDirty = false;                              // a new surf shader appeared -> rebuild rtPSO
+	std::atomic<bool> rtPipelineDirty{false};                  // a new surf shader appeared -> rebuild rtPSO (set on the render thread, cleared by the builder)
 	std::vector<std::string> rtInstShaderGuid;                 // per-instance material shader name (-> hit group), parallel to rtInstances
 	std::vector<uint8_t>     allMatCPU;                        // concatenated per-instance MatCB blocks (kMatBlock each)
 	static const uint32_t    kMatBlock = 256;                  // per-instance material byte block (matches MatCB capacity)
@@ -642,9 +695,68 @@ struct NukeDiligent::Impl
 		Uint8          builtSamples = 0;
 		TEXTURE_FORMAT builtFmt = TEX_FORMAT_UNKNOWN;
 		bool           buildFailed = false;   // latched: a broken shader is not retried every frame
+		bool           building = false;      // a background build is in flight for this pipe
+		int            builtStages = 0;       // kStage* bits adopted so far (base first, the rest by priority)
 	};
+	// Build stages of a world pipe — what a draw needs first comes first, across ALL shaders:
+	// base (opaque + instanced opaque + SRBs: objects appear), blend (transparent/additive),
+	// extra (vertex-color tint, tessellation), wire (editor wireframe). Priorities interleave
+	// the module/G-buffer/RT jobs between them.
+	enum : int { kStageBase = 1, kStageBlend = 2, kStageExtra = 4, kStageWire = 8, kStageAll = 15 };
+	enum : int { kPrioBase = 0, kPrioGBuffer = 5, kPrioBlend = 10, kPrioModule = 12, kPrioExtra = 20, kPrioRT = 25, kPrioWire = 30 };
+	// The boot pipeline: a tiny unlit-textured world shader built synchronously at init (tens of
+	// ms). PipeFor hands it out while neither the shader's own pipe nor the default one exists,
+	// so the scene is on screen from the first frame and fades into full shading as the real
+	// pipelines land in the background.
+	WorldPipe bootPipe;
 	std::unordered_map<uint64_t, WorldPipe> worldPipes;   // shader handle -> pipeline
 	uint64_t                              defaultWorldHandle = 0;   // builtin "world" pipeline
+
+	// --- background pipeline builder --------------------------------------------------------
+	// World pipelines (13 variants per shader) are built on a dedicated thread: the Diligent
+	// device is thread-safe for object creation, the draw path already skips a pipe that is not
+	// ready (PipeFor falls back / returns null), so startup shows frames immediately and
+	// objects appear as their pipelines land — never a frozen window. Builds are snapshots
+	// (sources copied at request time); the render thread adopts finished results in the
+	// warm-up pump and parks the replaced GPU objects through Trash.
+	struct PipeBuild
+	{
+		uint64_t       handle = 0;
+		WorldPipe      pipe;                      // sources in, pipelines out
+		int            stage = kStageBase;        // which kStage* this build produces
+		Uint8          samples = 0;               // what it is being built for
+		TEXTURE_FORMAT fmt = TEX_FORMAT_UNKNOWN;
+		RefCntAutoPtr<IShaderSourceInputStreamFactory> factory;   // include resolver snapshot
+		bool           ok = false;
+	};
+	struct BuildJob { boost::function<void()> build, adopt; std::string name; };
+	// ONE priority queue for pipe stages and jobs: lower prio first, ties by arrival.
+	struct BuildItem { int prio = 0; uint64_t seq = 0; std::shared_ptr<PipeBuild> pipe; std::shared_ptr<BuildJob> job; };
+	std::vector<BuildItem>                  buildQueue;
+	uint64_t                                buildSeq = 0;
+	std::vector<std::shared_ptr<PipeBuild>> pipeDone;    // built, awaiting adoption
+	boost::mutex              pipeMutex;
+	boost::condition_variable pipeCv;
+	std::vector<boost::thread> pipeThreads;   // a small pool: pipes of different shaders build concurrently
+	bool                      pipeStop = false, pipeThreadStarted = false;
+	// Generic background build: `build` runs on the builder thread (device-object creation
+	// only — never the context), `adopt` on the render thread once it finished (publish flags,
+	// swap pointers). Used by the G-buffer/RT pipelines and by modules through the native hatch.
+	std::vector<std::shared_ptr<BuildJob>> jobDone;
+	void EnqueueBuild(const boost::function<void()>& build, const boost::function<void()>& adopt,
+	                  int prio = kPrioModule, const char* name = "");
+	void EnqueueItem(BuildItem&& it);   // sorted insert + wake
+	std::atomic<bool> gbufBuilding{false};   // G-buffer pipes in flight: the prepass skips
+	std::atomic<bool> rtBuilding{false};     // RT reflection pipeline in flight: the pass blits through
+	void BuildBootPipe();               // synchronous stand-in (boot.vs/ps), init + MSAA change
+	void StartPipeBuilder();
+	void StopPipeBuilder();
+	void PipeBuilderLoop();
+	static bool& BuilderThreadFlag() { static thread_local bool f = false; return f; }
+	static bool  IsBuilderThread() { return BuilderThreadFlag(); }
+	void RequestPipeBuild(uint64_t h, int stage);   // render thread: snapshot + enqueue one stage (one in flight per pipe)
+	void AdoptBuiltPipes();              // render thread: swap finished builds into worldPipes
+	void TrashPipe(WorldPipe& wp);       // park a pipe's GPU objects (may be in flight this frame)
 	// Sample count / scene format an auxiliary pipeline set was built for. Same contract as
 	// WorldPipe: the draw skips a stale set, the warm-up rebuilds one set per frame.
 	struct PipeStamp
@@ -667,6 +779,7 @@ struct NukeDiligent::Impl
 		if (it != worldPipes.end() && ok(it->second)) return &it->second;
 		auto d = worldPipes.find(defaultWorldHandle);
 		if (d != worldPipes.end() && ok(d->second)) return &d->second;
+		if (ok(bootPipe)) return &bootPipe;   // nothing real yet: the unlit boot shading
 		return nullptr;
 	}
 
@@ -896,7 +1009,10 @@ struct NukeDiligent::Impl
 	// Build a world-type PSO (fixed layout/CBs) from VS+PS source; store it under a handle.
 	uint64_t MakeWorldPSO(const std::string& vsSrc, const std::string& psSrc, const char* dbg,
 	                      const std::string& hsSrc = std::string(), const std::string& dsSrc = std::string());
-	bool     BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg);
+	// Builds every variant of one world pipeline into `wp` (any thread: touches only the device
+	// and `wp`). `factory` = the include resolver to use (a snapshot on the builder thread).
+	bool     BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg,
+	                        IShaderSourceInputStreamFactory* factory = nullptr, int stages = 15 /*kStageAll*/);
 	void     RebuildForMSAA();   // rebuild all sample-count-dependent pipelines + targets after `samples` changes
 	// ---- pooled mesh streams (TB-5) -----------------------------------------------------------
 	// Churn-free residency for pooled meshes (Mesh::pooled — terrain nodes): streams live as

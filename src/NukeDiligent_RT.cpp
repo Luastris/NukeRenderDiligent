@@ -855,14 +855,13 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	if (!dstTex || !srcSRV) return;
 	// TraceRays/CopyTexture must not target a still-bound render target — unbind first.
 	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
-	if (rtPipelineDirty)
-	{
-		BuildRTPipeline();   // a custom shader appeared/changed -> rebuild with its hit group
-		context->Flush();    // split the AS builds + cold DXR PSO off the frame's command list (TDR/timeout guard)
-	}
+	// A custom shader appeared/changed -> rebuild with its hit group, in the background; the
+	// pass passes the colour through until the new pipeline lands.
+	if (rtPipelineDirty && !rtBuilding.exchange(true))
+		EnqueueBuild([this] { BuildRTPipeline(); }, [this] { rtBuilding = false; }, kPrioRT, "RT reflection pipeline");
 	// No scene to trace -> pass the chain colour through. Must be BlitTexture, not CopyTexture:
 	// source and destination formats differ (RGBA8 scene vs RGBA16F scratch).
-	if (!rtPSO || !rtSBT || !rtSceneReady || !tlas)
+	if (rtBuilding || !rtPSO || !rtSBT || !rtSceneReady || !tlas)
 	{
 		BlitTexture(srcSRV, dstTex);
 		return;
