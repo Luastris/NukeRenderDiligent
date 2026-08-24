@@ -631,7 +631,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.psoTess.Release(); wp.srbTess.Release();
 	const bool tessOptIn = vsSrc.find("NUKE_TESS") != std::string::npos
 	                    && psSrc.find("g_Disp") != std::string::npos;
-	if (!wp.hsSrc.empty() && (!device->GetDeviceInfo().Features.Tessellation || !tessOptIn))
+	if ((stages & kStageBase) && !wp.hsSrc.empty() && (!device->GetDeviceInfo().Features.Tessellation || !tessOptIn))
 		// A shader SHIPPING custom hull/domain stages expects tessellation — say WHY it's off
 		// instead of silently rendering flat (undebuggable from the editor).
 		cout << "[NukeDiligent]\ttess SKIPPED ('" << dbg << "'): "

@@ -174,6 +174,7 @@ add_library(NukeRenderDiligent SHARED
     src/NukeDiligent_Profile.cpp
     src/NukeDiligent_Native.cpp
     src/NukeDiligent_Occlusion.cpp
+    src/NukeDiligent_Storage.cpp
 )
 if(APPLE)
     target_sources(NukeRenderDiligent PRIVATE src/NukeDiligent_Cocoa.mm)   # CAMetalLayer shim
@@ -221,6 +222,7 @@ if(WIN32)
         shell32 user32   # ExtractIconEx + SendMessage(WM_SETICON) for the window icon
         dwmapi           # DwmSetWindowAttribute — dark title bar
         dcomp            # DirectComposition — per-pixel window transparency (Game.SetTransparent)
+        version          # GetFileVersionInfo — DirectStorage runtime build in the self-test verdict key
     )
 else()
     # Deuterium (macOS/Linux): Vulkan is the only backend; deps come from the vcpkg toolchain,
@@ -352,7 +354,14 @@ if(WIN32)
                 "${CMAKE_CURRENT_SOURCE_DIR}/deps/dxc/dxcompiler.dll" "${EDITOR_DIR}/"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/deps/dxc/dxil.dll" "${EDITOR_DIR}/"
-        COMMENT "Deploying NukeRenderDiligent.dll + glfw3.dll + DXC (dxcompiler/dxil)"
+        # DirectStorage runtime (vcpkg port "dstorage": the Microsoft redistributable). Loaded by
+        # name at runtime by the D3D12 provider — absent DLLs mean CPU pak reads, never a failed
+        # module load. dstoragecore.dll is dstorage.dll's own dependency.
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${VCPKG_INSTALLED}/bin/dstorage.dll" "${EDITOR_DIR}/"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${VCPKG_INSTALLED}/bin/dstoragecore.dll" "${EDITOR_DIR}/"
+        COMMENT "Deploying NukeRenderDiligent.dll + glfw3.dll + DXC (dxcompiler/dxil) + DirectStorage"
     )
 elseif(APPLE)
     # ---- vendored UNIVERSAL MoltenVK (download-and-run games) --------------------------------

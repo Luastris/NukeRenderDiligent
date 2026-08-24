@@ -48,7 +48,7 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 		auto rit = rts.find(t->rtId);
 		return rit != rts.end() ? rit->second.srv : nullptr;
 	}
-	if (t->pixels.empty() || t->width <= 0 || t->height <= 0) return nullptr;
+	if (!t->HasPixelData() || t->width <= 0 || t->height <= 0) return nullptr;
 
 	if (t->frameCount > 1)   // animated (GIF): a separate Texture2D per frame; return the current frame's SRV
 	{
@@ -92,6 +92,18 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 			if (st != streamTex.end())
 				base = st->second.residentBase = StreamDesiredBase(t, st->second.lastDist);
 		}
+		// Pak-resident pixels: DirectStorage streams them into VRAM — this draw goes without
+		// the texture, the adopter publishes it when it lands. No provider / a failed pak read:
+		// pull the pixels on the CPU and upload as always.
+		if (t->pixels.empty() && t->pakSource)
+		{
+			if (dstor && !storFailed.count(t))
+			{
+				if (!storPendingTex.count(t) && StorageRequestTex(t, base, false)) storPendingTex.insert(t);
+				return nullptr;
+			}
+			if (!t->EnsurePixels()) return nullptr;
+		}
 		RefCntAutoPtr<ITexture> tex = CreateEngineTex(t, base);
 		// Never cache a failed upload: the cache must only ever hold a live SRV, so it self-heals on retry.
 		if (!tex)
@@ -118,6 +130,7 @@ RefCntAutoPtr<ITexture> NukeDiligent::Impl::CreateEngineTex(Texture* t, int base
 		const int  mips = t->mipCount < 1 ? 1 : t->mipCount;
 		if (baseMip < 0) baseMip = 0;
 		if (baseMip > mips - 1) baseMip = mips - 1;
+		baseMip = AlignedBase(t, baseMip);
 		TextureDesc td; td.Type = RESOURCE_DIM_TEX_2D;
 		td.Width  = (Uint32)std::max(1, t->width  >> baseMip);
 		td.Height = (Uint32)std::max(1, t->height >> baseMip);
@@ -165,12 +178,21 @@ bool NukeDiligent::Impl::StreamEligible(Texture* t) const
 	return t->mipCount >= 4 && std::max(t->width, t->height) >= 256;
 }
 
+// A BC resource's top level must be a multiple of 4 on D3D12/Vulkan; an NPOT chain's lower
+// levels (4000 -> 250 -> 125 -> 62) cannot head a resource. Walk back to a level that can.
+int NukeDiligent::Impl::AlignedBase(Texture* t, int base)
+{
+	if (t->format != Texture::FMT_BC1 && t->format != Texture::FMT_BC3 && t->format != Texture::FMT_BC5) return base;
+	while (base > 0 && (((t->width >> base) & 3) || ((t->height >> base) & 3))) --base;
+	return base;
+}
+
 // The always-resident tail: first mip whose larger dimension is <= 64.
 int NukeDiligent::Impl::StreamTailBase(Texture* t)
 {
 	int base = 0, dim = std::max(t->width, t->height);
 	while (dim > 64 && base < t->mipCount - 1) { dim >>= 1; ++base; }
-	return base;
+	return AlignedBase(t, base);
 }
 
 long long NukeDiligent::Impl::StreamBytes(Texture* t, int base)
@@ -192,7 +214,7 @@ int NukeDiligent::Impl::StreamDesiredBase(Texture* t, float dist) const
 	int b = 0; float d = dist;
 	while (d > kFullResDist && b < 30) { d *= 0.5f; ++b; }
 	const int tail = StreamTailBase(t);
-	return b > tail ? tail : b;
+	return AlignedBase(t, b > tail ? tail : b);
 }
 
 // Per-draw feedback from the world passes: the nearest use this frame drives residency.
@@ -264,6 +286,19 @@ void NukeDiligent::Impl::StreamPump()
 		if (rebuilds >= kMaxRebuilds || uploaded >= kMaxUploadBytes) continue;
 		auto tc = texCache.find(c.t);
 		if (tc == texCache.end()) { s.residentBase = c.target; continue; }   // not on GPU yet: born at target
+		if (c.t->pixels.empty() && c.t->pakSource && dstor && !storFailed.count(c.t))
+		{
+			// Re-target through DirectStorage: the old object stays bound until the new one lands.
+			if (storPendingTex.count(c.t)) continue;
+			if (!StorageRequestTex(c.t, c.target, false)) continue;
+			storPendingTex.insert(c.t);
+			uploaded += StreamBytes(c.t, c.target);
+			++rebuilds;
+			s.residentBase = c.target;
+			s.wantLowerFrames = 0;
+			continue;
+		}
+		if (c.t->pixels.empty() && !c.t->EnsurePixels()) continue;
 		RefCntAutoPtr<ITexture> fresh = CreateEngineTex(c.t, c.target);
 		if (!fresh) continue;
 		Trash(tc->second);
@@ -818,6 +853,8 @@ void NukeDiligent::invalidateTexture(Texture* t)   // re-uploaded on next GetTex
 		m_impl->animTex.erase(at);
 	}
 	m_impl->streamTex.erase(t);   // the pointer may be about to die; feedback re-registers it
+	m_impl->storPendingTex.erase(t);   // an in-flight DirectStorage job lands into the trash
+	m_impl->storFailed.erase(t);
 }
 
 void NukeDiligent::invalidateMesh(Mesh* m)

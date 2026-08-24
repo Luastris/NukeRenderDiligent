@@ -782,6 +782,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 		m_impl->SetupHDROutput();   // HDR10 colour space via DXGI — D3D backends only for now
 
 	m_impl->InitPSOCache();   // before the first pipeline: every creation goes through the cache
+	m_impl->StorageInit();    // DirectStorage provider (D3D12): pak reads + VRAM-direct textures
 	const SwapChainDesc& scd = m_impl->swapChain->GetDesc();
 	m_impl->CreateUIPipeline(scd.ColorBufferFormat, scd.DepthBufferFormat);
 	m_impl->CreateWorldPipeline();
@@ -923,6 +924,7 @@ int NukeDiligent::render()
 	// D3D detached windows get their pixels via GDI from offscreen RTs (no secondary swap chains).
 	m_impl->BlitHostWindows();
 	m_impl->AdoptBuiltPipes();      // publish what the builder thread finished (pipes + jobs)
+	m_impl->StoragePump();          // publish textures DirectStorage landed; issue prefetches
 	m_impl->PumpPipelineWarmup();   // build a slice of the pending pipelines, off the draw path
 	m_impl->PollShaderSaves();      // persist finished background compiles into the disk cache
 	m_impl->SavePSOCache(false);    // ...and the driver pipeline blobs (throttled, when new ones appeared)
@@ -1140,6 +1142,7 @@ void NukeDiligent::deinit()
 {
 	for (auto& cb : m_impl->onClose) cb();
 	m_impl->StopPipeBuilder();    // join: no device call may still run on the builder thread
+	m_impl->StorageShutdown();    // every DirectStorage request lands before its destinations die
 	m_impl->SavePSOCache(true);   // pipelines built this session -> next start creates them warm
 	// Drain the GPU trash AFTER the queue settles — parked objects must not outlive the device.
 	if (m_impl->context && m_impl->device)

@@ -99,6 +99,7 @@ extern "C" void  NukeCocoaSetHiddenFromCapture(GLFWwindow* wnd, bool hide);
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <iostream>
 #include <cstdlib>   // getenv (diagnostic switches)
@@ -1094,10 +1095,26 @@ struct NukeDiligent::Impl
 	void StreamPump();                               // per-frame residency step
 	bool StreamEligible(Texture* t) const;           // BC + mip chain + not animated/RT
 	static int StreamTailBase(Texture* t);           // base where max dim <= 64 (always resident)
+	static int AlignedBase(Texture* t, int base);    // BC: a resource's top level must be 4-aligned (NPOT chains)
 	static long long StreamBytes(Texture* t, int base);   // GPU bytes of mips [base..last]
 	int  StreamDesiredBase(Texture* t, float dist) const; // distance -> first-resident mip
 	RefCntAutoPtr<ITexture> CreateEngineTex(Texture* t, int baseMip);   // factored BC/RGBA8 upload
 	std::unordered_map<Texture*, std::vector<RefCntAutoPtr<ITexture>>> animTex;   // GIF: one Texture2D per frame
+
+	// ---- Fast loading 4: DirectStorage provider (NukeDiligent_Storage.cpp, D3D12 only) -------
+	// Pak-resident textures (Texture::pakSource) stream into VRAM through DirectStorage: the draw
+	// that needs one queues it and draws without it until it lands (the adopter publishes it to
+	// texCache); the content scan prefetches every registered texture at low priority.
+	struct StorTexJob; struct StorMemJob; struct StorQueue; struct DStor;
+	DStor* dstor = nullptr;
+	std::unordered_set<Texture*> storPendingTex;   // requested, not landed
+	std::unordered_set<Texture*> storFailed;       // pak path failed: CPU decode on the next draw
+	uint64_t storLanded = 0;
+	void StorageInit();                                    // after device creation
+	void StorageShutdown();                                // before the device dies
+	void StoragePump();                                    // render thread, once per frame
+	bool StorageRequestTex(Texture* t, int base, bool low);   // queue mips [base..] into a fresh GPU texture
+	void StorageVerify(Texture* t, ITexture* tex, int base);  // NUKE_DSTORAGE_VERIFY readback check
 	float4x4 curView, curProj;   // set in beginCamera, used in renderObject
 
 	// Selection outline (editor): pass 1 renders the selected mesh into a mask RT; pass 2 is a
