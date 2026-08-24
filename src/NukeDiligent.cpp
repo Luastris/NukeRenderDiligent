@@ -940,6 +940,8 @@ int NukeDiligent::render()
 		for (auto& cb : m_impl->onGUI) cb();
 	}
 
+	m_impl->DrawCursorPass();   // software cursor: topmost, over the finished UI
+
 	if (m_impl->DeviceRemoved()) return 1;   // device lost this frame: skip present, keep the app alive
 	if (s_frameDbg) dt4 = dbgclock::now();
 	m_impl->swapChain->Present(m_impl->vsync ? 1 : 0);   // SyncInterval 1 = vsync, 0 = uncapped
@@ -1322,6 +1324,64 @@ void NukeDiligent::setCursorMode(int mode)
 	m_cursorMode = mode;
 }
 int NukeDiligent::getCursorMode() { return m_cursorMode; }
+
+// Custom cursor (see irender.h): hardware = cached GLFW cursor per id; software = cached
+// texture per id, drawn by DrawCursorPass. Does not override setCursorMode's capture/hide.
+bool NukeDiligent::setCursorImage(uint64_t id, const unsigned char* rgba, int w, int h,
+                                  int hotX, int hotY, int mode)
+{
+	if (!m_window) return false;
+	m_impl->cursorWindow = m_window;
+	if (mode == 0 || !rgba || w <= 0 || h <= 0)
+	{
+		glfwSetCursor(m_window, nullptr);
+		if (m_impl->curCursorMode == 2 && m_cursorMode == 0)
+			glfwSetInputMode(m_window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);   // undo the software hide
+		m_impl->curCursorId = 0;
+		m_impl->curCursorMode = 0;
+		return true;
+	}
+	if (mode == 1)
+	{
+		GLFWcursor*& cur = m_impl->hwCursors[id];
+		if (!cur)
+		{
+			GLFWimage img{ w, h, const_cast<unsigned char*>(rgba) };   // GLFW copies the pixels
+			cur = glfwCreateCursor(&img, hotX, hotY);
+			if (!cur) { m_impl->hwCursors.erase(id); return false; }
+		}
+		if (m_impl->curCursorMode == 2 && m_cursorMode == 0)
+			glfwSetInputMode(m_window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+		glfwSetCursor(m_window, cur);
+		m_impl->curCursorId = id;
+		m_impl->curCursorMode = 1;
+		return true;
+	}
+	// mode 2: software — upload the frame once, hide the OS cursor, DrawCursorPass paints it.
+	auto& sw = m_impl->swCursors[id];
+	if (!sw.tex)
+	{
+		TextureDesc td;
+		td.Name      = "cursor frame";
+		td.Type      = RESOURCE_DIM_TEX_2D;
+		td.Width     = (Uint32)w;
+		td.Height    = (Uint32)h;
+		td.Format    = TEX_FORMAT_RGBA8_UNORM;
+		td.BindFlags = BIND_SHADER_RESOURCE;
+		TextureSubResData sub{ rgba, (Uint64)w * 4 };
+		TextureData data{ &sub, 1 };
+		m_impl->device->CreateTexture(td, &data, &sw.tex);
+		if (!sw.tex) { m_impl->swCursors.erase(id); return false; }
+		sw.w = w; sw.h = h;
+	}
+	sw.hotX = hotX; sw.hotY = hotY;
+	if (m_cursorMode == 0)
+		glfwSetInputMode(m_window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
+	glfwSetCursor(m_window, nullptr);
+	m_impl->curCursorId = id;
+	m_impl->curCursorMode = 2;
+	return true;
+}
 bool NukeDiligent::isMouseButtonDown(int b) { return m_window && glfwGetMouseButton(m_window, b) == GLFW_PRESS; }
 
 // Desktop file-drop -> editor import (one renderer instance, so a file-static callback is fine).

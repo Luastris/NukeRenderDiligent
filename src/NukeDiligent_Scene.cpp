@@ -1035,6 +1035,96 @@ void NukeDiligent::Impl::DrawEditorGridPass()
 	context->Draw(da);
 }
 
+// Software cursor: alpha-blended textured quad at the cursor position, into the backbuffer.
+void NukeDiligent::Impl::DrawCursorPass()
+{
+	if (curCursorMode != 2 || !cursorWindow) return;
+	auto it = swCursors.find(curCursorId);
+	if (it == swCursors.end() || !it->second.tex) return;
+	SwCursor& sw = it->second;
+
+	const TEXTURE_FORMAT fmt = swapChain->GetDesc().ColorBufferFormat;
+	if (!cursorPSO || cursorFmt != fmt)
+	{
+		if (cursorPSO) Trash(cursorPSO);
+		cursorPSO.Release();
+		for (auto& kv : swCursors) kv.second.srb.Release();
+		std::string vsSrc = shaderSource("cursor.vs"), psSrc = shaderSource("cursor.ps");
+		if (vsSrc.empty() || psSrc.empty()) return;
+		if (!cursorCB)
+		{
+			BufferDesc cbd; cbd.Name = "CursorCB"; cbd.Size = sizeof(float) * 8;
+			cbd.Usage = USAGE_DYNAMIC; cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
+			device->CreateBuffer(cbd, nullptr, &cursorCB);
+			if (!cursorCB) return;
+		}
+		ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+		RefCntAutoPtr<IShader> v, p;
+		sci.Desc = {"Cursor VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); CreateShaderCached(sci, &v);
+		sci.Desc = {"Cursor PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); CreateShaderCached(sci, &p);
+		if (!v || !p) return;
+		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Cursor PSO";
+		auto& gp = ci.GraphicsPipeline;
+		gp.NumRenderTargets = 1; gp.RTVFormats[0] = fmt;
+		gp.DSVFormat = swapChain->GetDesc().DepthBufferFormat;
+		gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+		gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
+		gp.DepthStencilDesc.DepthEnable = False;
+		gp.DepthStencilDesc.DepthWriteEnable = False;
+		auto& rt0 = gp.BlendDesc.RenderTargets[0];
+		rt0.BlendEnable = True;
+		rt0.SrcBlend = BLEND_FACTOR_SRC_ALPHA;  rt0.DestBlend = BLEND_FACTOR_INV_SRC_ALPHA;
+		rt0.SrcBlendAlpha = BLEND_FACTOR_ZERO;  rt0.DestBlendAlpha = BLEND_FACTOR_ONE;
+		ShaderResourceVariableDesc vars[] = {
+			{ SHADER_TYPE_PIXEL, "g_Tex", SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE },
+		};
+		SamplerDesc smp;
+		smp.MinFilter = FILTER_TYPE_LINEAR; smp.MagFilter = FILTER_TYPE_LINEAR; smp.MipFilter = FILTER_TYPE_POINT;
+		smp.AddressU = TEXTURE_ADDRESS_CLAMP; smp.AddressV = TEXTURE_ADDRESS_CLAMP; smp.AddressW = TEXTURE_ADDRESS_CLAMP;
+		ImmutableSamplerDesc samplers[] = { { SHADER_TYPE_PIXEL, "g_Tex", smp } };
+		ci.PSODesc.ResourceLayout.Variables = vars;
+		ci.PSODesc.ResourceLayout.NumVariables = 1;
+		ci.PSODesc.ResourceLayout.ImmutableSamplers = samplers;
+		ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+		ci.pVS = v; ci.pPS = p;
+		CreateGraphicsPipelineStateCached(ci, &cursorPSO);
+		if (!cursorPSO) return;
+		if (auto* sv = cursorPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CursorCB")) sv->Set(cursorCB);
+		cursorFmt = fmt;
+	}
+	if (!sw.srb)
+	{
+		cursorPSO->CreateShaderResourceBinding(&sw.srb, true);
+		if (!sw.srb) return;
+		if (auto* tv = sw.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex"))
+			tv->Set(sw.tex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	}
+
+	double mx = 0.0, my = 0.0;
+	glfwGetCursorPos(cursorWindow, &mx, &my);
+	int ww = 0, wh = 0, fbw = 0, fbh = 0;
+	glfwGetWindowSize(cursorWindow, &ww, &wh);
+	glfwGetFramebufferSize(cursorWindow, &fbw, &fbh);
+	if (fbw <= 0 || fbh <= 0 || ww <= 0 || wh <= 0) return;
+	// Cursor position is in window coords; the quad draws in framebuffer pixels.
+	const float sx = (float)fbw / (float)ww, sy = (float)fbh / (float)wh;
+	struct CB { float rect[4]; float screen[4]; };
+	{
+		MapHelper<CB> cb(context, cursorCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		cb->rect[0] = (float)(mx - sw.hotX) * sx;
+		cb->rect[1] = (float)(my - sw.hotY) * sy;
+		cb->rect[2] = (float)sw.w * sx;
+		cb->rect[3] = (float)sw.h * sy;
+		cb->screen[0] = (float)fbw; cb->screen[1] = (float)fbh;
+		cb->screen[2] = 0.0f; cb->screen[3] = 0.0f;
+	}
+	context->SetVertexBuffers(0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	context->SetPipelineState(cursorPSO);
+	context->CommitShaderResources(sw.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{6, DRAW_FLAG_VERIFY_STATES};
+	context->Draw(da);
+}
+
 void NukeDiligent::endCamera()
 {
 	if (m_impl->occlPassActive) endOpaque();   // engine skipped the opaque-scope close: never drop geometry

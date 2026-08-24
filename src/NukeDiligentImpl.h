@@ -933,6 +933,24 @@ struct NukeDiligent::Impl
 	int            gridSamples = 0;
 	TEXTURE_FORMAT gridFmt     = TEX_FORMAT_UNKNOWN;
 	float          gridStep    = 0.0f;      // per-frame handover from the editor (0 = hidden)
+
+	// Custom cursors: hardware = cached GLFW cursors, software = cached textures drawn by
+	// DrawCursorPass after the UI.
+	std::map<uint64_t, GLFWcursor*> hwCursors;
+	struct SwCursor
+	{
+		RefCntAutoPtr<ITexture>               tex;
+		RefCntAutoPtr<IShaderResourceBinding> srb;
+		int w = 0, h = 0, hotX = 0, hotY = 0;
+	};
+	std::map<uint64_t, SwCursor> swCursors;
+	GLFWwindow* cursorWindow = nullptr;
+	uint64_t curCursorId  = 0;      // active id (0 = none/OS arrow)
+	int      curCursorMode = 0;     // 0 arrow / 1 hardware / 2 software
+	RefCntAutoPtr<IPipelineState> cursorPSO;
+	RefCntAutoPtr<IBuffer>        cursorCB;
+	TEXTURE_FORMAT cursorFmt = TEX_FORMAT_UNKNOWN;
+	void DrawCursorPass();          // software cursor: draw over the finished backbuffer
 	void DrawEditorGridPass();              // endCamera, before DrawDepthDebugLines
 	std::vector<float> debugVertsDepth;   // 7 floats per vertex (shares debugMutex + debugVB)
 	void DrawDepthDebugLines();

@@ -78,6 +78,8 @@ public:
 	void getCursorPos(double& x, double& y) override;
 	void setCursorMode(int mode) override;
 	int  getCursorMode() override;
+	bool setCursorImage(uint64_t id, const unsigned char* rgba, int w, int h,
+	                    int hotX, int hotY, int mode) override;
 	// GPU instancing
 	uint64_t createInstanceBuffer() override;
 	void     updateInstanceBuffer(uint64_t id, const NukeInstanceData* data, int count) override;
