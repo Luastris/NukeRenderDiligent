@@ -1035,34 +1035,30 @@ void NukeDiligent::Impl::DrawEditorGridPass()
 	context->Draw(da);
 }
 
-// Software cursor: alpha-blended textured quad at the cursor position, into the backbuffer.
-void NukeDiligent::Impl::DrawCursorPass()
+// The cursor/overlay screen-quad PSO (cursor.vs/ps); rebuilt when the swapchain format changes.
+bool NukeDiligent::Impl::EnsureCursorPSO()
 {
-	if (curCursorMode != 2 || !cursorWindow) return;
-	auto it = swCursors.find(curCursorId);
-	if (it == swCursors.end() || !it->second.tex) return;
-	SwCursor& sw = it->second;
-
 	const TEXTURE_FORMAT fmt = swapChain->GetDesc().ColorBufferFormat;
 	if (!cursorPSO || cursorFmt != fmt)
 	{
 		if (cursorPSO) Trash(cursorPSO);
 		cursorPSO.Release();
 		for (auto& kv : swCursors) kv.second.srb.Release();
+		overlaySRB.Release(); overlayLastSRV = nullptr;
 		std::string vsSrc = shaderSource("cursor.vs"), psSrc = shaderSource("cursor.ps");
-		if (vsSrc.empty() || psSrc.empty()) return;
+		if (vsSrc.empty() || psSrc.empty()) return false;
 		if (!cursorCB)
 		{
 			BufferDesc cbd; cbd.Name = "CursorCB"; cbd.Size = sizeof(float) * 8;
 			cbd.Usage = USAGE_DYNAMIC; cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 			device->CreateBuffer(cbd, nullptr, &cursorCB);
-			if (!cursorCB) return;
+			if (!cursorCB) return false;
 		}
 		ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 		RefCntAutoPtr<IShader> v, p;
 		sci.Desc = {"Cursor VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); CreateShaderCached(sci, &v);
 		sci.Desc = {"Cursor PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); CreateShaderCached(sci, &p);
-		if (!v || !p) return;
+		if (!v || !p) return false;
 		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Cursor PSO";
 		auto& gp = ci.GraphicsPipeline;
 		gp.NumRenderTargets = 1; gp.RTVFormats[0] = fmt;
@@ -1088,10 +1084,20 @@ void NukeDiligent::Impl::DrawCursorPass()
 		ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
 		ci.pVS = v; ci.pPS = p;
 		CreateGraphicsPipelineStateCached(ci, &cursorPSO);
-		if (!cursorPSO) return;
+		if (!cursorPSO) return false;
 		if (auto* sv = cursorPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CursorCB")) sv->Set(cursorCB);
 		cursorFmt = fmt;
 	}
+	return true;
+}
+
+void NukeDiligent::Impl::DrawCursorPass()
+{
+	if (curCursorMode != 2 || !cursorWindow) return;
+	auto it = swCursors.find(curCursorId);
+	if (it == swCursors.end() || !it->second.tex) return;
+	SwCursor& sw = it->second;
+	if (!EnsureCursorPSO()) return;
 	if (!sw.srb)
 	{
 		cursorPSO->CreateShaderResourceBinding(&sw.srb, true);
@@ -1121,6 +1127,44 @@ void NukeDiligent::Impl::DrawCursorPass()
 	context->SetVertexBuffers(0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	context->SetPipelineState(cursorPSO);
 	context->CommitShaderResources(sw.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{6, DRAW_FLAG_VERIFY_STATES};
+	context->Draw(da);
+}
+
+// Fullscreen video overlay: the engine texture drawn letterboxed over the finished frame.
+void NukeDiligent::Impl::DrawOverlayPass()
+{
+	if (!overlayTex) return;
+	ITextureView* srv = GetTexSRV(overlayTex);
+	if (!srv || !EnsureCursorPSO()) return;
+	if (!overlaySRB || overlayLastSRV != srv)
+	{
+		overlaySRB.Release();
+		cursorPSO->CreateShaderResourceBinding(&overlaySRB, true);
+		if (!overlaySRB) return;
+		if (auto* tv = overlaySRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex")) tv->Set(srv);
+		overlayLastSRV = srv;
+	}
+	int fbwI = 0, fbhI = 0;
+	if (cursorWindow) glfwGetFramebufferSize(cursorWindow, &fbwI, &fbhI);
+	const float fbw = (float)(fbwI > 0 ? fbwI : 1), fbh = (float)(fbhI > 0 ? fbhI : 1);
+	const float vw = (float)(overlayTex->width > 0 ? overlayTex->width : 1);
+	const float vh = (float)(overlayTex->height > 0 ? overlayTex->height : 1);
+	const float s  = std::min(fbw / vw, fbh / vh);   // Fit: letterboxed
+	const float qw = vw * s, qh = vh * s;
+	struct CB { float rect[4]; float screen[4]; };
+	{
+		MapHelper<CB> cb(context, cursorCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		cb->rect[0] = (fbw - qw) * 0.5f;
+		cb->rect[1] = (fbh - qh) * 0.5f;
+		cb->rect[2] = qw;
+		cb->rect[3] = qh;
+		cb->screen[0] = fbw; cb->screen[1] = fbh;
+		cb->screen[2] = 0.0f; cb->screen[3] = 0.0f;
+	}
+	context->SetVertexBuffers(0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	context->SetPipelineState(cursorPSO);
+	context->CommitShaderResources(overlaySRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{6, DRAW_FLAG_VERIFY_STATES};
 	context->Draw(da);
 }

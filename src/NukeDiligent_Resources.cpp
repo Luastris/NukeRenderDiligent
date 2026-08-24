@@ -50,6 +50,42 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 	}
 	if (!t->HasPixelData() || t->width <= 0 || t->height <= 0) return nullptr;
 
+	// Dynamic textures (E8 video): USAGE_DEFAULT + in-place UpdateTexture when the owner
+	// bumped dynamicVersion. RGBA8 mip0 only by contract (Texture.h).
+	if (t->dynamic)
+	{
+		if (t->pixels.size() < (size_t)t->width * t->height * 4) return nullptr;
+		auto it = texCache.find(t);
+		if (it == texCache.end() || !it->second)
+		{
+			TextureDesc td;
+			td.Name      = "dynamic texture";
+			td.Type      = RESOURCE_DIM_TEX_2D;
+			td.Width     = (Uint32)t->width;
+			td.Height    = (Uint32)t->height;
+			td.Format    = TEX_FORMAT_RGBA8_UNORM;
+			td.Usage     = USAGE_DEFAULT;
+			td.BindFlags = BIND_SHADER_RESOURCE;
+			TextureSubResData sub{ t->pixels.data(), (Uint64)t->width * 4 };
+			TextureData data{ &sub, 1 };
+			RefCntAutoPtr<ITexture> tex;
+			device->CreateTexture(td, &data, &tex);
+			if (!tex) return nullptr;
+			it = texCache.emplace(t, tex).first;
+			dynTexVersion[t] = t->dynamicVersion;
+		}
+		auto vt = dynTexVersion.find(t);
+		if (vt == dynTexVersion.end() || vt->second != t->dynamicVersion)
+		{
+			Box box(0, (Uint32)t->width, 0, (Uint32)t->height);
+			TextureSubResData sub{ t->pixels.data(), (Uint64)t->width * 4 };
+			context->UpdateTexture(it->second, 0, 0, box, sub,
+			                       RESOURCE_STATE_TRANSITION_MODE_TRANSITION, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			dynTexVersion[t] = t->dynamicVersion;
+		}
+		return it->second->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+	}
+
 	if (t->frameCount > 1)   // animated (GIF): a separate Texture2D per frame; return the current frame's SRV
 	{
 		auto av = animTex.find(t);
@@ -846,6 +882,7 @@ void NukeDiligent::invalidateTexture(Texture* t)   // re-uploaded on next GetTex
 	// The old SRV may still sit in this frame's recorded UI draw data — park, don't free inline.
 	auto it = m_impl->texCache.find(t);
 	if (it != m_impl->texCache.end()) { m_impl->Trash(it->second); m_impl->texCache.erase(it); }
+	m_impl->dynTexVersion.erase(t);
 	auto at = m_impl->animTex.find(t);
 	if (at != m_impl->animTex.end())
 	{

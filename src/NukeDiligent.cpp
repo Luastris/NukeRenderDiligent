@@ -5,6 +5,7 @@
 #include "SwapChainD3D11.h"
 #endif
 #include <config.h>              // nuke::WindowMode (window display mode)
+#include <API/Model/Game.h>      // Game::FlushScreenshot (end-of-frame capture)
 #ifdef _WIN32
 #include <d3d12.h>
 #include <dxgidebug.h>           // IDXGIInfoQueue: DXGI's OWN error queue (swapchain/present faults)
@@ -940,7 +941,9 @@ int NukeDiligent::render()
 		for (auto& cb : m_impl->onGUI) cb();
 	}
 
+	m_impl->DrawOverlayPass();  // E8 fullscreen video: over the finished frame, under the cursor
 	m_impl->DrawCursorPass();   // software cursor: topmost, over the finished UI
+	Game::FlushScreenshot();    // queued Game.Screenshot: the presented image is complete here
 
 	if (m_impl->DeviceRemoved()) return 1;   // device lost this frame: skip present, keep the app alive
 	if (s_frameDbg) dt4 = dbgclock::now();
@@ -1324,6 +1327,12 @@ void NukeDiligent::setCursorMode(int mode)
 	m_cursorMode = mode;
 }
 int NukeDiligent::getCursorMode() { return m_cursorMode; }
+
+void NukeDiligent::setScreenOverlay(Texture* tex)
+{
+	if (m_impl->overlayTex != tex) { m_impl->overlaySRB.Release(); m_impl->overlayLastSRV = nullptr; }
+	m_impl->overlayTex = tex;
+}
 
 // Custom cursor (see irender.h): hardware = cached GLFW cursor per id; software = cached
 // texture per id, drawn by DrawCursorPass. Does not override setCursorMode's capture/hide.

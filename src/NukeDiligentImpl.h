@@ -951,6 +951,12 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>        cursorCB;
 	TEXTURE_FORMAT cursorFmt = TEX_FORMAT_UNKNOWN;
 	void DrawCursorPass();          // software cursor: draw over the finished backbuffer
+	// E8 fullscreen video overlay: drawn letterboxed after the UI (reuses the cursor PSO).
+	Texture* overlayTex = nullptr;
+	RefCntAutoPtr<IShaderResourceBinding> overlaySRB;
+	ITextureView* overlayLastSRV = nullptr;
+	bool EnsureCursorPSO();
+	void DrawOverlayPass();
 	void DrawEditorGridPass();              // endCamera, before DrawDepthDebugLines
 	std::vector<float> debugVertsDepth;   // 7 floats per vertex (shares debugMutex + debugVB)
 	void DrawDepthDebugLines();
@@ -1104,6 +1110,7 @@ struct NukeDiligent::Impl
 	void LodRange(Mesh* mesh, int lod, uint32_t& first, uint32_t& count);
 	float lodCamPos[3] = { 0, 0, 0 };   // latched in beginCamera (shadow/probe passes reuse it)
 	std::unordered_map<Texture*, RefCntAutoPtr<ITexture>> texCache;   // engine Texture -> GPU texture
+	std::unordered_map<Texture*, int> dynTexVersion;   // dynamic textures: last uploaded dynamicVersion
 
 	// ---- T3 texture streaming: mip residency pool -------------------------------------------
 	// A WORLD-DRAWN BC texture with a real mip chain streams: only mips [residentBase..last]
