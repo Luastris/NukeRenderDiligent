@@ -826,7 +826,17 @@ int NukeDiligent::init(const WindowDesc& desc)
 
 int NukeDiligent::render()
 {
+	// Dev hook: NUKE_FRAME_DEBUG=1 — CPU timings of the frame sections, printed every ~2s
+	// (frame-pacing probes: which section eats the frame).
+	static int s_frameDbg = -1;
+	if (s_frameDbg < 0) { const char* e = std::getenv("NUKE_FRAME_DEBUG"); s_frameDbg = (e && *e == '1') ? 1 : 0; }
+	using dbgclock = std::chrono::steady_clock;
+	dbgclock::time_point dt0, dt1, dt2, dt3, dt4, dt5;
+	auto dbgnow = [&]() { return s_frameDbg ? dbgclock::now() : dbgclock::time_point(); };
+	dt0 = dbgnow();
+
 	glfwPollEvents();
+	if (s_frameDbg) dt1 = dbgclock::now();
 #ifdef _DEBUG
 	DrainD3D12DebugMessages(m_impl->device, m_impl->useD3D12);   // real validation errors -> console
 #endif
@@ -911,7 +921,9 @@ int NukeDiligent::render()
 	m_impl->context->ClearDepthStencil(pDSV, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
 	// 1) World passes: onRender drives World::Render (beginCamera + renderObject).
+	if (s_frameDbg) dt2 = dbgclock::now();
 	for (auto& cb : m_impl->onRender) cb();
+	if (s_frameDbg) dt3 = dbgclock::now();
 
 	// Reset debug/gizmo buffers HERE, not at frame start: lines emitted later (editor UI
 	// overlays) must survive into the next frame's camera passes.
@@ -929,7 +941,9 @@ int NukeDiligent::render()
 	}
 
 	if (m_impl->DeviceRemoved()) return 1;   // device lost this frame: skip present, keep the app alive
+	if (s_frameDbg) dt4 = dbgclock::now();
 	m_impl->swapChain->Present(m_impl->vsync ? 1 : 0);   // SyncInterval 1 = vsync, 0 = uncapped
+	if (s_frameDbg) dt5 = dbgclock::now();
 	// Secondary (Vulkan native viewport) swapchains present AFTER the main chain: Present flushes,
 	// and doing it mid-frame splits an RT write from its sampling and removes the device.
 	for (void* h : m_impl->vpPresentQueue)
@@ -940,12 +954,34 @@ int NukeDiligent::render()
 	}
 	m_impl->vpPresentQueue.clear();
 	// D3D detached windows get their pixels via GDI from offscreen RTs (no secondary swap chains).
+	dbgclock::time_point dp0 = dbgnow();
 	m_impl->BlitHostWindows();
+	dbgclock::time_point dp1 = dbgnow();
 	m_impl->AdoptBuiltPipes();      // publish what the builder thread finished (pipes + jobs)
+	dbgclock::time_point dp2 = dbgnow();
 	m_impl->StoragePump();          // publish textures DirectStorage landed; issue prefetches
+	dbgclock::time_point dp3 = dbgnow();
 	m_impl->PumpPipelineWarmup();   // build a slice of the pending pipelines, off the draw path
+	dbgclock::time_point dp4 = dbgnow();
 	m_impl->PollShaderSaves();      // persist finished background compiles into the disk cache
+	dbgclock::time_point dp5 = dbgnow();
 	m_impl->SavePSOCache(false);    // ...and the driver pipeline blobs (throttled, when new ones appeared)
+	if (s_frameDbg)
+	{
+		static dbgclock::time_point s_lastPrint;
+		const dbgclock::time_point end = dbgclock::now();
+		if (end - s_lastPrint > std::chrono::seconds(2))
+		{
+			s_lastPrint = end;
+			auto ms = [](dbgclock::time_point a, dbgclock::time_point b)
+			{ return std::chrono::duration<double, std::milli>(b - a).count(); };
+			std::cout << "[NukeDiligent]\tframe ms: poll " << ms(dt0, dt1) << "  pre " << ms(dt1, dt2)
+			          << "  world " << ms(dt2, dt3) << "  ui+3 " << ms(dt3, dt4)
+			          << "  present " << ms(dt4, dt5) << "  post " << ms(dt5, end)
+			          << " [blit " << ms(dp0, dp1) << " adopt " << ms(dp1, dp2) << " storage " << ms(dp2, dp3)
+			          << " warmup " << ms(dp3, dp4) << " saves " << ms(dp4, dp5) << " psocache " << ms(dp5, end) << "]" << std::endl;
+		}
+	}
 	return 1;
 }
 
