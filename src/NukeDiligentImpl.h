@@ -221,9 +221,19 @@ struct NukeDiligent::Impl
 	bool                          rtSupported = false;     // device reports ray-tracing capability
 	// #include resolver (+ RT shader loading): a MEMORY factory over the sources the engine pushed
 	// through setShaderSource. The renderer does NO file IO for shader sources.
+	// The #include resolver over shaderSrc. Compiles run on the BUILDER thread and inside the
+	// render loop while the game thread keeps pushing sources (module shaders, .nush assets):
+	// every access goes through the lock, rebuilds are LAZY (a push only bumps the version) and
+	// replaced factories retire into a graveyard until deinit — FXC was caught mid-D3DCompile
+	// inside a factory whose last reference a concurrent push had just released (pure virtual
+	// call), and the native seam hands modules RAW pointers that must stay valid for the run.
 	RefCntAutoPtr<IShaderSourceInputStreamFactory> shaderFactory;
-	void RebuildShaderFactory();   // rebuild shaderFactory from shaderSrc (called on every push)
-	uint64_t includeEpoch = 0;     // FNV over all INCLUDE sources — part of the disk-cache key
+	std::vector<RefCntAutoPtr<IShaderSourceInputStreamFactory>> retiredShaderFactories;
+	boost::mutex shaderLock;               // guards shaderSrc + factory + versions
+	uint64_t shaderSrcVersion = 1, shaderFactoryVersion = 0;
+	RefCntAutoPtr<IShaderSourceInputStreamFactory> ShaderFactory();   // lazy-rebuilt snapshot
+	void RebuildShaderFactory();   // shaderLock HELD: rebuild shaderFactory from shaderSrc
+	std::atomic<uint64_t> includeEpoch{ 0 };   // FNV over all INCLUDE sources — part of the disk-cache key
 	std::vector<Mesh*> rtDynMeshes;   // Mesh::rtDynamic instances added this frame -> per-frame BLAS rebuild
 	void RebuildDynamicBLAS();        // rebuild their cached BLASes over the updated vertex buffers
 
@@ -1192,6 +1202,8 @@ struct NukeDiligent::Impl
 	std::unordered_map<std::string, std::string> shaderSrc;
 	std::string shaderSource(const char* name)
 	{
+		// The builder thread reads while the game thread pushes — same lock as the factory.
+		boost::mutex::scoped_lock l(shaderLock);
 		auto it = shaderSrc.find(name);
 		if (it == shaderSrc.end() || it->second.empty())
 			{ cout << "[NukeDiligent]\tmissing shader source '" << name << "'" << endl; return std::string(); }

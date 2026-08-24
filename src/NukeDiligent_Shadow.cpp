@@ -65,7 +65,8 @@ void NukeDiligent::Impl::CreateShadowResources()
 	std::string vs = shaderSource("shadow.vs"), ps = shaderSource("shadow.ps");
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tshadow shaders missing" << endl; return; }
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
-	sci.pShaderSourceStreamFactory = shaderFactory;   // resolves #include "nukebend.hlsl"
+	auto sfLocal = ShaderFactory();   // held for the compiles below
+	sci.pShaderSourceStreamFactory = sfLocal;
 	RefCntAutoPtr<IShader> vsh, psh;
 	sci.Desc = {"Shadow VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &vsh);
 	sci.Desc = {"Shadow PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &psh);

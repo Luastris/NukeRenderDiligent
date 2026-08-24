@@ -159,7 +159,8 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 		if (!cs.empty())
 		{
 			ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
-			sci.pShaderSourceStreamFactory = shaderFactory;   // resolves #include "nukebend.hlsl"
+			auto bendSf = ShaderFactory();   // held for the compile: pushes must not kill it mid-FXC
+			sci.pShaderSourceStreamFactory = bendSf;
 			sci.Desc = {"Foliage Bend CS", SHADER_TYPE_COMPUTE, true};
 			sci.Source = cs.c_str();
 			RefCntAutoPtr<IShader> csh; CreateShaderCached(sci, &csh);
@@ -201,7 +202,8 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 		if (!cs.empty())
 		{
 			ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
-			sci.pShaderSourceStreamFactory = shaderFactory;
+			auto sfLocal = ShaderFactory();
+			sci.pShaderSourceStreamFactory = sfLocal;
 			sci.Desc = {"Skin CS", SHADER_TYPE_COMPUTE, true};
 			sci.Source = cs.c_str();
 			RefCntAutoPtr<IShader> csh; CreateShaderCached(sci, &csh);
@@ -413,7 +415,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
                                         IShaderSourceInputStreamFactory* factory, int stages)
 {
 	if (vsSrc.empty() || psSrc.empty()) return false;
-	if (!factory) factory = shaderFactory;
+	RefCntAutoPtr<IShaderSourceInputStreamFactory> sfHold;
+	if (!factory) { sfHold = ShaderFactory(); factory = sfHold; }
 	ShaderCreateInfo sci;
 	sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	sci.pShaderSourceStreamFactory = factory;   // resolves #include "nukebend.hlsl"
@@ -578,7 +581,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		const std::string vsV = "#define NUKE_VCTINT 1\n" + vsSrc;
 		const std::string psV = "#define NUKE_VCTINT 1\n" + psSrc;
 		ShaderCreateInfo sciV; sciV.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
-		sciV.pShaderSourceStreamFactory = shaderFactory;
+		auto sfLocalV = ShaderFactory();
+		sciV.pShaderSourceStreamFactory = sfLocalV;
 		RefCntAutoPtr<IShader> vsv, psv;
 		sciV.Desc = {"World VS (vcol)", SHADER_TYPE_VERTEX, true}; sciV.Source = vsV.c_str(); CreateShaderCached(sciV, &vsv);
 		sciV.Desc = {"World PS (vcol)", SHADER_TYPE_PIXEL,  true}; sciV.Source = psV.c_str(); CreateShaderCached(sciV, &psv);
@@ -999,7 +1003,7 @@ void NukeDiligent::Impl::RequestPipeBuild(uint64_t h, int stage)
 	b->pipe.hsSrc = wp.hsSrc.empty() ? shaderSource("world.hs") : wp.hsSrc;
 	b->pipe.dsSrc = wp.dsSrc.empty() ? shaderSource("world.ds") : wp.dsSrc;
 	b->samples = samples; b->fmt = SceneFmt();
-	b->factory = shaderFactory;
+	b->factory = ShaderFactory();
 	BuildItem item;
 	item.prio = stage == kStageBase ? kPrioBase : stage == kStageBlend ? kPrioBlend : stage == kStageExtra ? kPrioExtra : kPrioWire;
 	item.pipe = b;
@@ -1145,13 +1149,14 @@ uint64_t NukeDiligent::createShaderPipeline(const char* name, const char* vs, co
 	uint64_t h = m_impl->MakeWorldPSO(vs, ps, "Shader");   // world-type PSO (layout/CBs) from custom VS+PS
 	// A shader shipping "<name>.surf.hlsl" (file OR code-registered) gets an auto-generated
 	// RT closest-hit group.
-	if (h && name && *name && m_impl->rtSupported && m_impl->shaderFactory)
+	auto surfSf = m_impl->ShaderFactory();
+	if (h && name && *name && m_impl->rtSupported && surfSf)
 	{
 		bool hasSurf = m_impl->rtSurfSources.count(name) != 0;
 		if (!hasSurf)
 		{
 			RefCntAutoPtr<IFileStream> stream;
-			m_impl->shaderFactory->CreateInputStream2((std::string(name) + ".surf.hlsl").c_str(),
+			surfSf->CreateInputStream2((std::string(name) + ".surf.hlsl").c_str(),
 			                                          CREATE_SHADER_SOURCE_INPUT_STREAM_FLAG_SILENT, &stream);
 			hasSurf = stream != nullptr;
 		}

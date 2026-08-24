@@ -739,7 +739,8 @@ void NukeDiligent::buildRTScene()
 bool NukeDiligent::Impl::BuildRTPipeline()
 {
 	if (rtPSO && !rtPipelineDirty) return true;
-	if (!rtSupported || !shaderFactory) return false;
+	auto rtSf = ShaderFactory();
+	if (!rtSupported || !rtSf) return false;
 	if (rtPSO) { rtPSO.Release(); rtSRB.Release(); rtSBT.Release(); }   // a new surf shader appeared -> rebuild
 	rtPipelineDirty = false;
 
@@ -747,7 +748,7 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 	{
 		ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 		sci.ShaderCompiler = SHADER_COMPILER_DXC; sci.HLSLVersion = ShaderVersion{6, 5};
-		sci.pShaderSourceStreamFactory = shaderFactory;            // loads the file + resolves #include "rt_common.hlsl"
+		sci.pShaderSourceStreamFactory = rtSf;            // loads the file + resolves #include "rt_common.hlsl"
 		sci.FilePath = file; sci.EntryPoint = "main"; sci.Desc = {dbg, type, true};
 		device->CreateShader(sci, &out);
 		if (!out) cout << "[NukeDiligent]\tRT shader build failed: " << file << endl;
@@ -765,7 +766,7 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 	{
 		ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 		sci.ShaderCompiler = SHADER_COMPILER_DXC; sci.HLSLVersion = ShaderVersion{6, 5};
-		sci.pShaderSourceStreamFactory = shaderFactory;   // resolves #include "rt_common.hlsl" / "<name>.surf.hlsl"
+		sci.pShaderSourceStreamFactory = rtSf;   // resolves #include "rt_common.hlsl" / "<name>.surf.hlsl"
 		sci.Source = src.c_str(); sci.EntryPoint = "main"; sci.Desc = {dbg, SHADER_TYPE_RAY_CLOSEST_HIT, true};
 		device->CreateShader(sci, &out);
 		if (!out) cout << "[NukeDiligent]\tRT chit codegen failed: " << dbg << endl;

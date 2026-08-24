@@ -117,7 +117,8 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	std::string vsSrc = shaderSource("gbuffer.vs"), psSrc = shaderSource("gbuffer.ps");   // velocity-aware VS (motion vectors)
 	if (vsSrc.empty() || psSrc.empty()) return false;
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
-	sci.pShaderSourceStreamFactory = shaderFactory;   // resolves #include "nukebend.hlsl"
+	auto sfLocal = ShaderFactory();   // held for the compiles below
+	sci.pShaderSourceStreamFactory = sfLocal;
 	RefCntAutoPtr<IShader> vs, ps;
 	sci.Desc = {"GBuffer VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); CreateShaderCached(sci, &vs);
 	sci.Desc = {"GBuffer PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); CreateShaderCached(sci, &ps);

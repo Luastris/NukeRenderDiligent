@@ -310,12 +310,29 @@ NukeDiligent::~NukeDiligent() { if (nativeImpl == m_impl) nativeImpl = nullptr; 
 void NukeDiligent::setShaderSource(const char* name, const char* source)
 {
 	if (!name || !source) return;
+	boost::mutex::scoped_lock l(m_impl->shaderLock);
 	m_impl->shaderSrc[name] = source;
-	m_impl->RebuildShaderFactory();   // includes must resolve from the pushed set (pak or disk)
+	++m_impl->shaderSrcVersion;   // the factory rebuilds lazily at the next ShaderFactory()
+}
+
+// The lock-guarded snapshot every compile holds for its whole duration. Lazy: pushes since the
+// last build only bump the version; the replaced factory retires (never dies) because modules
+// keep raw pointers from the native seam.
+RefCntAutoPtr<IShaderSourceInputStreamFactory> NukeDiligent::Impl::ShaderFactory()
+{
+	boost::mutex::scoped_lock l(shaderLock);
+	if (shaderFactoryVersion != shaderSrcVersion)
+	{
+		if (shaderFactory) retiredShaderFactories.push_back(shaderFactory);
+		RebuildShaderFactory();
+		shaderFactoryVersion = shaderSrcVersion;
+	}
+	return shaderFactory;
 }
 
 // Rebuilds the memory #include resolver over the sources pushed via setShaderSource (no disk IO).
 // Every entry resolves both as "<name>" and "<name>.hlsl", since sources are pushed by stem.
+// shaderLock is HELD by the caller.
 void NukeDiligent::Impl::RebuildShaderFactory()
 {
 	std::vector<MemoryShaderSourceFileInfo> files;
@@ -324,7 +341,7 @@ void NukeDiligent::Impl::RebuildShaderFactory()
 	hlslNames.reserve(shaderSrc.size());                 // no realloc: c_str()s must stay valid
 	// Cache keys hash only the top-level source, so fold every include (dot-less name) into one
 	// hash CreateShaderCached mixes in — otherwise an include edit serves stale bytecode.
-	includeEpoch = 1469598103934665603ull;
+	uint64_t epoch = 1469598103934665603ull;
 	for (auto& kv : shaderSrc)
 	{
 		if (kv.second.empty()) continue;
@@ -334,8 +351,9 @@ void NukeDiligent::Impl::RebuildShaderFactory()
 		const bool isInc = kv.first.find('.') == std::string::npos
 		                || (kv.first.size() > 6 && kv.first.compare(kv.first.size() - 6, 6, ".hlsli") == 0);
 		if (isInc)
-			for (unsigned char ch : kv.second) { includeEpoch ^= ch; includeEpoch *= 1099511628211ull; }
+			for (unsigned char ch : kv.second) { epoch ^= ch; epoch *= 1099511628211ull; }
 	}
+	includeEpoch.store(epoch);
 	MemoryShaderSourceFactoryCreateInfo mci{ files.data(), (Uint32)files.size(), True /*CopySources*/ };
 	shaderFactory.Release();
 	CreateMemoryShaderSourceFactory(mci, &shaderFactory);
@@ -736,7 +754,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 			cout << "[NukeDiligent]\tDComp device creation failed — window opaque" << endl;
 	}
 #endif   // _WIN32 (DirectComposition)
-	m_impl->RebuildShaderFactory();
+	m_impl->ShaderFactory();   // build the resolver over everything pushed so far
 	// Ray tracing: D3D12 (DXR) or Vulkan (VK_KHR_ray_tracing) + a capable GPU/driver — and a
 	// shader compiler that speaks SM6.x. Off Windows no DXC is vendored (yet): glslang cannot
 	// even parse RayQuery HLSL (RT_ENABLED world.ps), so a Linux GPU with RT caps must still
@@ -973,7 +991,8 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 	uint64_t h = 1469598103934665603ull;
 	const size_t srcLen = ci.SourceLength ? ci.SourceLength : strlen(ci.Source);
 	h = fnv(h, ci.Source, srcLen);
-	h = fnv(h, &includeEpoch, sizeof(includeEpoch));   // include edits must invalidate too
+	const uint64_t epochNow = includeEpoch.load();
+	h = fnv(h, &epochNow, sizeof(epochNow));   // include edits must invalidate too
 	if (ci.EntryPoint) h = fnv(h, ci.EntryPoint, strlen(ci.EntryPoint));
 	h = fnv(h, &ci.Desc.ShaderType, sizeof(ci.Desc.ShaderType));
 	h = fnv(h, &ci.Desc.UseCombinedTextureSamplers, sizeof(bool));
@@ -1142,6 +1161,7 @@ void NukeDiligent::deinit()
 {
 	for (auto& cb : m_impl->onClose) cb();
 	m_impl->StopPipeBuilder();    // join: no device call may still run on the builder thread
+	m_impl->retiredShaderFactories.clear();   // nothing compiles any more; the graveyard may go
 	m_impl->StorageShutdown();    // every DirectStorage request lands before its destinations die
 	m_impl->SavePSOCache(true);   // pipelines built this session -> next start creates them warm
 	// Drain the GPU trash AFTER the queue settles — parked objects must not outlive the device.

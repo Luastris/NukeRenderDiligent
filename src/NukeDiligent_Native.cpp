@@ -16,7 +16,7 @@ bool GetFrame(Frame& out)
 	if (!d || !d->device || !d->context) return false;
 	out.device = d->device;
 	out.context = d->context;
-	out.shaderFactory = d->shaderFactory;
+	out.shaderFactory = d->ShaderFactory();   // raw for the seam; retired factories outlive the run
 	out.cameraPassActive = d->cameraPassActive;
 	out.camIsEditor = d->curCamEditor;
 	out.curRTV = d->curRTV;
