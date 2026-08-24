@@ -1011,6 +1011,10 @@ struct NukeDiligent::Impl
 	IShaderResourceVariable*              decalTexVarAdd = nullptr, *decalDepthVarAdd = nullptr;
 	IShaderResourceVariable*              decalTexVarMod = nullptr, *decalDepthVarMod = nullptr;
 	RefCntAutoPtr<IBuffer>                decalCB, decalVB;
+	// Target-filtered decals: the mesh re-draw variant (depth-tested, position stream only).
+	RefCntAutoPtr<IPipelineState>         decalMeshPSO, decalMeshPSOAdd, decalMeshPSOMod;
+	RefCntAutoPtr<IShaderResourceBinding> decalMeshSRB, decalMeshSRBAdd, decalMeshSRBMod;
+	IShaderResourceVariable*              decalMeshTexVar = nullptr, *decalMeshTexVarAdd = nullptr, *decalMeshTexVarMod = nullptr;
 	void CreateDecalResources();
 
 	RefCntAutoPtr<IPipelineState>         skyPSO;

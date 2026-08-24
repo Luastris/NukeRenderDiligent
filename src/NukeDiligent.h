@@ -67,6 +67,10 @@ public:
 	void drawDecal(Texture* tex, const float pos[3], const float quat[4], const float scale[3],
 	               const float tint[4], float intensity, float angleFade, int mode,
 	               float appear = 1.0f, int appearMode = 0) override;
+	void drawDecalMesh(Texture* tex, const float pos[3], const float quat[4], const float scale[3],
+	                   const float tint[4], float intensity, float angleFade, int mode,
+	                   float appear, int appearMode, Mesh* target,
+	                   const float tPos[3], const float tQuat[4], const float tScale[3]) override;
 	void setWireframe(bool on) override;                 // scene fill mode (world meshes only)
 	bool getWireframe() override;
 	void drawDebugLineDepth(const float a[3], const float b[3], const float color[4]) override;
