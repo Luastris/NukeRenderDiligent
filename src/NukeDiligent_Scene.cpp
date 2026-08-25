@@ -1086,7 +1086,7 @@ void NukeDiligent::Impl::DrawEditorGridPass()
 	IDeviceObject* depthSRV = depthAware ? (IDeviceObject*)gbufDepthSRV
 	                                     : (IDeviceObject*)whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 	IShaderResourceVariable* dvar = depthAware ? gridDepthVarND : gridDepthVar;
-	if (dvar) dvar->Set(depthSRV);
+	if (dvar && dvar->Get(0) != depthSRV) dvar->Set(depthSRV);   // mutable var: rebinding the same SRV asserts
 	context->SetVertexBuffers(0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	context->SetPipelineState(depthAware ? gridPSOND : gridPSO);
 	context->CommitShaderResources(depthAware ? gridSRBND : gridSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
