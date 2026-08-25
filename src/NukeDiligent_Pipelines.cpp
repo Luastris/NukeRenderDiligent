@@ -635,9 +635,10 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.psoTess.Release(); wp.srbTess.Release();
 	const bool tessOptIn = vsSrc.find("NUKE_TESS") != std::string::npos
 	                    && psSrc.find("g_Disp") != std::string::npos;
-	if ((stages & kStageBase) && !wp.hsSrc.empty() && (!device->GetDeviceInfo().Features.Tessellation || !tessOptIn))
+	if ((stages & kStageBase) && wp.tessCustom && (!device->GetDeviceInfo().Features.Tessellation || !tessOptIn))
 		// A shader SHIPPING custom hull/domain stages expects tessellation — say WHY it's off
-		// instead of silently rendering flat (undebuggable from the editor).
+		// instead of silently rendering flat (undebuggable from the editor). tessCustom, not
+		// hsSrc: builder copies resolve the SHARED pair into hsSrc for every shader.
 		cout << "[NukeDiligent]\ttess SKIPPED ('" << dbg << "'): "
 		     << (!device->GetDeviceInfo().Features.Tessellation ? "device has no tessellation"
 		                                                        : "sources lack NUKE_TESS/g_Disp") << endl;
@@ -861,6 +862,7 @@ uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::s
 	WorldPipe wp;
 	wp.vsSrc = vsSrc; wp.psSrc = psSrc; wp.dbg = dbg;   // kept so the warm-up can (re)build it
 	wp.hsSrc = hsSrc; wp.dsSrc = dsSrc;                 // custom tess stages (terrain)
+	wp.tessCustom = !hsSrc.empty() || !dsSrc.empty();
 	// Nothing is built here — not even the default pipeline: the builder thread takes every
 	// pipe in registration order (default first) and the draw path skips what is not ready.
 	uint64_t h = nextShaderHandle++;
@@ -1002,6 +1004,7 @@ void NukeDiligent::Impl::RequestPipeBuild(uint64_t h, int stage)
 	// thread may be rewriting (shader hot reload).
 	b->pipe.hsSrc = wp.hsSrc.empty() ? shaderSource("world.hs") : wp.hsSrc;
 	b->pipe.dsSrc = wp.dsSrc.empty() ? shaderSource("world.ds") : wp.dsSrc;
+	b->pipe.tessCustom = wp.tessCustom;
 	b->samples = samples; b->fmt = SceneFmt();
 	b->factory = ShaderFactory();
 	BuildItem item;

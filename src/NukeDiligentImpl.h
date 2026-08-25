@@ -701,6 +701,7 @@ struct NukeDiligent::Impl
 		IDeviceObject* lastBindI[13 + kOvTexCount + 3] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
 		std::string hsSrc, dsSrc;        // CUSTOM tess stages (empty = shared world.hs/world.ds)
+		bool tessCustom = false;         // the shader SHIPPED hs/ds (builder copies resolve the shared pair into hsSrc)
 		// What this pipeline was built for. Stale or never-built pipes are skipped by the draw
 		// and rebuilt by the warm-up; the draw falls back to the default world pipeline.
 		Uint8          builtSamples = 0;
