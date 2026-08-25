@@ -60,7 +60,7 @@ bool NukeDiligent::Impl::CameraSize(const NukeCameraDesc& cam, int& w, int& h)
 void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
                                 const float pos[3], const float quat[4], const float scale[3])
 {
-	Impl::TagScope tag(m_impl);   // R4: the armed occlusion tag covers this one submit
+	Impl::TagScope tag(m_impl);   // the armed occlusion tag covers this one submit
 	if (!mesh) return;
 	// One material for the whole mesh: the active LOD is one contiguous IB range = one draw.
 	uint32_t first = 0, count = 0;
@@ -68,7 +68,7 @@ void NukeDiligent::renderObject(Mesh* mesh, Material* mat,
 	RenderObjectRange(mesh, mat, pos, quat, scale, first, count);
 }
 
-// Terrain cluster culling (TB-5): one index range with the full material pipeline.
+// Terrain cluster culling: one index range with the full material pipeline.
 void NukeDiligent::renderObjectRange(Mesh* mesh, Material* mat,
                                      const float pos[3], const float quat[4], const float scale[3],
                                      uint32_t firstIndex, uint32_t indexCount)
@@ -134,7 +134,33 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	if (m_impl->worldPipes.empty() || indexCount == 0) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
-	// R4 occlusion: a tagged draw resolves its verdict once (every section shares it); a draw
+	if (m_impl->debugView == 1)
+	{
+		++m_impl->statDraws;
+		m_impl->statTris += (int)indexCount / 3;
+		const float4x4 w = float4x4::Scale(scale[0], scale[1], scale[2])
+		                 * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
+		                 * float4x4::Translation(pos[0], pos[1], pos[2]);
+		// Wire alpha ~ projected pixels per triangle: sub-pixel wire must not blacken the color.
+		float wireA = 0.4f;
+		if (mesh)
+		{
+			mesh->EnsureBounds();
+			const float ex = mesh->aabbMax[0] - mesh->aabbMin[0], ey = mesh->aabbMax[1] - mesh->aabbMin[1],
+			            ez = mesh->aabbMax[2] - mesh->aabbMin[2];
+			const float ms = std::max(std::fabs(scale[0]), std::max(std::fabs(scale[1]), std::fabs(scale[2])));
+			const float r  = 0.5f * std::sqrt(ex * ex + ey * ey + ez * ez) * ms;
+			const float dx = pos[0] - m_impl->curCamPos[0], dy = pos[1] - m_impl->curCamPos[1],
+			            dz = pos[2] - m_impl->curCamPos[2];
+			const float dist = std::max(0.05f, std::sqrt(dx * dx + dy * dy + dz * dz));
+			const float px = r / dist * m_impl->curProj.m11 * (float)m_impl->curRTH * 0.5f;
+			const float pxPerTri = 3.1416f * px * px / std::max(1.0f, (float)indexCount / 3.0f);
+			wireA *= std::min(1.0f, pxPerTri * 0.1f);
+		}
+		m_impl->DrawCostRange(*gp, w, firstIndex, indexCount, wireA);
+		return;
+	}
+	// Occlusion: a tagged draw resolves its verdict once (every section shares it); a draw
 	// the history holds back is recorded for the indirect replay after the pyramid.
 	if (m_impl->occlDrawTag && m_impl->occlReplay < 0)
 	{
@@ -187,7 +213,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		metallic = mat->metallic; roughness = mat->roughness; specF = mat->specular;
 		emissive[0] = (float)mat->emissive.r; emissive[1] = (float)mat->emissive.g; emissive[2] = (float)mat->emissive.b;
 		emissiveI = mat->emissiveIntensity;
-		// T3 streaming feedback: this draw's camera distance drives the material maps' residency.
+		// Streaming feedback: this draw's camera distance drives the material maps' residency.
 		if (m_impl->streamBudget > 0)
 		{
 			const float dx = pos[0] - m_impl->curCamPos[0], dy = pos[1] - m_impl->curCamPos[1],
@@ -209,7 +235,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		if (mat->wipe) wipesrv = m_impl->GetTexSRV(mat->wipe);
 		if (mat->liveSurface.height) heightsrv = m_impl->GetTexSRV(mat->liveSurface.height);
 	}
-	// Overlay slot maps (LM-3 states/layers), OvTexNames() order; last = the painted 3D mask.
+	// Overlay slot maps, OvTexNames() order; last = the painted 3D mask.
 	ITextureView* ovsrv[Impl::kOvTexCount] = {};
 	if (mat)
 	{
@@ -503,7 +529,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	if (mat && mat->liveDrawSet) mat->liveDrawSet = false;
 }
 
-// LM-6 background refraction: snapshot the opaque scene (resolve when MSAA) so transparent
+// background refraction: snapshot the opaque scene (resolve when MSAA) so transparent
 // refractive draws can sample what is behind them. The copy invalidates on size/format change;
 // beginCamera nulls refrSRV so a camera without refraction never samples a stale snapshot.
 void NukeDiligent::beginTransparent()
@@ -764,7 +790,7 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
 	m_impl->WriteFrameCB(P);
 
-	m_impl->OcclBeginCamera();   // R4: open the tag scope, consume matured visibility readbacks
+	m_impl->OcclBeginCamera();   // open the tag scope, consume matured visibility readbacks
 
 	m_impl->DrawSky();   // procedural sky behind the scene (after clear, before geometry)
 }
@@ -977,12 +1003,14 @@ void NukeDiligent::Impl::DrawEditorGridPass()
 	if (!gridPSO || gridSamples != (int)samples || gridFmt != SceneFmt())
 	{
 		if (gridPSO) Trash(gridPSO);
-		gridPSO.Release(); gridSRB.Release();
+		if (gridPSOND) Trash(gridPSOND);
+		gridPSO.Release(); gridSRB.Release(); gridPSOND.Release(); gridSRBND.Release();
+		gridDepthVar = gridDepthVarND = nullptr;
 		std::string vsSrc = shaderSource("grid.vs"), psSrc = shaderSource("grid.ps");
 		if (vsSrc.empty() || psSrc.empty()) return;
 		if (!gridCB)
 		{
-			BufferDesc cbd; cbd.Name = "GridCB"; cbd.Size = sizeof(float4x4) + sizeof(float) * 8;
+			BufferDesc cbd; cbd.Name = "GridCB"; cbd.Size = sizeof(float4x4) * 2 + sizeof(float) * 12;
 			cbd.Usage = USAGE_DYNAMIC; cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 			device->CreateBuffer(cbd, nullptr, &gridCB);
 			if (!gridCB) return;
@@ -992,25 +1020,46 @@ void NukeDiligent::Impl::DrawEditorGridPass()
 		sci.Desc = {"Grid VS", SHADER_TYPE_VERTEX, true}; sci.Source = vsSrc.c_str(); CreateShaderCached(sci, &v);
 		sci.Desc = {"Grid PS", SHADER_TYPE_PIXEL, true};  sci.Source = psSrc.c_str(); CreateShaderCached(sci, &p);
 		if (!v || !p) return;
-		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Editor Grid PSO";
-		auto& gp = ci.GraphicsPipeline;
-		gp.NumRenderTargets = 1; gp.RTVFormats[0] = SceneFmt();
-		gp.DSVFormat = TEX_FORMAT_D32_FLOAT;
-		gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-		gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
-		gp.DepthStencilDesc.DepthEnable = True;          // occluded by scene geometry
-		gp.DepthStencilDesc.DepthWriteEnable = False;
-		gp.SmplDesc.Count = samples;
-		auto& rt0 = gp.BlendDesc.RenderTargets[0];
-		rt0.BlendEnable = True;
-		rt0.SrcBlend = BLEND_FACTOR_SRC_ALPHA;  rt0.DestBlend = BLEND_FACTOR_INV_SRC_ALPHA;
-		rt0.SrcBlendAlpha = BLEND_FACTOR_ZERO;  rt0.DestBlendAlpha = BLEND_FACTOR_ONE;
-		ci.pVS = v; ci.pPS = p;
-		CreateGraphicsPipelineStateCached(ci, &gridPSO);
-		if (!gridPSO) return;
-		if (auto* sv = gridPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "GridCB")) sv->Set(gridCB);
-		if (auto* sp = gridPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "GridCB")) sp->Set(gridCB);
-		gridPSO->CreateShaderResourceBinding(&gridSRB, true);
+		ShaderResourceVariableDesc gvars[] = {
+			{SHADER_TYPE_PIXEL, "g_Depth", SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+		};
+		SamplerDesc gsmp;
+		gsmp.MinFilter = FILTER_TYPE_POINT; gsmp.MagFilter = FILTER_TYPE_POINT; gsmp.MipFilter = FILTER_TYPE_POINT;
+		gsmp.AddressU = TEXTURE_ADDRESS_CLAMP; gsmp.AddressV = TEXTURE_ADDRESS_CLAMP; gsmp.AddressW = TEXTURE_ADDRESS_CLAMP;
+		ImmutableSamplerDesc gimms[] = { {SHADER_TYPE_PIXEL, "g_Depth", gsmp} };
+		// depthAware: no depth test at all — the PS reads the prepass depth and occludes in
+		// WORLD space (a surface above the plane hides the grid, the coplanar floor never
+		// z-fights). The fallback keeps the classic test + a few-ULP bias.
+		auto build = [&](const char* nm, bool depthAware,
+		                 RefCntAutoPtr<IPipelineState>& pso, RefCntAutoPtr<IShaderResourceBinding>& srb,
+		                 IShaderResourceVariable*& dvar)
+		{
+			GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = nm;
+			auto& gp = ci.GraphicsPipeline;
+			gp.NumRenderTargets = 1; gp.RTVFormats[0] = SceneFmt();
+			gp.DSVFormat = TEX_FORMAT_D32_FLOAT;
+			gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+			gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
+			if (!depthAware) gp.RasterizerDesc.DepthBias = -4;
+			gp.DepthStencilDesc.DepthEnable = depthAware ? False : True;
+			gp.DepthStencilDesc.DepthWriteEnable = False;
+			gp.SmplDesc.Count = samples;
+			auto& rt0 = gp.BlendDesc.RenderTargets[0];
+			rt0.BlendEnable = True;
+			rt0.SrcBlend = BLEND_FACTOR_SRC_ALPHA;  rt0.DestBlend = BLEND_FACTOR_INV_SRC_ALPHA;
+			rt0.SrcBlendAlpha = BLEND_FACTOR_ZERO;  rt0.DestBlendAlpha = BLEND_FACTOR_ONE;
+			ci.pVS = v; ci.pPS = p;
+			ci.PSODesc.ResourceLayout.Variables = gvars; ci.PSODesc.ResourceLayout.NumVariables = 1;
+			ci.PSODesc.ResourceLayout.ImmutableSamplers = gimms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+			CreateGraphicsPipelineStateCached(ci, &pso);
+			if (!pso) return;
+			if (auto* sv = pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "GridCB")) sv->Set(gridCB);
+			if (auto* sp = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "GridCB")) sp->Set(gridCB);
+			pso->CreateShaderResourceBinding(&srb, true);
+			if (srb) dvar = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth");
+		};
+		build("Editor Grid PSO",       false, gridPSO,   gridSRB,   gridDepthVar);
+		build("Editor Grid PSO Depth", true,  gridPSOND, gridSRBND, gridDepthVarND);
 		gridSamples = (int)samples; gridFmt = SceneFmt();
 	}
 	if (!gridPSO || !gridSRB) return;
@@ -1019,18 +1068,28 @@ void NukeDiligent::Impl::DrawEditorGridPass()
 	// grid always dissolves well inside its quad, never at an edge.
 	float4x4 invView = curView.Inverse();
 	const float cx = invView.m30, cy = invView.m31, cz = invView.m32;
-	struct CB { float4x4 vp; float cam[4]; float fade[4]; };
+	const bool depthAware = gridPSOND && gridSRBND && gbufActive && gbufDepthSRV;
+	struct CB { float4x4 vp; float4x4 invVP; float cam[4]; float fade[4]; float res[4]; };
 	{
+		const float4x4 vp = curView * curProj;
 		MapHelper<CB> cb(context, gridCB, MAP_WRITE, MAP_FLAG_DISCARD);
-		cb->vp = curView * curProj;
+		cb->vp = vp;
+		cb->invVP = vp.Inverse();
 		cb->cam[0] = cx; cb->cam[1] = cy; cb->cam[2] = cz; cb->cam[3] = gridStep;
 		cb->fade[0] = std::max(400.0f, std::fabs(cy) * 30.0f);   // fade distance
 		cb->fade[1] = 0.9f;                                      // master alpha
-		cb->fade[2] = 0.0f; cb->fade[3] = 0.0f;
+		cb->fade[2] = depthAware ? 1.0f : 0.0f;                  // PS world-space occlusion mode
+		cb->fade[3] = 0.0f;
+		cb->res[0] = (float)(curRTW > 0 ? curRTW : 1); cb->res[1] = (float)(curRTH > 0 ? curRTH : 1);
+		cb->res[2] = cb->res[3] = 0.0f;
 	}
+	IDeviceObject* depthSRV = depthAware ? (IDeviceObject*)gbufDepthSRV
+	                                     : (IDeviceObject*)whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+	IShaderResourceVariable* dvar = depthAware ? gridDepthVarND : gridDepthVar;
+	if (dvar) dvar->Set(depthSRV);
 	context->SetVertexBuffers(0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
-	context->SetPipelineState(gridPSO);
-	context->CommitShaderResources(gridSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	context->SetPipelineState(depthAware ? gridPSOND : gridPSO);
+	context->CommitShaderResources(depthAware ? gridSRBND : gridSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{6, DRAW_FLAG_VERIFY_STATES};
 	context->Draw(da);
 }
@@ -1169,6 +1228,242 @@ void NukeDiligent::Impl::DrawOverlayPass()
 	context->Draw(da);
 }
 
+// ---- mesh-cost debug view -----------------------------------------------------------------------
+
+struct CostCBData { float4x4 wvp; float4 color; float4 params; };
+
+// tris (x instances) -> legend color. log10 ramp: <=1k green, 10k yellow, 100k orange,
+// 1M red, >=10M magenta (keep the profiler legend in sync).
+static void CostColor(double tris, float4& out)
+{
+	static const float stops[5][3] = {
+		{ 0.10f, 0.75f, 0.15f }, { 0.90f, 0.85f, 0.05f }, { 1.00f, 0.45f, 0.02f },
+		{ 1.00f, 0.05f, 0.02f }, { 1.00f, 0.00f, 0.90f } };
+	double t = (tris > 1.0 ? std::log10(tris) : 0.0) - 3.0;
+	if (t < 0.0) t = 0.0;
+	if (t > 4.0) t = 4.0;
+	const int i = t >= 4.0 ? 3 : (int)t;
+	const float f = (float)(t - i);
+	out.x = stops[i][0] + (stops[i + 1][0] - stops[i][0]) * f;
+	out.y = stops[i][1] + (stops[i + 1][1] - stops[i][1]) * f;
+	out.z = stops[i][2] + (stops[i + 1][2] - stops[i][2]) * f;
+	out.w = 1.0f;
+}
+
+bool NukeDiligent::Impl::EnsureCostPSOs()
+{
+	if (costPSO && costStamp.current(samples, SceneFmt())) return true;
+	costPSO.Release(); costPSOInst.Release(); costWirePSO.Release(); costWirePSOInst.Release();
+	costSRB.Release(); costSRBInst.Release(); costWireSRB.Release(); costWireSRBInst.Release();
+	std::string vs = shaderSource("meshcost.vs"), ps = shaderSource("meshcost.ps");
+	if (vs.empty() || ps.empty()) return false;
+	if (!costCB)
+	{
+		BufferDesc bd; bd.Name = "CostCB"; bd.Size = sizeof(CostCBData);
+		bd.Usage = USAGE_DYNAMIC; bd.BindFlags = BIND_UNIFORM_BUFFER; bd.CPUAccessFlags = CPU_ACCESS_WRITE;
+		device->CreateBuffer(bd, nullptr, &costCB);
+		if (!costCB) return false;
+	}
+	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	RefCntAutoPtr<IShader> v, p, vi;
+	sci.Desc = {"MeshCost VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &v);
+	sci.Desc = {"MeshCost PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &p);
+	const std::string vsI = "#define NUKE_INSTANCED 1\n" + vs;
+	sci.Desc = {"MeshCost VS Inst", SHADER_TYPE_VERTEX, true}; sci.Source = vsI.c_str(); CreateShaderCached(sci, &vi);
+	if (!v || !p || !vi) return false;
+	LayoutElement lay1[] = { {0, 0, 3, VT_FLOAT32} };
+	const Uint32 instStride = (Uint32)sizeof(NukeInstanceData);
+	LayoutElement layI[] = {
+		{0, 0, 3, VT_FLOAT32},
+		{1, 1, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, instStride, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+		{2, 1, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, instStride, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+		{3, 1, 4, VT_FLOAT32, False, LAYOUT_ELEMENT_AUTO_OFFSET, instStride, INPUT_ELEMENT_FREQUENCY_PER_INSTANCE},
+	};
+	auto build = [&](const char* nm, IShader* vtx, LayoutElement* lay, Uint32 nlay, bool wire, bool blend, CULL_MODE cull,
+	                 RefCntAutoPtr<IPipelineState>& pso, RefCntAutoPtr<IShaderResourceBinding>& srb)
+	{
+		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = nm;
+		auto& g2 = ci.GraphicsPipeline;
+		g2.NumRenderTargets = 1; g2.RTVFormats[0] = SceneFmt();
+		g2.DSVFormat = TEX_FORMAT_D32_FLOAT;
+		g2.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+		g2.RasterizerDesc.CullMode = cull;
+		g2.RasterizerDesc.FillMode = wire ? FILL_MODE_WIREFRAME : FILL_MODE_SOLID;
+		g2.DepthStencilDesc.DepthEnable = True;
+		g2.DepthStencilDesc.DepthFunc = COMPARISON_FUNC_LESS_EQUAL;
+		g2.DepthStencilDesc.DepthWriteEnable = blend ? False : True;
+		if (blend)   // wire/proxy: the cost color must stay readable through them
+		{
+			auto& rt0 = g2.BlendDesc.RenderTargets[0];
+			rt0.BlendEnable = True;
+			rt0.SrcBlend = BLEND_FACTOR_SRC_ALPHA; rt0.DestBlend = BLEND_FACTOR_INV_SRC_ALPHA;
+			rt0.SrcBlendAlpha = BLEND_FACTOR_ZERO; rt0.DestBlendAlpha = BLEND_FACTOR_ONE;
+		}
+		g2.SmplDesc.Count = samples;
+		g2.InputLayout.LayoutElements = lay; g2.InputLayout.NumElements = nlay;
+		ci.pVS = vtx; ci.pPS = p;
+		ci.PSODesc.ResourceLayout.DefaultVariableType = SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
+		CreateGraphicsPipelineStateCached(ci, &pso);
+		if (!pso) return;
+		if (auto* sv = pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CostCB")) sv->Set(costCB);
+		if (auto* sp = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "CostCB")) sp->Set(costCB);
+		pso->CreateShaderResourceBinding(&srb, true);
+	};
+	build("MeshCost PSO",           v,  lay1, 1, false, false, CULL_MODE_BACK, costPSO,         costSRB);
+	build("MeshCost Wire PSO",      v,  lay1, 1, true,  true,  CULL_MODE_BACK, costWirePSO,     costWireSRB);
+	build("MeshCost Inst PSO",      vi, layI, 4, false, false, CULL_MODE_BACK, costPSOInst,     costSRBInst);
+	build("MeshCost Inst Wire PSO", vi, layI, 4, true,  true,  CULL_MODE_BACK, costWirePSOInst, costWireSRBInst);
+	build("MeshCost Proxy PSO",     v,  lay1, 1, false, true,  CULL_MODE_NONE, costProxyPSO,    costProxySRB);
+	if (!(costPSO && costWirePSO && costPSOInst && costWirePSOInst && costProxyPSO
+	      && costSRB && costWireSRB && costSRBInst && costWireSRBInst && costProxySRB))
+		return false;
+	costStamp.stamp(samples, SceneFmt());
+	return true;
+}
+
+void NukeDiligent::Impl::DrawCostRange(MeshGPU& g, const float4x4& world, uint32_t firstIndex, uint32_t indexCount,
+                                       float wireAlpha)
+{
+	if (!g.PosBuf() || !EnsureCostPSOs()) return;
+	lastInstBind.pso = nullptr;   // this path replaces the instanced VB/PSO state
+	CostCBData cb;
+	cb.wvp = world * curView * curProj;
+	CostColor((double)indexCount / 3.0, cb.color);
+	cb.params = float4(0, 0, 0, 0);
+	{ MapHelper<CostCBData> m(context, costCB, MAP_WRITE, MAP_FLAG_DISCARD); if (m == nullptr) return; *m = cb; }
+	IBuffer* vbs[] = { g.PosBuf() };
+	Uint64   offs[] = { g.PosOfs() };
+	context->SetVertexBuffers(0, 1, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	const bool indexed = g.IdxBuf() && g.numIndices > 0;
+	if (indexed) context->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	auto draw = [&]
+	{
+		if (indexed)
+		{
+			DrawIndexedAttribs da{(Uint32)indexCount, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
+			da.FirstIndexLocation = firstIndex;
+			context->DrawIndexed(da);
+		}
+		else
+		{
+			DrawAttribs da{(Uint32)indexCount, DRAW_FLAG_VERIFY_STATES};
+			da.StartVertexLocation = firstIndex;
+			context->Draw(da);
+		}
+	};
+	context->SetPipelineState(costPSO);
+	context->CommitShaderResources(costSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	draw();
+	if (wireAlpha < 0.02f) return;   // sub-pixel triangles: wire would only blacken the color
+	cb.color = float4(0.0f, 0.0f, 0.0f, wireAlpha);
+	cb.params.x = 4e-5f;
+	{ MapHelper<CostCBData> m(context, costCB, MAP_WRITE, MAP_FLAG_DISCARD); if (m == nullptr) return; *m = cb; }
+	context->SetPipelineState(costWirePSO);
+	context->CommitShaderResources(costWireSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	draw();
+}
+
+void NukeDiligent::Impl::DrawCostInstanced(MeshGPU& g, Mesh* mesh, IBuffer* instBuf, int first, int count)
+{
+	if (!g.PosBuf() || !instBuf || !EnsureCostPSOs()) return;
+	lastInstBind.pso = nullptr;
+	const bool indexed = g.IdxBuf() != nullptr;
+	uint32_t l0First = 0, l0Count = 0;
+	if (indexed) LodRange(mesh, 0, l0First, l0Count);
+	else l0Count = (uint32_t)g.numVerts;
+	if (!l0Count) return;
+	float radius = 1.0f;
+	if (mesh)
+	{
+		mesh->EnsureBounds();
+		const float ex = mesh->aabbMax[0] - mesh->aabbMin[0], ey = mesh->aabbMax[1] - mesh->aabbMin[1],
+		            ez = mesh->aabbMax[2] - mesh->aabbMin[2];
+		radius = 0.5f * std::sqrt(ex * ex + ey * ey + ez * ez);
+	}
+	CostCBData cb;
+	cb.wvp = curView * curProj;   // instance rows ARE the world transform
+	CostColor((double)l0Count / 3.0 * (double)count, cb.color);
+	// y: world units -> pixels at w=1; z: tris per instance; w: mesh local radius (VS density fade).
+	cb.params = float4(0, curProj.m11 * (float)curRTH * 0.5f, (float)l0Count / 3.0f, radius);
+	{ MapHelper<CostCBData> m(context, costCB, MAP_WRITE, MAP_FLAG_DISCARD); if (m == nullptr) return; *m = cb; }
+	IBuffer* vbs[] = { g.PosBuf(), instBuf };
+	Uint64   offs[] = { g.PosOfs(), 0 };
+	context->SetVertexBuffers(0, 2, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	if (indexed) context->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	auto draw = [&]
+	{
+		if (indexed)
+		{
+			DrawIndexedAttribs da{(Uint32)l0Count, VT_UINT32, DRAW_FLAG_VERIFY_STATES};
+			da.FirstIndexLocation    = l0First;
+			da.NumInstances          = (Uint32)count;
+			da.FirstInstanceLocation = (Uint32)first;
+			context->DrawIndexed(da);
+		}
+		else
+		{
+			DrawAttribs da{(Uint32)l0Count, DRAW_FLAG_VERIFY_STATES};
+			da.NumInstances          = (Uint32)count;
+			da.FirstInstanceLocation = (Uint32)first;
+			context->Draw(da);
+		}
+	};
+	context->SetPipelineState(costPSOInst);
+	context->CommitShaderResources(costSRBInst, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	draw();
+	cb.color = float4(0.0f, 0.0f, 0.0f, 0.4f);
+	cb.params.x = 4e-5f;
+	{ MapHelper<CostCBData> m(context, costCB, MAP_WRITE, MAP_FLAG_DISCARD); if (m == nullptr) return; *m = cb; }
+	context->SetPipelineState(costWirePSOInst);
+	context->CommitShaderResources(costWireSRBInst, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	draw();
+}
+
+// Cost stand-in for module passes (water): a translucent box colored by the pass's tri load.
+void NukeDiligent::Impl::DrawCostProxyBox(const float pos[3], const float quat[4], const float size[3], double tris)
+{
+	if (!EnsureCostPSOs()) return;
+	if (!costCubeVB)
+	{
+		static const float k[8][3] = {
+			{ -0.5f, -0.5f, -0.5f }, { 0.5f, -0.5f, -0.5f }, { 0.5f, 0.5f, -0.5f }, { -0.5f, 0.5f, -0.5f },
+			{ -0.5f, -0.5f,  0.5f }, { 0.5f, -0.5f,  0.5f }, { 0.5f, 0.5f,  0.5f }, { -0.5f, 0.5f,  0.5f } };
+		static const int idx[36] = { 0,2,1, 0,3,2, 4,5,6, 4,6,7, 0,1,5, 0,5,4, 2,3,7, 2,7,6, 1,2,6, 1,6,5, 3,0,4, 3,4,7 };
+		float verts[36][3];
+		for (int i = 0; i < 36; ++i) memcpy(verts[i], k[idx[i]], sizeof(float) * 3);
+		BufferDesc bd; bd.Name = "Cost Proxy Cube"; bd.BindFlags = BIND_VERTEX_BUFFER;
+		bd.Usage = USAGE_IMMUTABLE; bd.Size = sizeof(verts);
+		BufferData init{ verts, sizeof(verts) };
+		device->CreateBuffer(bd, &init, &costCubeVB);
+		if (!costCubeVB) return;
+	}
+	lastInstBind.pso = nullptr;
+	++statDraws;
+	statTris += (int)tris;   // report what the pass WOULD have drawn
+	CostCBData cb;
+	cb.wvp = float4x4::Scale(size[0], size[1], size[2])
+	       * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
+	       * float4x4::Translation(pos[0], pos[1], pos[2])
+	       * curView * curProj;
+	CostColor(tris, cb.color);
+	cb.color.w = 0.55f;
+	cb.params = float4(0, 0, 0, 0);
+	{ MapHelper<CostCBData> m(context, costCB, MAP_WRITE, MAP_FLAG_DISCARD); if (m == nullptr) return; *m = cb; }
+	IBuffer* vbs[] = { costCubeVB };
+	Uint64   offs[] = { 0 };
+	context->SetVertexBuffers(0, 1, vbs, offs, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	context->SetPipelineState(costProxyPSO);
+	context->CommitShaderResources(costProxySRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da{36, DRAW_FLAG_VERIFY_STATES};
+	context->Draw(da);
+	cb.color = float4(0.0f, 0.0f, 0.0f, 0.5f);
+	cb.params.x = 4e-5f;
+	{ MapHelper<CostCBData> m(context, costCB, MAP_WRITE, MAP_FLAG_DISCARD); if (m == nullptr) return; *m = cb; }
+	context->SetPipelineState(costWirePSO);
+	context->CommitShaderResources(costWireSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	context->Draw(da);
+}
+
 void NukeDiligent::endCamera()
 {
 	if (m_impl->occlPassActive) endOpaque();   // engine skipped the opaque-scope close: never drop geometry
@@ -1217,14 +1512,15 @@ void NukeDiligent::endCamera()
 			// (slices of one name sum, so the remaining fullscreen work still reads as post).
 			if (pit->second.isSSR)     // built-in screen-space reflections (samples the prepass G-buffer + depth)
 			{
-				if (!m_impl->gbufActive) continue;   // no prepass ran -> skip this stage (src passes through unchanged)
+				// Cost view: reflections composite over metallic pixels and repaint the cost colors.
+				if (!m_impl->gbufActive || m_impl->debugView == 1) continue;
 				m_impl->GpuPass("ssr");
 				m_impl->RunSSR(pit->second, srcSRV, dstRTV, w, h, cs.params);
 				m_impl->GpuPass("post");
 			}
 			else if (pit->second.isRTRef)   // built-in ray-traced reflections (real DXR pipeline: rt_rgen/rmiss/rchit + SBT)
 			{
-				if (!m_impl->gbufActive) continue;   // needs the gbuffer prepass (reflector roughness/metalness); no TLAS -> passthrough inside
+				if (!m_impl->gbufActive || m_impl->debugView == 1) continue;   // cost view: same rule as SSR
 				m_impl->GpuPass("rt.trace");
 				m_impl->RunRTReflectPipeline(srcSRV, dstTex, w, h, cs.params);
 				m_impl->GpuPass("post");
@@ -1385,14 +1681,21 @@ void NukeDiligent::destroyInstanceBuffer(uint64_t id)
 // world transform comes from per-instance attributes, so the CB carries VIEW*PROJ and identity world.
 void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count)
 {
-	Impl::TagScope tag(m_impl);   // R4: one tag = one chunk
+	Impl::TagScope tag(m_impl);   // one tag = one chunk
 	if (m_impl->worldPipes.empty() || count <= 0) return;
 	auto bit = m_impl->instBufs.find(instBuf);
 	if (bit == m_impl->instBufs.end() || !bit->second.buf) return;
 	if (first < 0 || first + count > bit->second.count) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
-	// R4 occlusion: a tagged chunk the history holds back is recorded for the indirect replay.
+	if (m_impl->debugView == 1)
+	{
+		++m_impl->statDraws;
+		m_impl->statTris += mesh ? mesh->TriCount() * count : 0;
+		m_impl->DrawCostInstanced(*gp, mesh, bit->second.buf, first, count);
+		return;
+	}
+	// Occlusion: a tagged chunk the history holds back is recorded for the indirect replay.
 	if (m_impl->occlDrawTag && m_impl->occlReplay < 0)
 	{
 		int slot = -1; bool defer = false;

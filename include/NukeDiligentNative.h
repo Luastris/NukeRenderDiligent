@@ -71,6 +71,10 @@ struct Frame
 	// Scene lights (renderer's CPU list; valid this frame).
 	const nuke::NukeLight* lights = nullptr;
 	int lightCount = 0;
+
+	// Active debug view (iRender::setDebugView): 0 = off, 1 = mesh cost. A module whose pass
+	// draws visible geometry should render a cost proxy instead (DrawCostProxy). ABI: appended.
+	int debugView = 0;
 };
 
 // Fill `out` with the current state. Returns false before init / after shutdown.
@@ -135,6 +139,10 @@ NUKEDLG_API void SetWaterHooks(const WaterHooks* hooks);
 // frame, fade = 1/opacityDepth, scatter/absorb per channel.
 NUKEDLG_API void SetRTWaterState(float level, float on, float fade,
                                  const float scatter[3], const float absorb[3]);
+
+// Mesh-cost debug view (Frame.debugView == 1): draw a translucent box at pos/quat/size,
+// colored by `tris` on the cost ramp — the stand-in for a module pass's own geometry.
+NUKEDLG_API void DrawCostProxy(const float pos[3], const float quat[4], const float size[3], double tris);
 
 }  // namespace nukediligent
 

@@ -50,7 +50,7 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 	}
 	if (!t->HasPixelData() || t->width <= 0 || t->height <= 0) return nullptr;
 
-	// Dynamic textures (E8 video): USAGE_DEFAULT + in-place UpdateTexture when the owner
+	// Dynamic textures: USAGE_DEFAULT + in-place UpdateTexture when the owner
 	// bumped dynamicVersion. RGBA8 mip0 only by contract (Texture.h).
 	if (t->dynamic)
 	{
@@ -119,7 +119,7 @@ ITextureView* NukeDiligent::Impl::GetTexSRV(Texture* t)
 	if (it != texCache.end())
 		return it->second ? it->second->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
 	{
-		// T3 streaming: a world-drawn (touched) BC texture is born at its DISTANCE-desired mip
+		// Streaming: a world-drawn (touched) BC texture is born at its DISTANCE-desired mip
 		// range; the pump re-targets it later. Untouched textures (UI, previews) stay full.
 		int base = 0;
 		if (streamBudget > 0 && StreamEligible(t))
@@ -203,7 +203,7 @@ RefCntAutoPtr<ITexture> NukeDiligent::Impl::CreateEngineTex(Texture* t, int base
 	return tex;
 }
 
-// ---- T3 texture streaming -----------------------------------------------------------------------
+// ---- texture streaming -----------------------------------------------------------------------
 
 // Streamable: BC with a real mip chain and enough levels that dropping some actually saves
 // memory; animated frames, render textures and tiny maps never stream.
@@ -420,7 +420,7 @@ void NukeDiligent::Impl::EnsureBackbufferMS(int w, int h)
 	backbufferMS = MakeRT(w, h);
 }
 
-// ---- pooled mesh streams (TB-5) -----------------------------------------------------------------
+// ---- pooled mesh streams -----------------------------------------------------------------
 
 bool NukeDiligent::Impl::PoolAlloc(std::map<uint32_t, uint32_t>& fm, uint32_t count, uint32_t& off)
 {

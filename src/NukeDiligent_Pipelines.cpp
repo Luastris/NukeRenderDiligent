@@ -291,7 +291,7 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	CreateSpriteResources();   // 2D sprite quad pipeline (SceneFmt + MSAA -> rebuild with them)
 	CreateDecalResources();    // screen-space decal pipeline (SceneFmt + MSAA)
 	CreatePostResources();     // final tonemap / post-process pass
-	CreateOcclResources();     // Hi-Z pyramid + occlusion test (R4)
+	CreateOcclResources();     // Hi-Z pyramid + occlusion test
 	const TEXTURE_FORMAT fmt0 = SceneFmt();
 	skyStamp.stamp(samples, fmt0); debugStamp.stamp(samples, fmt0); spriteStamp.stamp(samples, fmt0);
 	decalStamp.stamp(samples, fmt0); outlineStamp.stamp(samples, fmt0);
@@ -462,8 +462,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		{SHADER_TYPE_PIXEL, "g_Occlusion",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Emissive",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Spec",       SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-		{SHADER_TYPE_PIXEL, "g_WipeMask",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // luma-wipe mask (LM-3)
-		{SHADER_TYPE_PIXEL, "g_Height",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // POM/displacement height (LM-3)
+		{SHADER_TYPE_PIXEL, "g_WipeMask",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // luma-wipe mask
+		{SHADER_TYPE_PIXEL, "g_Height",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // POM/displacement height
 		{SHADER_TYPE_PIXEL, "g_Shadow",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_ShadowCube", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Probe",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // reflection probe cubemap
@@ -473,10 +473,10 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	// The last two base entries are RT-only — drop them when the device has no ray tracing.
 	const Uint32 kNumBase = (Uint32)(sizeof(varsBase) / sizeof(varsBase[0]));
 	std::vector<ShaderResourceVariableDesc> vars(varsBase, varsBase + (rtSupported ? kNumBase : kNumBase - 2));
-	// Overlay slots (LM-3 states/layers), OvTexNames() order; one shared sampler on g_Ov0Alb.
+	// Overlay slots, OvTexNames() order; one shared sampler on g_Ov0Alb.
 	for (const std::string& n : OvTexNames())
 		vars.push_back({SHADER_TYPE_PIXEL, n.c_str(), SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
-	// BRDF pack (LM-6): flow map + the pre-transparent scene snapshot (shared sampler too).
+	// BRDF pack: flow map + the pre-transparent scene snapshot (shared sampler too).
 	vars.push_back({SHADER_TYPE_PIXEL, "g_Flow",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	vars.push_back({SHADER_TYPE_PIXEL, "g_MskStamp",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	vars.push_back({SHADER_TYPE_PIXEL, "g_SceneRefr", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});

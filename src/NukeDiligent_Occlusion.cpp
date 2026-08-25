@@ -2,7 +2,7 @@
 #include <cstring>
 #include <cmath>
 
-// R4 Hi-Z occlusion culling: per-target visibility history, MAX depth pyramid, GPU box test,
+// Hi-Z occlusion culling: per-target visibility history, MAX depth pyramid, GPU box test,
 // deferred indirect replay and the latency-hidden readback. The draw-path hooks (tag scope,
 // deferral, indirect draws) live in NukeDiligent_Scene.cpp.
 

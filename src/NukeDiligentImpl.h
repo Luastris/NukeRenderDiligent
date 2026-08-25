@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // Include order matters: Windows-pulling headers (GLFW native + Diligent D3D) MUST come
 // before the engine headers, which do `using namespace std;` (std::byte vs ::byte clash).
 
@@ -410,7 +410,7 @@ struct NukeDiligent::Impl
 	std::unordered_map<uint64_t, GBufferSet> gbufCache;
 	uint64_t                            gbufFrameCtr = 0;   // LRU clock
 	uint64_t                            gbufCurKey = 0;     // active set's key (never evicted)
-	// Overlay-slot texture names (LM-3): kOvSlots x (albedo, normal, MR, mask2D) + the painted
+	// Overlay-slot texture names: kOvSlots x (albedo, normal, MR, mask2D) + the painted
 	// 3D-mask flipbook. Shared by the pipeline var fetch and the draw binds. The G-buffer set
 	// skips the albedos (normals/roughness only): kOvSlots x (normal, MR, mask2D) + the mask.
 	static const int kOvSlots    = 8;                   // must match Material::kOverlaySlots
@@ -425,8 +425,8 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IShaderResourceBinding> gbufSRB;
 	IShaderResourceVariable*            gbufMRVar = nullptr;   // PS g_MetalRough (dynamic)
 	IShaderResourceVariable*            gbufNrmVar = nullptr;  // PS g_Normal (dynamic) — normal-mapped gbuffer normal
-	IShaderResourceVariable*            gbufTexVar = nullptr;  // PS g_Tex (base alpha for cutout, LM-3)
-	IShaderResourceVariable*            gbufWipeVar = nullptr; // PS g_WipeMask (luma-wipe holes, LM-3)
+	IShaderResourceVariable*            gbufTexVar = nullptr;  // PS g_Tex (base alpha for cutout)
+	IShaderResourceVariable*            gbufWipeVar = nullptr; // PS g_WipeMask (luma-wipe holes)
 	// Overlay maps in the G-buffer (kOvSlots x normal/MR/mask2D + the painted 3D mask), one set
 	// per SRB variant (normal/instanced/skinned), OvGbufNames() order. gbufOvLast gate the Sets.
 	IShaderResourceVariable*            gbufOvVar[kOvGbufCount]     = {};
@@ -446,7 +446,7 @@ struct NukeDiligent::Impl
 	float4x4                            curProjNoJitter;       // curProj before jitter (for TAA reprojection)
 	void RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params);
 
-	// --- R4 Hi-Z occlusion culling -----------------------------------------------------------------------
+	// --- Hi-Z occlusion culling -----------------------------------------------------------------------
 	// Two-phase per camera: draws whose id the visibility history calls visible go straight through
 	// (phase 1); the rest are deferred. endOpaque builds a MAX depth pyramid from what was drawn,
 	// tests EVERY tagged box in a compute pass, replays the deferred draws as indirect draws whose
@@ -671,10 +671,10 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              specVar = nullptr;  // PS "g_Spec"       (specular map, dynamic)
 		IShaderResourceVariable*              wipeVar = nullptr;  // PS "g_WipeMask"   (luma-wipe mask, dynamic)
 		IShaderResourceVariable*              heightVar = nullptr;// PS "g_Height"     (POM/displacement height, dynamic)
-		// Overlay slots (LM-3 states/layers): kOvSlots x (albedo, normal, MR, mask2D) + the
+		// Overlay slots: kOvSlots x (albedo, normal, MR, mask2D) + the
 		// painted 3D-mask flipbook. Same order as OvTexNames(); lastBind[13..] gate them.
 		IShaderResourceVariable*              ovVar[kOvTexCount] = {};
-		// BRDF pack (LM-6): anisotropy flow map + the pre-transparent scene snapshot.
+		// BRDF pack: anisotropy flow map + the pre-transparent scene snapshot.
 		IShaderResourceVariable*              flowVar = nullptr;   // PS "g_Flow"
 		IShaderResourceVariable*              refrVar = nullptr;   // PS "g_SceneRefr"
 		IShaderResourceVariable*              mskVar  = nullptr;   // PS "g_MskStamp" (LiveMask stamp)
@@ -927,8 +927,12 @@ struct NukeDiligent::Impl
 	int            debugDepthSamples = 0;                        // PSO built for this sample count
 	TEXTURE_FORMAT debugDepthFmt     = TEX_FORMAT_UNKNOWN;       // ...and this scene format
 	// Editor infinite grid: analytic shader plane, drawn depth-tested before the gizmo lines.
-	RefCntAutoPtr<IPipelineState>         gridPSO;
+	RefCntAutoPtr<IPipelineState>         gridPSO;     // fallback: depth-tested + ULP bias (no prepass)
 	RefCntAutoPtr<IShaderResourceBinding> gridSRB;
+	RefCntAutoPtr<IPipelineState>         gridPSOND;   // depth-aware: no depth test, PS occludes from the prepass
+	RefCntAutoPtr<IShaderResourceBinding> gridSRBND;
+	IShaderResourceVariable*              gridDepthVar   = nullptr;
+	IShaderResourceVariable*              gridDepthVarND = nullptr;
 	RefCntAutoPtr<IBuffer>                gridCB;
 	int            gridSamples = 0;
 	TEXTURE_FORMAT gridFmt     = TEX_FORMAT_UNKNOWN;
@@ -951,12 +955,25 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>        cursorCB;
 	TEXTURE_FORMAT cursorFmt = TEX_FORMAT_UNKNOWN;
 	void DrawCursorPass();          // software cursor: draw over the finished backbuffer
-	// E8 fullscreen video overlay: drawn letterboxed after the UI (reuses the cursor PSO).
+	// Fullscreen video overlay: drawn letterboxed after the UI (reuses the cursor PSO).
 	Texture* overlayTex = nullptr;
 	RefCntAutoPtr<IShaderResourceBinding> overlaySRB;
 	ITextureView* overlayLastSRV = nullptr;
 	bool EnsureCursorPSO();
 	void DrawOverlayPass();
+
+	// Mesh-cost debug view (setDebugView 1): world draws render flat-colored by triangle load
+	// + dark wireframe, through their own PSOs (plain/instanced x solid/wire).
+	int debugView = 0;
+	RefCntAutoPtr<IPipelineState> costPSO, costPSOInst, costWirePSO, costWirePSOInst, costProxyPSO;
+	RefCntAutoPtr<IShaderResourceBinding> costSRB, costSRBInst, costWireSRB, costWireSRBInst, costProxySRB;
+	RefCntAutoPtr<IBuffer> costCB, costCubeVB;
+	PipeStamp costStamp;
+	bool EnsureCostPSOs();
+	void DrawCostRange(MeshGPU& g, const float4x4& world, uint32_t firstIndex, uint32_t indexCount, float wireAlpha);
+	void DrawCostInstanced(MeshGPU& g, Mesh* mesh, IBuffer* instBuf, int first, int count);
+	void DrawCostProxyBox(const float pos[3], const float quat[4], const float size[3], double tris);
+
 	void DrawEditorGridPass();              // endCamera, before DrawDepthDebugLines
 	std::vector<float> debugVertsDepth;   // 7 floats per vertex (shares debugMutex + debugVB)
 	void DrawDepthDebugLines();
@@ -1053,7 +1070,7 @@ struct NukeDiligent::Impl
 	bool     BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc, const std::string& psSrc, const char* dbg,
 	                        IShaderSourceInputStreamFactory* factory = nullptr, int stages = 15 /*kStageAll*/);
 	void     RebuildForMSAA();   // rebuild all sample-count-dependent pipelines + targets after `samples` changes
-	// ---- pooled mesh streams (TB-5) -----------------------------------------------------------
+	// ---- pooled mesh streams -----------------------------------------------------------
 	// Churn-free residency for pooled meshes (Mesh::pooled — terrain nodes): streams live as
 	// RANGES inside shared arena buffers, so (re)serving/freeing a node allocates ranges and
 	// never creates or destroys GPU objects. Element-granular first-fit free lists, coalescing.
@@ -1112,7 +1129,7 @@ struct NukeDiligent::Impl
 	std::unordered_map<Texture*, RefCntAutoPtr<ITexture>> texCache;   // engine Texture -> GPU texture
 	std::unordered_map<Texture*, int> dynTexVersion;   // dynamic textures: last uploaded dynamicVersion
 
-	// ---- T3 texture streaming: mip residency pool -------------------------------------------
+	// ---- texture streaming: mip residency pool -------------------------------------------
 	// A WORLD-DRAWN BC texture with a real mip chain streams: only mips [residentBase..last]
 	// live on the GPU (the texture object is created at that size — normalized UVs make the
 	// swap invisible to shaders). Distance feedback comes from the draw submit (StreamTouch);
@@ -1166,7 +1183,7 @@ struct NukeDiligent::Impl
 	ITextureView*                         outlineMaskSRV = nullptr;
 	int                                   outlineMaskW = 0, outlineMaskH = 0;
 	RefCntAutoPtr<IBuffer>                outlineEdgeCB;      // texel size + thickness
-	// LM-6 background refraction: the opaque scene resolved/copied at beginTransparent.
+	// background refraction: the opaque scene resolved/copied at beginTransparent.
 	RefCntAutoPtr<ITexture>               refrTex;
 	ITextureView*                         refrSRV = nullptr;   // null = no snapshot this camera
 	ITextureView*                         curRTV = nullptr;   // current camera color target (outline rebind)

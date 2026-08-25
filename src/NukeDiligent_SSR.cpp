@@ -143,10 +143,10 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	std::vector<ShaderResourceVariableDesc> vars = {
 		{SHADER_TYPE_PIXEL, "g_MetalRough", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Normal",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-		{SHADER_TYPE_PIXEL, "g_Tex",        SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // base alpha for cutout (LM-3)
-		{SHADER_TYPE_PIXEL, "g_WipeMask",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // luma-wipe holes (LM-3)
+		{SHADER_TYPE_PIXEL, "g_Tex",        SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // base alpha for cutout
+		{SHADER_TYPE_PIXEL, "g_WipeMask",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // luma-wipe holes
 	};
-	// Overlay slots shape the G-buffer normal/roughness too (LM-3); one shared sampler on g_Ov0Nrm.
+	// Overlay slots shape the G-buffer normal/roughness too; one shared sampler on g_Ov0Nrm.
 	for (const std::string& n : OvGbufNames())
 		vars.push_back({SHADER_TYPE_PIXEL, n.c_str(), SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	ci.PSODesc.ResourceLayout.Variables = vars.data(); ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
@@ -557,23 +557,40 @@ void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t in
 	}
 
 	float metallic = 0.0f, roughness = 0.6f; ITextureView* mrsrv = nullptr; ITextureView* nsrv = nullptr;
+	ITextureView* texsrv = nullptr; ITextureView* wipesrv = nullptr;
 	if (mat) { metallic = mat->metallic; roughness = mat->roughness;
-	           if (mat->mr) mrsrv = m_impl->GetTexSRV(mat->mr); if (mat->norm) nsrv = m_impl->GetTexSRV(mat->norm); }
+	           if (mat->mr) mrsrv = m_impl->GetTexSRV(mat->mr); if (mat->norm) nsrv = m_impl->GetTexSRV(mat->norm);
+	           if (mat->diff) texsrv = m_impl->GetTexSRV(mat->diff);
+	           if (mat->wipe) wipesrv = m_impl->GetTexSRV(mat->wipe); }
 	{
 		MapHelper<Uint8> mb(m_impl->context, m_impl->worldMatCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		if (mb == nullptr) return;
 		Uint8* p = mb; memset(p, 0, Impl::kMatCBBytes);
+		float col[4] = { 1, 1, 1, mat ? (float)mat->color.a : 1.0f };   // g_Color (alpha feeds the cutout clip)
+		memcpy(p + 0, col, sizeof(float) * 4);
 		float nrmY = nsrv ? ((mat && mat->norm && !mat->norm->invertGreen) ? -1.0f : 1.0f) : 0.0f;
-		float prm[4]  = { 0, nrmY, metallic, roughness };
+		float prm[4]  = { texsrv ? 1.0f : 0.0f, nrmY, metallic, roughness };
 		memcpy(p + 16, prm, sizeof(float) * 4);
 		float prm2[4] = { mrsrv ? 1.0f : 0.0f, 0, 0, 1.0f };
 		memcpy(p + 32, prm2, sizeof(float) * 4);
+		// LiveMaterial: UV transform + cutout/wipe thresholds mirror the color pass.
+		float uvt[4]  = { mat ? (float)mat->uvTiling.x : 0.0f, mat ? (float)mat->uvTiling.y : 0.0f,
+		                  mat ? (float)mat->uvOffset.x + mat->uvAnim[0] : 0.0f,
+		                  mat ? (float)mat->uvOffset.y + mat->uvAnim[1] : 0.0f };
+		memcpy(p + 64, uvt, sizeof(float) * 4);
+		float uvt2[4] = { mat ? mat->uvRotation * 0.01745329f : 0.0f,
+		                  (mat && mat->blendMode == 3) ? mat->alphaCutoff : 0.0f,
+		                  (mat && mat->wipe && mat->wipeThreshold > 0.0f) ? mat->wipeThreshold : 0.0f, 0.0f };
+		memcpy(p + 80, uvt2, sizeof(float) * 4);
 		FillGBufOverlays(p, mat);
 	}
+	ITextureView* instWhiteSRV = m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 	if (m_impl->gbufMRVarInst)
-		m_impl->gbufMRVarInst->Set(mrsrv ? mrsrv : m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+		m_impl->gbufMRVarInst->Set(mrsrv ? mrsrv : instWhiteSRV);
 	if (m_impl->gbufNrmVarInst)
 		m_impl->gbufNrmVarInst->Set(nsrv ? nsrv : m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	if (m_impl->gbufTexVarInst)  m_impl->gbufTexVarInst->Set(texsrv ? texsrv : instWhiteSRV);
+	if (m_impl->gbufWipeVarInst) m_impl->gbufWipeVarInst->Set(wipesrv ? wipesrv : instWhiteSRV);
 	{
 		ITextureView* whiteSRV = m_impl->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 		ITextureView* flatN = m_impl->flatNormTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);

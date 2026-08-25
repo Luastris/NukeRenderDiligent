@@ -46,6 +46,7 @@ bool GetFrame(Frame& out)
 	out.rtSupported = d->rtSupported;
 	out.lights = d->lights.empty() ? nullptr : d->lights.data();
 	out.lightCount = (int)d->lights.size();
+	out.debugView = d->debugView;
 	return true;
 }
 
@@ -141,6 +142,12 @@ void SetRTWaterState(float level, float on, float fade, const float scatter[3], 
 	d->rtWaterOcc[0] = level; d->rtWaterOcc[1] = on; d->rtWaterOcc[2] = fade; d->rtWaterOcc[3] = 0.0f;
 	if (scatter) memcpy(d->rtWaterCol, scatter, sizeof(float) * 3);
 	if (absorb)  memcpy(d->rtWaterAbs, absorb, sizeof(float) * 3);
+}
+
+void DrawCostProxy(const float pos[3], const float quat[4], const float size[3], double tris)
+{
+	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;
+	if (d && pos && quat && size) d->DrawCostProxyBox(pos, quat, size, tris);
 }
 
 }  // namespace nukediligent
