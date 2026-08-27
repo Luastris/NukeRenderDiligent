@@ -360,6 +360,13 @@ void NukeDiligent::endOpaque()
 	const int mode = im.OcclEndOpaque();
 	if (mode != 0)
 	{
+		// The pyramid compute pass just rebound the context: every "already committed" cache is
+		// stale, and a replayed draw whose material EQUALS the last drawn one would skip its
+		// commit entirely (SRB-less DrawIndirect asserts).
+		im.sceneCommitSrb = nullptr;
+		im.matCBFor = nullptr;
+		im.tessBindMat = nullptr;
+		im.lastInstBind.pso = nullptr;
 		// Replay the deferred draws — indirect (the test wrote the arguments) or plain when the
 		// test could not run. Each record restores the overlay context its draw was tagged with.
 		std::vector<Impl::OcclDeferred> defer; defer.swap(im.occlDeferred);

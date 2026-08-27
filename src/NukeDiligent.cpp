@@ -34,6 +34,7 @@ extern "C" bool g_NukeVkHDR10;
 extern "C" bool g_NukeVkHDR10Active;
 
 #include "DebugOutput.h"   // Diligent::SetDebugMessageCallback
+#include <API/Model/CrashReport.h>   // probe runs: symbolized stack on a Diligent assert
 
 #if !defined(_WIN32) && !defined(__APPLE__)
 // Window-icon PNG decode (X11 has no icon-in-binary concept — the AppDir png is the icon).
@@ -60,6 +61,17 @@ static void NukeDiligentLogCallback(Diligent::DEBUG_MESSAGE_SEVERITY sev, const 
 	                : sev == Diligent::DEBUG_MESSAGE_SEVERITY_ERROR       ? "ERROR"
 	                : sev == Diligent::DEBUG_MESSAGE_SEVERITY_WARNING     ? "Warning" : "Info";
 	std::cout << "Diligent Engine: " << tag << ": " << (msg ? msg : "") << std::endl;
+	// Probe runs (NUKE_ASSERT_STDERR): a failed Diligent VERIFY would pop a modal Abort/Retry
+	// box right after this callback and hang a headless run forever — print and die instead.
+	static const bool headlessAsserts = std::getenv("NUKE_ASSERT_STDERR") != nullptr;
+	if (headlessAsserts && sev >= Diligent::DEBUG_MESSAGE_SEVERITY_ERROR
+	    && msg && std::strstr(msg, "Debug assertion failed"))
+	{
+		std::fprintf(stderr, "Diligent ASSERT: %s\n", msg);
+		nuke::CrashReport::PrintBacktrace();
+		std::fflush(stderr);
+		std::_Exit(3);
+	}
 }
 
 #ifdef _WIN32
