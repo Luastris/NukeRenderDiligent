@@ -115,16 +115,26 @@ void NukeDiligent::renderObjectMulti(Mesh* mesh, Material* const* mats, int matC
 	}
 	Impl::TagScope tag(m_impl);   // one tag = the whole sectioned object
 	MeshLOD L = mesh->Lod(m_impl->SelectLod(mesh, pos, scale));
-	for (int s = 0; s < L.sectionCount; ++s)
-	{
-		MeshSection sec = mesh->Section(L.firstSection + s);
-		Material* m = (sec.slot >= 0 && sec.slot < matCount && mats[sec.slot]) ? mats[sec.slot]
-		            : (matCount > 0 ? mats[0] : nullptr);
-		const int bm = m ? m->blendMode : 0;
-		if (blendPass == 0 && bm != 0) continue;
-		if (blendPass == 1 && bm == 0) continue;
-		RenderObjectRange(mesh, m, pos, quat, scale, sec.firstIndex, sec.indexCount);
-	}
+	// The blend pass carries CUTOUT sections too (they draw with the depth-writing default
+	// PSO). Within one mesh they must land BEFORE the true alpha-blend sections in SECTION
+	// order, or a later cutout section repaints an earlier blend one (VRoid eyes: the
+	// cutout eye-white section follows the blend iris section and erased it).
+	for (int sub = 0; sub < (blendPass == 1 ? 2 : 1); ++sub)
+		for (int s = 0; s < L.sectionCount; ++s)
+		{
+			MeshSection sec = mesh->Section(L.firstSection + s);
+			Material* m = (sec.slot >= 0 && sec.slot < matCount && mats[sec.slot]) ? mats[sec.slot]
+			            : (matCount > 0 ? mats[0] : nullptr);
+			const int bm = m ? m->blendMode : 0;
+			if (blendPass == 0 && bm != 0) continue;
+			if (blendPass == 1)
+			{
+				if (bm == 0) continue;
+				const bool depthWriting = (bm == 3);   // cutout: sub-pass 0; blend/add: sub-pass 1
+				if (depthWriting != (sub == 0)) continue;
+			}
+			RenderObjectRange(mesh, m, pos, quat, scale, sec.firstIndex, sec.indexCount);
+		}
 }
 
 void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
@@ -722,6 +732,11 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	m_impl->GpuPass("scene");   // geometry of this camera, up to the post chain in endCamera
 	++m_impl->passSerial;   // invalidate the per-draw redundancy gates (shared CBs re-map per pass)
 	m_impl->curTarget = cam.target;   // feedback guard: GetTexSRV won't sample the RT we draw into
+	// The G-buffer prepass is valid for ONE camera. A camera without its own prepass (asset
+	// previews, aux views) must not consume the last camera's depth — the editor grid's
+	// depth-aware occlusion would discard along the MAIN viewport's geometry (a screen-locked
+	// "bite" in the preview grid), soft sprites would fade on foreign depth, etc.
+	if (cam.target != m_impl->gbufTarget) m_impl->gbufActive = false;
 	// LOD anchor: mesh LOD selection measures distance from the camera drawing the frame
 	// (shadow/probe passes reuse the latest camera, not the light).
 	m_impl->lodCamPos[0] = cam.camPos[0]; m_impl->lodCamPos[1] = cam.camPos[1]; m_impl->lodCamPos[2] = cam.camPos[2];
@@ -1086,7 +1101,9 @@ void NukeDiligent::Impl::DrawEditorGridPass()
 	IDeviceObject* depthSRV = depthAware ? (IDeviceObject*)gbufDepthSRV
 	                                     : (IDeviceObject*)whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 	IShaderResourceVariable* dvar = depthAware ? gridDepthVarND : gridDepthVar;
-	if (dvar && dvar->Get(0) != depthSRV) dvar->Set(depthSRV);   // mutable var: rebinding the same SRV asserts
+	// Mutable var: the depth target is REBUILT on viewport resize, so a same-named but
+	// different SRV must legally replace the old binding (the SRB is not in flight here).
+	if (dvar && dvar->Get(0) != depthSRV) dvar->Set(depthSRV, SET_SHADER_RESOURCE_FLAG_ALLOW_OVERWRITE);
 	context->SetVertexBuffers(0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	context->SetPipelineState(depthAware ? gridPSOND : gridPSO);
 	context->CommitShaderResources(depthAware ? gridSRBND : gridSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);

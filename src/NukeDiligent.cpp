@@ -955,6 +955,9 @@ int NukeDiligent::render()
 		for (auto& cb : m_impl->onGUI) cb();
 	}
 
+	// The UI pass (editor ImGui multi-viewport) may END the implicit render pass with its
+	// own submissions: rebind the backbuffer so the overlay/cursor draws have one again.
+	m_impl->context->SetRenderTargets(1, &pRTV, pDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	m_impl->DrawOverlayPass();  // fullscreen video: over the finished frame, under the cursor
 	m_impl->DrawCursorPass();   // software cursor: topmost, over the finished UI
 	Game::FlushScreenshot();    // queued Game.Screenshot: the presented image is complete here

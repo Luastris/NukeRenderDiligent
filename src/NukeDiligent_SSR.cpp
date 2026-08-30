@@ -364,6 +364,7 @@ void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
 	ctx->SetViewports(1, &vp, w, h);
 	m_impl->gbufActive = true;
+	m_impl->gbufTarget = cam.target;   // this prepass belongs to THIS camera (see beginCamera)
 }
 
 void NukeDiligent::renderGBufferObject(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],

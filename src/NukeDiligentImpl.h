@@ -421,6 +421,7 @@ struct NukeDiligent::Impl
 
 	void EvictGBufferCache();
 	bool                                gbufActive = false;   // a valid prepass ran for the current camera
+	uint64_t                            gbufTarget = ~0ull;   // the camera target that prepass belongs to
 	RefCntAutoPtr<IPipelineState>       gbufPSO;
 	RefCntAutoPtr<IShaderResourceBinding> gbufSRB;
 	IShaderResourceVariable*            gbufMRVar = nullptr;   // PS g_MetalRough (dynamic)
