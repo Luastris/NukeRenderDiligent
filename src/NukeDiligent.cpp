@@ -1356,6 +1356,16 @@ void NukeDiligent::setScreenOverlay(Texture* tex)
 	m_impl->overlayTex = tex;
 }
 
+uint64_t NukeDiligent::claimScreenOverlay(int* w, int* h)
+{
+	m_impl->overlayClaimed = true;   // sticky: the claimer owns the draw from now on
+	Texture* tex = m_impl->overlayTex;
+	if (!tex) return 0;
+	if (w) *w = tex->width;
+	if (h) *h = tex->height;
+	return (uint64_t)m_impl->GetTexSRV(tex);
+}
+
 // Custom cursor (see irender.h): hardware = cached GLFW cursor per id; software = cached
 // texture per id, drawn by DrawCursorPass. Does not override setCursorMode's capture/hide.
 bool NukeDiligent::setCursorImage(uint64_t id, const unsigned char* rgba, int w, int h,

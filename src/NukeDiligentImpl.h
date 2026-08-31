@@ -958,7 +958,9 @@ struct NukeDiligent::Impl
 	TEXTURE_FORMAT cursorFmt = TEX_FORMAT_UNKNOWN;
 	void DrawCursorPass();          // software cursor: draw over the finished backbuffer
 	// Fullscreen video overlay: drawn letterboxed after the UI (reuses the cursor PSO).
+	// claimScreenOverlay flips overlayClaimed and the editor draws it in its viewport instead.
 	Texture* overlayTex = nullptr;
+	bool overlayClaimed = false;
 	RefCntAutoPtr<IShaderResourceBinding> overlaySRB;
 	ITextureView* overlayLastSRV = nullptr;
 	bool EnsureCursorPSO();

@@ -1210,7 +1210,7 @@ void NukeDiligent::Impl::DrawCursorPass()
 // Fullscreen video overlay: the engine texture drawn letterboxed over the finished frame.
 void NukeDiligent::Impl::DrawOverlayPass()
 {
-	if (!overlayTex) return;
+	if (!overlayTex || overlayClaimed) return;   // claimed: the editor draws it in its viewport
 	ITextureView* srv = GetTexSRV(overlayTex);
 	if (!srv || !EnsureCursorPSO()) return;
 	if (!overlaySRB || overlayLastSRV != srv)

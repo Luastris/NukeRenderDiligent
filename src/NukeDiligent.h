@@ -85,6 +85,7 @@ public:
 	bool setCursorImage(uint64_t id, const unsigned char* rgba, int w, int h,
 	                    int hotX, int hotY, int mode) override;
 	void setScreenOverlay(Texture* tex) override;
+	uint64_t claimScreenOverlay(int* w, int* h) override;
 	void setDebugView(int mode) override;
 	// GPU instancing
 	uint64_t createInstanceBuffer() override;
