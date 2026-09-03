@@ -436,16 +436,36 @@ struct NukeDiligent::Impl
 	IDeviceObject*                      gbufOvLast[3][kOvGbufCount] = {};
 	RefCntAutoPtr<IBuffer>              ssrCB;                 // SSR matrices (view/proj/invProj/res)
 	RefCntAutoPtr<IBuffer>              rtRefCB;               // RT reflections (invViewProj, light, ambient, sky)
-	// Temporal AA: per-camera history + previous view/proj (keyed by curTarget), shared CB, and this
+	// Temporal AA: per-camera history + previous view/proj (keyed by curCamKey), shared CB, and this
 	// frame's sub-pixel jitter (applied to the COLOUR projection only, in beginCamera).
 	RefCntAutoPtr<IBuffer>              taaCB;
-	struct TAAState { RefCntAutoPtr<ITexture> hist; float4x4 prevView, prevProj; bool valid = false; int w = 0, h = 0; };
+	struct TAAState { RefCntAutoPtr<ITexture> hist; float4x4 prevView, prevProj; bool valid = false; int w = 0, h = 0; uint64_t lastUsed = 0; };
 	std::map<uint64_t, TAAState>        taaStates;
 	bool                                curTAA = false;        // is the current camera running TAA?
 	float                               curJitterX = 0.0f, curJitterY = 0.0f;   // this frame's jitter (pixels, [-0.5,0.5])
 	int                                 taaFrame = 0;
 	float4x4                            curProjNoJitter;       // curProj before jitter (for TAA reprojection)
 	void RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params);
+
+	// --- Screen-space ambient occlusion ---------------------------------------------------------
+	// Runs off the prepass in beginCamera; screenAOSRV feeds the world PS (g_ScreenAO) for the
+	// camera and is dropped in endCamera. Per-target history like TAA.
+	int      aoQuality = 0;              // 0 = off, 1 SSAO, 2 HBAO, 3 GTAO, 4 VBAO, 5 RT-AO (World::Settings)
+	float    aoRadius = 0.6f, aoIntensity = 1.0f, aoPower = 1.5f;
+	PostPipe aoPipe, aoResolvePipe;
+	IShaderResourceVariable* aoTlasVar = nullptr;   // RT-AO: g_TLAS on the AO pipe (DXR devices only)
+	RefCntAutoPtr<IBuffer> aoCB;
+	std::atomic<bool> aoBuilding{false};
+	bool     aoFailed = false;
+	// raw/den at the AO resolution; resolved (rgb shaped, a accumulated) + hist[2] (r accumulated,
+	// g linear depth) at full res — the resolve writes hist[cur] as its second target, reads hist[prev]
+	struct AOState { RefCntAutoPtr<ITexture> raw, den, den2, resolved, hist[2]; int w = 0, h = 0, lw = 0, lh = 0, cur = 0; bool valid = false; uint64_t lastUsed = 0; };
+	std::map<uint64_t, AOState> aoStates;
+	ITextureView* screenAOSRV = nullptr;
+	float4x4 gbufView, gbufProj;         // the prepass camera (AO + next frame's motion vectors reproject against THESE)
+	int      aoFrame = 0;
+	bool BuildAOPipes();
+	void RunAO(int w, int h);
 
 	// --- Hi-Z occlusion culling -----------------------------------------------------------------------
 	// Two-phase per camera: draws whose id the visibility history calls visible go straight through
@@ -481,7 +501,7 @@ struct NukeDiligent::Impl
 		Ring     ring[3]; int ringHead = 0;
 		uint64_t lastUsed = 0;
 	};
-	std::map<uint64_t, OcclView>        occlViews;            // keyed by curTarget
+	std::map<uint64_t, OcclView>        occlViews;            // keyed by curCamKey
 	bool                                occlEnabled = false, occlFreeze = false;
 	bool                                occlPassActive = false; // tags accepted: beginCamera .. endOpaque
 	bool                                occlPending = false;    // setOcclusionId armed for the next draw
@@ -678,6 +698,7 @@ struct NukeDiligent::Impl
 		// BRDF pack: anisotropy flow map + the pre-transparent scene snapshot.
 		IShaderResourceVariable*              flowVar = nullptr;   // PS "g_Flow"
 		IShaderResourceVariable*              refrVar = nullptr;   // PS "g_SceneRefr"
+		IShaderResourceVariable*              saoVar = nullptr;    // PS "g_ScreenAO" (screen-space AO visibility)
 		IShaderResourceVariable*              mskVar  = nullptr;   // PS "g_MskStamp" (LiveMask stamp)
 		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
@@ -693,13 +714,13 @@ struct NukeDiligent::Impl
 		                        *shadowVarI = nullptr, *cubeVarI = nullptr, *probeVarI = nullptr, *tlasVarI = nullptr,
 		                        *rtInstVarI = nullptr;
 		IShaderResourceVariable *ovVarI[kOvTexCount] = {};
-		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr, *mskVarI = nullptr;
+		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr, *mskVarI = nullptr, *saoVarI = nullptr;
 		// Redundancy gates: object each DYNAMIC variable currently holds — Diligent rewrites the
 		// descriptor cache on EVERY Set() of a dynamic var, so only Set() on an actual change.
 		// [0..12] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst,wipe,height;
-		// [13..] = overlay-slot maps (OvTexNames() order), then flow + scene-refraction.
-		IDeviceObject* lastBind[13 + kOvTexCount + 3]  = {};
-		IDeviceObject* lastBindI[13 + kOvTexCount + 3] = {};
+		// [13..] = overlay-slot maps (OvTexNames() order), then flow, scene-refraction, mask stamp, screen AO.
+		IDeviceObject* lastBind[13 + kOvTexCount + 4]  = {};
+		IDeviceObject* lastBindI[13 + kOvTexCount + 4] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
 		std::string hsSrc, dsSrc;        // CUSTOM tess stages (empty = shared world.hs/world.ds)
 		bool tessCustom = false;         // the shader SHIPPED hs/ds (builder copies resolve the shared pair into hsSrc)
@@ -873,6 +894,9 @@ struct NukeDiligent::Impl
 	float                                 curCamFwd[3] = {0, 0, 1};  // camera forward (ripple window aim)
 	bool                                  curCamEditor = false;      // this pass = editor viewport camera
 	uint64_t                              curTarget = 0;             // RT id bound by beginCamera (feedback guard)
+	uint64_t                              curCamKey = 0;             // per-camera state key (target + camera id): TAA / AO / occlusion views
+	static uint64_t CamKey(const NukeCameraDesc& c) { return c.target ^ (c.cameraId * 0x9E3779B97F4A7C15ull); }
+	void PruneCameraStates();   // once per frame: drop TAA / AO / occlusion states nobody rendered with lately
 	// True between beginCamera binding its targets and the end of endCamera. Sprites REQUIRE the
 	// camera's colour+depth targets, so sprite calls outside a camera pass are dropped.
 	bool                                  cameraPassActive = false;

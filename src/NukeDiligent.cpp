@@ -867,6 +867,7 @@ int NukeDiligent::render()
 
 	// GPU lifetime: advance the frame clock, free trash no in-flight command list can reference.
 	++m_impl->frameId;
+	m_impl->PruneCameraStates();
 	m_impl->PurgeTrash();
 	m_impl->StreamPump();   // Texture streaming: residency step (budgeted rebuilds/evictions)
 	// Queued secondary-swap-chain creations/resizes must run BEFORE anything is recorded.
@@ -1348,6 +1349,11 @@ int NukeDiligent::getCursorMode() { return m_cursorMode; }
 void NukeDiligent::setDebugView(int mode)
 {
 	m_impl->debugView = mode;
+}
+
+void NukeDiligent::setAmbientOcclusion(int quality, float radius, float intensity, float power)
+{
+	m_impl->aoQuality = quality; m_impl->aoRadius = radius; m_impl->aoIntensity = intensity; m_impl->aoPower = power;
 }
 
 void NukeDiligent::setScreenOverlay(Texture* tex)

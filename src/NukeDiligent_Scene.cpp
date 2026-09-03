@@ -392,6 +392,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		bindIf(wp.flowVar, (mat && mat->flow) ? m_impl->GetTexSRV(mat->flow) : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount]);
 		bindIf(wp.refrVar, m_impl->refrSRV ? m_impl->refrSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 1]);
 	bindIf(wp.mskVar, (mat && mat->mskStamp) ? m_impl->GetTexSRV(mat->mskStamp) : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 2]);
+	bindIf(wp.saoVar, m_impl->screenAOSRV ? m_impl->screenAOSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 3]);
 	// Generic named textures (terrain layer normal/MR maps): shader-declared g_Layer* SRVs fill
 	// from the material's extraTex by name; pointer-gated like everything else.
 	for (auto& ex : wp.extraVars)
@@ -475,6 +476,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		TP(SHADER_TYPE_PIXEL, "g_Flow",      (mat && mat->flow) ? (IDeviceObject*)m_impl->GetTexSRV(mat->flow) : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_MskStamp",  (mat && mat->mskStamp) ? (IDeviceObject*)m_impl->GetTexSRV(mat->mskStamp) : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_SceneRefr", m_impl->refrSRV ? (IDeviceObject*)m_impl->refrSRV : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_ScreenAO",  m_impl->screenAOSRV ? (IDeviceObject*)m_impl->screenAOSRV : (IDeviceObject*)whiteSRV);
 		// Generic named textures (terrain layer maps): EVERY declared g_Layer* var gets bound —
 		// absent maps fall back to white, or Diligent's validation floods the console with
 		// "No resource is bound" on every draw (a slideshow of its own). PIXEL + DOMAIN (the
@@ -732,6 +734,7 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	m_impl->GpuPass("scene");   // geometry of this camera, up to the post chain in endCamera
 	++m_impl->passSerial;   // invalidate the per-draw redundancy gates (shared CBs re-map per pass)
 	m_impl->curTarget = cam.target;   // feedback guard: GetTexSRV won't sample the RT we draw into
+	m_impl->curCamKey = Impl::CamKey(cam);
 	// The G-buffer prepass is valid for ONE camera. A camera without its own prepass (asset
 	// previews, aux views) must not consume the last camera's depth — the editor grid's
 	// depth-aware occlusion would discard along the MAIN viewport's geometry (a screen-locked
@@ -781,6 +784,16 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 			wh.onCameraBegin(wh.user);
 			m_impl->GpuPass("scene");
 		}
+	}
+
+	// Screen-space AO off this camera's prepass, before its colour targets bind (the world
+	// PS reads the result through g_ScreenAO; white while off / still building).
+	m_impl->screenAOSRV = nullptr;
+	if (m_impl->aoQuality > 0 && m_impl->gbufActive)
+	{
+		m_impl->GpuPass("ao");
+		m_impl->RunAO(w, h);
+		m_impl->GpuPass("scene");
 	}
 
 	IDeviceContext* ctx = m_impl->context;
@@ -1499,6 +1512,12 @@ void NukeDiligent::endCamera()
 		m_impl->context->ResolveTextureSubresource(m_impl->curResolveSrc, m_impl->curResolveDst, ra);
 	}
 	m_impl->GpuPass("post");   // resolve is done; from here the frame is fullscreen work
+	if (m_impl->debugView == 2 && m_impl->screenAOSRV && m_impl->curPostSrc)   // AO debug view: the visibility texture instead of the scene
+	{
+		m_impl->context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
+		m_impl->BlitTexture(m_impl->screenAOSRV, m_impl->curPostSrc->GetTexture());
+	}
+	m_impl->screenAOSRV = nullptr;   // this camera's only: shadow/preview passes read white
 	// 1.5) Module post hook — after the resolve, BEFORE the user chain: its output is scene content.
 	ITextureView* chainSrc = m_impl->curPostSrc;
 	{
@@ -1898,6 +1917,7 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 		bindIf(wp.flowVarI, (mat && mat->flow) ? m_impl->GetTexSRV(mat->flow) : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount]);
 		bindIf(wp.refrVarI, m_impl->refrSRV ? m_impl->refrSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 1]);
 		bindIf(wp.mskVarI, (mat && mat->mskStamp) ? m_impl->GetTexSRV(mat->mskStamp) : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 2]);
+		bindIf(wp.saoVarI, m_impl->screenAOSRV ? m_impl->screenAOSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 3]);
 	}
 
 	IDeviceContext* ctx = m_impl->context;

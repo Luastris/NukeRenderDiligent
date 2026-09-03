@@ -480,6 +480,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	vars.push_back({SHADER_TYPE_PIXEL, "g_Flow",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	vars.push_back({SHADER_TYPE_PIXEL, "g_MskStamp",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	vars.push_back({SHADER_TYPE_PIXEL, "g_SceneRefr", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+	vars.push_back({SHADER_TYPE_PIXEL, "g_ScreenAO",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // Load-only: no sampler
 	// Generic per-layer maps: any PS SRV named g_LayerN*/g_LayerMR*/g_LayerH* becomes a DYNAMIC
 	// var, filled from Material::extraTex by name (one shared sampler on g_LayerN0 below).
 	std::vector<std::string> extraNames;
@@ -744,6 +745,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.flowVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Flow");
 	wp.mskVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_MskStamp");
 	wp.refrVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneRefr");
+	wp.saoVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ScreenAO");
 	wp.extraVars.clear();
 	for (const std::string& n : extraNames)
 		if (auto* v = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, n.c_str()))
@@ -846,6 +848,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				wp.flowVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Flow");
 				wp.mskVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_MskStamp");
 				wp.refrVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneRefr");
+				wp.saoVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_ScreenAO");
 				}
 			}
 		}

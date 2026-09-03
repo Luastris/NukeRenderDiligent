@@ -285,7 +285,8 @@ void NukeDiligent::Impl::RunSSR(PostPipe& pp, ITextureView* srcSRV, ITextureView
 // then copy the result back into the history for next frame.
 void NukeDiligent::Impl::RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params)
 {
-	TAAState& st = taaStates[curTarget];
+	TAAState& st = taaStates[curCamKey];
+	st.lastUsed = frameId;
 	// History format must follow dstTex: it is copied from it, and cross-format CopyTexture is invalid in D3D12.
 	const TEXTURE_FORMAT histFmt = dstTex->GetDesc().Format;
 	if (!st.hist || st.w != w || st.h != h || st.hist->GetDesc().Format != histFmt)
@@ -348,8 +349,10 @@ void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 	if (!m_impl->CameraSize(cam, w, h)) return;
 	m_impl->EnsureGBuffer(w, h);
 	if (!m_impl->gbufRTV || !m_impl->gbufDSV) return;
-	m_impl->curTarget = cam.target;   // keys the per-camera TAA state during the prepass
+	m_impl->curTarget = cam.target;   // feedback guard during the prepass
+	m_impl->curCamKey = Impl::CamKey(cam);   // keys the per-camera TAA / AO state
 	m_impl->SetCameraViewProj(cam, w, h);
+	m_impl->gbufView = m_impl->curView; m_impl->gbufProj = m_impl->curProj;
 	IDeviceContext* ctx = m_impl->context;
 	ITextureView* rtvs[3] = { m_impl->gbufRTV, m_impl->gbufVelRTV, m_impl->gbufObjIdRTV };
 	Uint32 nrt = 1;
@@ -421,7 +424,7 @@ void NukeDiligent::RenderGBufferRange(Mesh* mesh, Material* mat, const float pos
 	float4x4 world = build(pos, quat, scale);
 	float4x4 wvp   = world * m_impl->curView * m_impl->curProj;   // prepass is UNjittered
 	// Previous-frame clip = prev object transform * previous camera; falls back to current (zero velocity).
-	Impl::TAAState& tst = m_impl->taaStates[m_impl->curTarget];
+	Impl::TAAState& tst = m_impl->taaStates[m_impl->curCamKey];
 	float4x4 prevWorld = (prevPos && prevQuat && prevScale) ? build(prevPos, prevQuat, prevScale) : world;
 	float4x4 prevWVP   = tst.valid ? (prevWorld * tst.prevView * tst.prevProj) : wvp;
 	struct CBData { float4x4 wvp; float4x4 world; float4x4 prevWVP; };
@@ -548,7 +551,7 @@ void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t in
 	Impl::MeshGPU& g = *gp;
 
 	float4x4 vp = m_impl->curView * m_impl->curProj;   // prepass is UNjittered
-	Impl::TAAState& tst = m_impl->taaStates[m_impl->curTarget];
+	Impl::TAAState& tst = m_impl->taaStates[m_impl->curCamKey];
 	float4x4 prevVP = tst.valid ? (tst.prevView * tst.prevProj) : vp;
 	struct CBData { float4x4 wvp; float4x4 world; float4x4 prevWVP; };
 	{

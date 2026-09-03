@@ -87,6 +87,7 @@ public:
 	void setScreenOverlay(Texture* tex) override;
 	uint64_t claimScreenOverlay(int* w, int* h) override;
 	void setDebugView(int mode) override;
+	void setAmbientOcclusion(int quality, float radius, float intensity, float power) override;
 	// GPU instancing
 	uint64_t createInstanceBuffer() override;
 	void     updateInstanceBuffer(uint64_t id, const NukeInstanceData* data, int count) override;

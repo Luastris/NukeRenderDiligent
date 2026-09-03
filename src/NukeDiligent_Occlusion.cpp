@@ -106,7 +106,7 @@ void NukeDiligent::Impl::OcclEnsureBuffers(Uint32 n)
 
 bool NukeDiligent::Impl::OcclDecide(uint64_t id)
 {
-	OcclView& v = occlViews[curTarget];
+	OcclView& v = occlViews[curCamKey];
 	auto it = v.hist.find(id);
 	if (it == v.hist.end()) return true;   // never tested: draw (conservative)
 	if (!occlFreeze) it->second.frame = occlFrame;
@@ -131,14 +131,14 @@ void NukeDiligent::Impl::OcclBeginCamera()
 	occlPending = false; occlDrawTag = false; occlPendingSlot = -1; occlPendingDefer = false; occlReplay = -1;
 	occlPassActive = occlEnabled && occlCSPSO && occlCSSRB && hizCopyPSO && hizDownPSO;
 	if (!occlPassActive) { statOcclTracked = statOcclCulled = 0; return; }
-	OcclView& v = occlViews[curTarget];
+	OcclView& v = occlViews[curCamKey];
 	v.lastUsed = occlFrame;
 	// Bound the per-target state (previews, camera-to-texture churn): drop the coldest view.
 	if (occlViews.size() > 8)
 	{
 		uint64_t oldest = ~0ull; uint64_t key = 0; bool found = false;
 		for (auto& kv : occlViews)
-			if (kv.first != curTarget && kv.second.lastUsed < oldest) { oldest = kv.second.lastUsed; key = kv.first; found = true; }
+			if (kv.first != curCamKey && kv.second.lastUsed < oldest) { oldest = kv.second.lastUsed; key = kv.first; found = true; }
 		if (found)
 		{
 			OcclView& o = occlViews[key];
@@ -248,7 +248,7 @@ int NukeDiligent::Impl::OcclEndOpaque()
 	statOcclTracked = (int)occlTags.size(); statOcclCulled = (int)occlDeferred.size();
 	if (occlTags.empty()) return 2;
 	if (occlFreeze) { OcclDebugBoxes(); return 0; }
-	OcclView& v = occlViews[curTarget];
+	OcclView& v = occlViews[curCamKey];
 	ITextureView* rtv = curRTV; ITextureView* dsv = curDSV;
 	if (!dsv || curRTW <= 0 || curRTH <= 0) return 2;
 	ITexture* depth = dsv->GetTexture();
