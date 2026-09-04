@@ -102,6 +102,52 @@ void NukeDiligent::setGIVolumes(const NukeGIVolumeDesc* volumes, int count)
 	}
 	d->giIrrSRV = d->giIrrAtlas ? d->giIrrAtlas->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
 	d->giVisSRV = d->giVisAtlas ? d->giVisAtlas->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
+	d->GIEnvTick();
+}
+
+// Probes captured per frame on the raster path: a full pass in <= 128 frames, x8 while settling.
+int NukeDiligent::Impl::GICaptureBudget(int total) const
+{
+	const int lo = giBoost > 0 ? kCaptureMin * 4 : kCaptureMin, hi = giBoost > 0 ? kCaptureMax * 4 : kCaptureMax;
+	const int per = giBoost > 0 ? 16 : 128;
+	return std::min(total, std::max(lo, std::min(hi, total / per)));
+}
+
+// Compare the lighting environment with the anchor; a jump starts a settle pass.
+void NukeDiligent::Impl::GIEnvTick()
+{
+	float cur[kGIEnvN] = {}; int n = 0;
+	auto push = [&](float x) { if (n < kGIEnvN) cur[n++] = x; };
+	for (int k = 0; k < 3; ++k) push(sky.top[k] * sky.skyIntensity);
+	for (int k = 0; k < 3; ++k) push(sky.horizon[k] * sky.skyIntensity);
+	for (int k = 0; k < 3; ++k) push(sky.ground[k] * sky.skyIntensity);
+	for (int k = 0; k < 3; ++k) push(sky.ambient[k] * sky.ambientIntensity);
+	push((float)sky.mode);
+	int dirs = 0;
+	for (const NukeLight& L : lights)
+	{
+		if (L.type != 0 || dirs >= 4) continue;
+		++dirs;
+		for (int k = 0; k < 3; ++k) push(L.dir[k]);
+		for (int k = 0; k < 3; ++k) push(L.color[k] * L.intensity);
+	}
+	if (!giEnvValid) { memcpy(giEnvAnchor, cur, sizeof(cur)); giEnvValid = true; return; }
+	float delta = 0.0f;
+	for (int k = 0; k < kGIEnvN; ++k)
+	{
+		const float a = fabsf(giEnvAnchor[k]), b = fabsf(cur[k]);
+		delta = std::max(delta, fabsf(cur[k] - giEnvAnchor[k]) / (std::max(a, b) + 0.25f));
+	}
+	if (delta > 0.08f)
+	{
+		memcpy(giEnvAnchor, cur, sizeof(cur));
+		int total = 0; for (const GIVol& v : giVols) total += v.probes;
+		int frames = 8;   // RT: every probe every frame
+		if (!rtSupported && total > 0) { const int b = std::max(1, GICaptureBudget(total)); frames = (total + b - 1) / b + 1; }
+		giBoost = std::max(giBoost, frames);
+	}
+	else
+		for (int k = 0; k < kGIEnvN; ++k) giEnvAnchor[k] += (cur[k] - giEnvAnchor[k]) * 0.1f;   // follow the drift
 }
 
 // GICB for the current volume set; dynamic buffers must be written every frame they are read.
@@ -143,7 +189,10 @@ bool NukeDiligent::Impl::BuildGIPipes()
 	};
 	SamplerDesc lin; lin.MinFilter = FILTER_TYPE_LINEAR; lin.MagFilter = FILTER_TYPE_LINEAR; lin.MipFilter = FILTER_TYPE_LINEAR;
 	lin.AddressU = TEXTURE_ADDRESS_CLAMP; lin.AddressV = TEXTURE_ADDRESS_CLAMP; lin.AddressW = TEXTURE_ADDRESS_CLAMP;
-	auto build = [&](const char* dbg, IShader* cs, const std::vector<const char*>& samplers, RefCntAutoPtr<IPipelineState>& pso, RefCntAutoPtr<IShaderResourceBinding>& srb)
+	SamplerDesc pt; pt.MinFilter = FILTER_TYPE_POINT; pt.MagFilter = FILTER_TYPE_POINT; pt.MipFilter = FILTER_TYPE_POINT;
+	pt.AddressU = TEXTURE_ADDRESS_CLAMP; pt.AddressV = TEXTURE_ADDRESS_CLAMP; pt.AddressW = TEXTURE_ADDRESS_CLAMP;
+	auto build = [&](const char* dbg, IShader* cs, const std::vector<const char*>& samplers, const std::vector<const char*>& points,
+	                 RefCntAutoPtr<IPipelineState>& pso, RefCntAutoPtr<IShaderResourceBinding>& srb)
 	{
 		ComputePipelineStateCreateInfo ci; ci.PSODesc.Name = dbg;
 		ShaderResourceVariableDesc vars[] = {
@@ -153,6 +202,7 @@ bool NukeDiligent::Impl::BuildGIPipes()
 		};
 		std::vector<ImmutableSamplerDesc> imms;
 		for (const char* s : samplers) imms.push_back({SHADER_TYPE_COMPUTE, s, lin});
+		for (const char* s : points)   imms.push_back({SHADER_TYPE_COMPUTE, s, pt});
 		ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 3;
 		ci.PSODesc.ResourceLayout.DefaultVariableType = SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC;
 		ci.PSODesc.ResourceLayout.ImmutableSamplers = imms.data(); ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)imms.size();
@@ -169,12 +219,12 @@ bool NukeDiligent::Impl::BuildGIPipes()
 	if (!compile("ddgi_update.cs", "DDGI update CS", false, csU)) return false;
 	if (!compile("ddgi_cube.cs",   "DDGI cube CS",   false, csC)) return false;
 	RefCntAutoPtr<IPipelineState> pU, pC, pT; RefCntAutoPtr<IShaderResourceBinding> sU, sC, sT;
-	if (!build("DDGI update PSO", csU, {}, pU, sU)) return false;
-	if (!build("DDGI cube PSO",   csC, {"g_CubeColor"}, pC, sC)) return false;
+	if (!build("DDGI update PSO", csU, {}, {}, pU, sU)) return false;
+	if (!build("DDGI cube PSO",   csC, {"g_CubeColor"}, {"g_CubeBack"}, pC, sC)) return false;
 	if (rtSupported)
 	{
 		if (!compile("ddgi_trace.cs", "DDGI trace CS", true, csT)) return false;
-		if (!build("DDGI trace PSO", csT, {"g_Probe", "g_MatTex", "g_GIIrr"}, pT, sT)) return false;
+		if (!build("DDGI trace PSO", csT, {"g_Probe", "g_MatTex", "g_GIIrr"}, {}, pT, sT)) return false;
 	}
 	giUpdatePSO = pU; giUpdateSRB = sU; giCubePSO = pC; giCubeSRB = sC; giTracePSO = pT; giTraceSRB = sT;
 	return true;
@@ -236,7 +286,7 @@ void NukeDiligent::Impl::ApplyGIResets()
 }
 
 // Rays of [first, first + count) probes of volume vi are in giRayBuf: fold them into the atlases.
-void NukeDiligent::Impl::GIUpdateProbes(int vi, int first, int count, const float rot[4])
+void NukeDiligent::Impl::GIUpdateProbes(int vi, int first, int count, const float rot[4], float hysteresis)
 {
 	const GIVol& v = giVols[vi];
 	auto pass = [&](int mode, int threadsPerProbe)
@@ -245,7 +295,7 @@ void NukeDiligent::Impl::GIUpdateProbes(int vi, int first, int count, const floa
 			MapHelper<GIPassData> pc(context, giPassCB, MAP_WRITE, MAP_FLAG_DISCARD);
 			pc->pass[0] = vi; pc->pass[1] = first; pc->pass[2] = v.desc.raysPerProbe; pc->pass[3] = mode;
 			memcpy(pc->rot, rot, sizeof(float) * 4);
-			pc->misc[0] = v.desc.maxRayDistance; pc->misc[1] = v.desc.hysteresis; pc->misc[2] = (float)(giFrame % 4096); pc->misc[3] = (float)count;
+			pc->misc[0] = v.desc.maxRayDistance; pc->misc[1] = hysteresis; pc->misc[2] = (float)(giFrame % 4096); pc->misc[3] = (float)count;
 		}
 		auto set = [&](const char* n, IDeviceObject* o) { if (auto* s = giUpdateSRB->GetVariableByName(SHADER_TYPE_COMPUTE, n)) s->Set(o); };
 		set("g_RayData",  giRayBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
@@ -289,7 +339,7 @@ void NukeDiligent::updateGIVolumes()
 			MapHelper<GIPassData> pc(d->context, d->giPassCB, MAP_WRITE, MAP_FLAG_DISCARD);
 			pc->pass[0] = vi; pc->pass[1] = 0; pc->pass[2] = (int)rays; pc->pass[3] = v.probes;
 			memcpy(pc->rot, rot, sizeof(float) * 4);
-			pc->misc[0] = v.desc.maxRayDistance; pc->misc[1] = v.desc.hysteresis; pc->misc[2] = (float)(d->giFrame % 4096); pc->misc[3] = 0;
+			pc->misc[0] = v.desc.maxRayDistance; pc->misc[1] = d->GIHysteresis(v.desc.hysteresis); pc->misc[2] = (float)(d->giFrame % 4096); pc->misc[3] = 0;
 		}
 		auto set = [&](const char* n, IDeviceObject* o) { if (auto* s = d->giTraceSRB->GetVariableByName(SHADER_TYPE_COMPUTE, n)) s->Set(o); };
 		ITextureView* white = d->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
@@ -319,8 +369,9 @@ void NukeDiligent::updateGIVolumes()
 		d->context->DispatchCompute(da);
 		StateTransitionDesc b(d->giRayBuf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS, STATE_TRANSITION_FLAG_UPDATE_STATE);
 		d->context->TransitionResourceStates(1, &b);
-		d->GIUpdateProbes(vi, 0, v.probes, rot);
+		d->GIUpdateProbes(vi, 0, v.probes, rot, d->GIHysteresis(v.desc.hysteresis));
 	}
+	if (d->giBoost > 0) --d->giBoost;
 	d->GpuPass("scene");
 }
 
@@ -330,7 +381,7 @@ int NukeDiligent::giCaptureBudget()
 	Impl* d = m_impl;
 	if (d->rtSupported || d->giVols.empty() || !d->EnsureGIPipes()) return 0;
 	int total = 0; for (const Impl::GIVol& v : d->giVols) total += v.probes;
-	const int budget = std::min(total, std::max(kCaptureMin, std::min(kCaptureMax, total / 128)));
+	const int budget = d->GICaptureBudget(total);
 	if ((int)d->giCaptures.size() < budget) d->giCaptures.resize(budget);
 	return budget;
 }
@@ -339,6 +390,37 @@ bool NukeDiligent::giCaptureBegin(int slot, int face, float pos[3], float* nearZ
 {
 	Impl* d = m_impl;
 	if (slot < 0 || slot >= (int)d->giCaptures.size() || d->giVols.empty()) return false;
+	if (face >= 6 && face < 12)
+	{
+		// Back-face depth of face-6: same eye and frustum, drawn through the shadow path (depth
+		// only, cull none) into the slot's depth cube. ddgi_cube.cs compares it with the colour
+		// capture's distance: nearer = the ray started inside geometry (a back-face hit).
+		Impl::GICapture& c = d->giCaptures[slot];
+		if (!c.valid || !c.back || !c.backDSV[face - 6]) return false;
+		const Impl::GIVol& v = d->giVols[c.vol];
+		const int nx = v.desc.counts[0], ny = v.desc.counts[1];
+		const int cx = c.probe % nx, cy = (c.probe / nx) % ny, cz = c.probe / (nx * ny);
+		pos[0] = v.desc.origin[0] + v.desc.spacing[0] * cx;
+		pos[1] = v.desc.origin[1] + v.desc.spacing[1] * cy;
+		pos[2] = v.desc.origin[2] + v.desc.spacing[2] * cz;
+		*nearZ = c.nearZ; *farZ = v.desc.maxRayDistance;
+		static const float3 F6[6] = { { 1,0,0}, {-1,0,0}, {0, 1,0}, {0,-1,0}, {0,0, 1}, {0,0,-1} };   // = beginCubeFace
+		static const float3 U6[6] = { { 0,1,0}, { 0,1,0}, {0,0,-1}, {0,0, 1}, {0,1, 0}, {0,1, 0} };
+		const int f = face - 6;
+		float3 P(pos[0], pos[1], pos[2]);
+		float3 F = F6[f], U = U6[f], R = normalize(cross(U, F)); U = cross(F, R);
+		float4x4 view(R.x,U.x,F.x,0, R.y,U.y,F.y,0, R.z,U.z,F.z,0, -dot(P,R),-dot(P,U),-dot(P,F),1);
+		d->curShadowVP = view * float4x4::Projection(1.5707963f, 1.0f, *nearZ, *farZ, false);
+		++d->passSerial;
+		d->curTarget = 0;
+		ITextureView* dsv = c.backDSV[f];
+		d->context->SetRenderTargets(0, nullptr, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		d->context->ClearDepthStencil(dsv, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)kCaptureRes; vp.Height = (float)kCaptureRes; vp.MinDepth = 0; vp.MaxDepth = 1;
+		d->context->SetViewports(1, &vp, kCaptureRes, kCaptureRes);
+		return true;
+	}
+	if (face < 0 || face >= 6) return false;
 	// slot -> (volume, probe) by the global cursor
 	int total = 0; for (const Impl::GIVol& v : d->giVols) total += v.probes;
 	if (total == 0) return false;
@@ -354,7 +436,20 @@ bool NukeDiligent::giCaptureBegin(int slot, int face, float pos[3], float* nearZ
 	Impl::GICapture& c = d->giCaptures[slot];
 	if (!c.cube) c.cube = createReflectionCube(kCaptureRes);
 	if (!c.cube) return false;
-	c.vol = vi; c.probe = idx; c.valid = true;
+	if (!c.back)
+	{
+		TextureDesc bd; bd.Name = "DDGI back depth"; bd.Type = RESOURCE_DIM_TEX_CUBE; bd.Width = bd.Height = (Uint32)kCaptureRes;
+		bd.ArraySize = 6; bd.MipLevels = 1; bd.Format = TEX_FORMAT_D32_FLOAT; bd.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE;
+		d->device->CreateTexture(bd, nullptr, &c.back);
+		if (c.back)
+			for (int f = 0; f < 6; ++f)
+			{
+				TextureViewDesc vd; vd.Name = "DDGI back face DSV"; vd.ViewType = TEXTURE_VIEW_DEPTH_STENCIL;
+				vd.TextureDim = RESOURCE_DIM_TEX_2D_ARRAY; vd.FirstArraySlice = (Uint32)f; vd.NumArraySlices = 1;
+				c.back->CreateView(vd, &c.backDSV[f]);
+			}
+	}
+	c.vol = vi; c.probe = idx; c.valid = true; c.nearZ = *nearZ;
 	d->giCaptureMaxD = v.desc.maxRayDistance;   // world.ps writes distance / maxD into alpha while set
 	beginCubeFace(c.cube, face, pos, *nearZ, *farZ);
 	return true;
@@ -364,6 +459,7 @@ void NukeDiligent::giCaptureEnd(int slot, int face)
 {
 	Impl* d = m_impl;
 	if (slot < 0 || slot >= (int)d->giCaptures.size() || !d->giCaptures[slot].cube) return;
+	if (face >= 6) return;   // back-face depth pass: nothing to resolve
 	endCubeFace(d->giCaptures[slot].cube, face);
 	d->giCaptureMaxD = 0.0f;
 }
@@ -396,13 +492,12 @@ void NukeDiligent::giCaptureCommit()
 			MapHelper<GIPassData> pc(d->context, d->giPassCB, MAP_WRITE, MAP_FLAG_DISCARD);
 			pc->pass[0] = c.vol; pc->pass[1] = c.probe; pc->pass[2] = (int)rays; pc->pass[3] = 0;
 			memcpy(pc->rot, rot, sizeof(float) * 4);
-			// A probe is captured once per (total / budget) frames: apply the per-frame hysteresis
-			// to that interval, or a full pass would still show only half of the light.
-			const float interval = std::max(1.0f, (float)total / (float)std::max(1, (int)d->giCaptures.size()));
-			pc->misc[0] = v.desc.maxRayDistance; pc->misc[1] = powf(v.desc.hysteresis, interval); pc->misc[2] = (float)(d->giFrame % 4096); pc->misc[3] = 1;
+			pc->misc[0] = v.desc.maxRayDistance; pc->misc[1] = c.nearZ; pc->misc[2] = (float)(d->giFrame % 4096); pc->misc[3] = 1;   // cube pass: y = capture near plane
 		}
 		auto set = [&](const char* n, IDeviceObject* o) { if (auto* s = d->giCubeSRB->GetVariableByName(SHADER_TYPE_COMPUTE, n)) s->Set(o); };
 		set("g_CubeColor", cit->second.srv);
+		if (!c.back) continue;
+		set("g_CubeBack",  c.back->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
 		set("g_RayData",   d->giRayBuf->GetDefaultView(BUFFER_VIEW_UNORDERED_ACCESS));
 		d->context->SetPipelineState(d->giCubePSO);
 		d->context->CommitShaderResources(d->giCubeSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -410,10 +505,15 @@ void NukeDiligent::giCaptureCommit()
 		d->context->DispatchCompute(da);
 		StateTransitionDesc b(d->giRayBuf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS, STATE_TRANSITION_FLAG_UPDATE_STATE);
 		d->context->TransitionResourceStates(1, &b);
-		d->GIUpdateProbes(c.vol, c.probe, 1, rot);
+		// A probe is captured once per (total / budget) frames: the per-frame hysteresis applies
+		// to that interval, or a full pass would still show only half of the light. A settle
+		// pass (lighting jump) writes the fresh capture straight in.
+		const float interval = std::max(1.0f, (float)total / (float)std::max(1, (int)d->giCaptures.size()));
+		d->GIUpdateProbes(c.vol, c.probe, 1, rot, d->giBoost > 0 ? 0.0f : powf(v.desc.hysteresis, interval));
 	}
 	d->giCursor += used;
 	++d->giFrame;
+	if (d->giBoost > 0) --d->giBoost;
 	d->GpuPass("scene");
 }
 

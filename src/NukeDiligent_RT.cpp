@@ -807,14 +807,16 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 	ImmutableSamplerDesc imms[] = {
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_Probe",  samp},
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_MatTex", samp},
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_GIIrr",  samp},   // DDGI atlases (hit ambient)
 	};
 	ShaderResourceVariableDesc vars[] = {
 		{SHADER_TYPE_ALL_RAY_TRACING, "RTRefCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 		{SHADER_TYPE_ALL_RAY_TRACING, "FrameCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
+		{SHADER_TYPE_ALL_RAY_TRACING, "GICB",    SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 	};
 	ci.PSODesc.ResourceLayout.DefaultVariableType = SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC;   // TLAS/gbuffer/bindless/output
-	ci.PSODesc.ResourceLayout.Variables           = vars; ci.PSODesc.ResourceLayout.NumVariables = 2;
-	ci.PSODesc.ResourceLayout.ImmutableSamplers   = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 2;
+	ci.PSODesc.ResourceLayout.Variables           = vars; ci.PSODesc.ResourceLayout.NumVariables = 3;
+	ci.PSODesc.ResourceLayout.ImmutableSamplers   = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 3;
 
 	device->CreateRayTracingPipelineState(ci, &rtPSO);
 	if (!rtPSO) { cout << "[NukeDiligent]\tRT pipeline PSO build failed" << endl; return false; }
@@ -822,6 +824,7 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 	{
 		if (auto* v = rtPSO->GetStaticVariableByName(t, "RTRefCB")) v->Set(rtRefCB);
 		if (auto* v = rtPSO->GetStaticVariableByName(t, "FrameCB")) v->Set(worldFrameCB);
+		if (auto* v = rtPSO->GetStaticVariableByName(t, "GICB"))    v->Set(giCB);
 	}
 	rtPSO->CreateShaderResourceBinding(&rtSRB, true);
 
@@ -905,6 +908,11 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	setv("g_Depth",    gbufDepthSRV);
 	setv("g_Source",   srcSRV);
 	setv("g_Probe",    (probeActive && probeCubeSRV) ? probeCubeSRV : fallbackCubeSRV);
+	{   // dynamic GI probes for the hit ambient (GICB carries 0 volumes when GI is off; the views must still be valid)
+		ITextureView* white = whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+		setv("g_GIIrr", giIrrSRV ? giIrrSRV : white);
+		setv("g_GIVis", giVisSRV ? giVisSRV : white);
+	}
 	setv("g_AllNrm",   rtNrmSRV);
 	setv("g_AllUV",    rtUVSRV ? rtUVSRV : rtNrmSRV);
 	setv("g_AllPos",   rtPosSRV ? rtPosSRV : rtNrmSRV);

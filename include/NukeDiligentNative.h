@@ -75,6 +75,13 @@ struct Frame
 	// Active debug view (iRender::setDebugView): 0 = off, 1 = mesh cost. A module whose pass
 	// draws visible geometry should render a cost proxy instead (DrawCostProxy). ABI: appended.
 	int debugView = 0;
+
+	// Dynamic GI (DDGI) probe set for module shaders: GICB (the volumes; count 0 = GI off) and
+	// the two atlases (null while no volume is enabled). Sample with ddgi.hlsli DDGISample.
+	// ABI: appended.
+	Diligent::IBuffer* giCB = nullptr;
+	Diligent::ITextureView* giIrrSRV = nullptr;
+	Diligent::ITextureView* giVisSRV = nullptr;
 };
 
 // Fill `out` with the current state. Returns false before init / after shutdown.

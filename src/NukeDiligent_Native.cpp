@@ -1,4 +1,4 @@
-﻿#include "NukeDiligentImpl.h"
+#include "NukeDiligentImpl.h"
 #include "../include/NukeDiligentNative.h"
 
 // Implementation of the native escape hatch (NukeDiligentNative.h) plus the generic ortho
@@ -47,6 +47,7 @@ bool GetFrame(Frame& out)
 	out.lights = d->lights.empty() ? nullptr : d->lights.data();
 	out.lightCount = (int)d->lights.size();
 	out.debugView = d->debugView;
+	out.giCB = d->giCB; out.giIrrSRV = d->giIrrSRV; out.giVisSRV = d->giVisSRV;
 	return true;
 }
 

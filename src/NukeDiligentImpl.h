@@ -476,12 +476,25 @@ struct NukeDiligent::Impl
 	std::map<uint64_t, GIScroll> giScroll;
 	std::vector<GIReset> giResets;           // cells that scrolled into range: tiles zeroed before the next update
 	void ApplyGIResets();
-	struct GICapture { uint64_t cube = 0; int vol = 0, probe = 0; bool valid = false; };
+	struct GICapture
+	{
+		uint64_t cube = 0; int vol = 0, probe = 0; bool valid = false; float nearZ = 0.05f;
+		RefCntAutoPtr<ITexture> back; RefCntAutoPtr<ITextureView> backDSV[6];   // back-face depth cube (faces 6..11)
+	};
 	std::vector<GIVol> giVols;
 	std::vector<GICapture> giCaptures;   // raster fallback: probes captured this frame (budget slots)
 	uint64_t giCursor = 0, giLayoutSig = 0, giFrame = 0;
 	int giIrrW = 0, giIrrH = 0, giVisW = 0, giVisH = 0;
 	float giCaptureMaxD = 0.0f;              // > 0 while a probe cube face renders: world.ps writes distance / this into alpha
+	// Lighting-environment watch (sky + directional lights): a jump - the sun teleported, a light
+	// switched, a new time of day set - shortens the hysteresis (RT) / widens the capture budget
+	// (raster) for one settle pass, so the probes follow within a few frames instead of the
+	// steady-state smoothing. Slow drift (a running day) is tracked by the normal hysteresis.
+	static const int kGIEnvN = 40;
+	float giEnvAnchor[kGIEnvN] = {}; bool giEnvValid = false; int giBoost = 0;   // giBoost = settle frames left
+	void  GIEnvTick();
+	float GIHysteresis(float h) const { return giBoost > 0 ? (h < 0.6f ? h : 0.6f) : h; }
+	int   GICaptureBudget(int total) const;
 	RefCntAutoPtr<ITexture> giIrrAtlas, giVisAtlas;
 	ITextureView* giIrrSRV = nullptr; ITextureView* giVisSRV = nullptr;
 	RefCntAutoPtr<IBuffer> giCB, giPassCB, giProbeCB, giRayBuf; uint32_t giRayCap = 0;
@@ -493,7 +506,7 @@ struct NukeDiligent::Impl
 	bool BuildGIPipes();
 	bool EnsureGIPipes();
 	void EnsureGIRays(uint32_t count);
-	void GIUpdateProbes(int vi, int first, int count, const float rot[4]);
+	void GIUpdateProbes(int vi, int first, int count, const float rot[4], float hysteresis);   // the blend the update pass uses
 	void DrawGIProbes();
 
 	// --- Screen-space GI (contact bounce from the lit history) ---------------------------------
