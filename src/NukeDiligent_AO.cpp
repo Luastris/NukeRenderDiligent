@@ -195,6 +195,16 @@ void NukeDiligent::Impl::PruneCameraStates()
 		}
 		else ++it;
 	}
+	for (auto it = ssgiStates.begin(); it != ssgiStates.end();)
+	{
+		if (frameId - it->second.lastUsed > kStale)
+		{
+			SSGIState& s = it->second;
+			Trash(s.lit); Trash(s.raw); Trash(s.den); Trash(s.den2); Trash(s.den3); Trash(s.resolved); Trash(s.hist[0]); Trash(s.hist[1]); Trash(s.histZ[0]); Trash(s.histZ[1]);
+			it = ssgiStates.erase(it);
+		}
+		else ++it;
+	}
 	for (auto it = occlViews.begin(); it != occlViews.end();)
 	{
 		if (occlFrame - it->second.lastUsed > kStale)

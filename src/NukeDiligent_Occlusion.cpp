@@ -154,7 +154,13 @@ void NukeDiligent::Impl::OcclBeginCamera()
 		if (r.pending > 0) { --r.pending; continue; }
 		void* p = nullptr;
 		context->MapBuffer(r.staging, MAP_READ, MAP_FLAG_DO_NOT_WAIT, p);
-		if (!p) continue;
+		if (!p)
+		{
+			// D3D11 answers WAS_STILL_DRAWING (null), but the debug context already booked the
+			// buffer as mapped: release the booking or the next map asserts "already been mapped".
+			context->UnmapBuffer(r.staging, MAP_READ);
+			continue;
+		}
 		const Uint32* vis = (const Uint32*)p;
 		for (size_t i = 0; i < r.ids.size(); ++i)
 		{

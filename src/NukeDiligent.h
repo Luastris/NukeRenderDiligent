@@ -88,6 +88,13 @@ public:
 	uint64_t claimScreenOverlay(int* w, int* h) override;
 	void setDebugView(int mode) override;
 	void setAmbientOcclusion(int quality, float radius, float intensity, float power) override;
+	void setGIVolumes(const NukeGIVolumeDesc* volumes, int count) override;
+	void updateGIVolumes() override;
+	int  giCaptureBudget() override;
+	bool giCaptureBegin(int slot, int face, float pos[3], float* nearZ, float* farZ) override;
+	void giCaptureEnd(int slot, int face) override;
+	void giCaptureCommit() override;
+	void setScreenGI(int quality, float radius, float intensity) override;
 	// GPU instancing
 	uint64_t createInstanceBuffer() override;
 	void     updateInstanceBuffer(uint64_t id, const NukeInstanceData* data, int count) override;

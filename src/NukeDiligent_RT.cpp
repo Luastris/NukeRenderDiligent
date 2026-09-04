@@ -397,6 +397,9 @@ void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
 	inst.pBLAS    = blas;
 	// TLAS visibility bits: 0x01 = reflection rays (RT_REFLECT_MASK), 0x02 = shadow rays; upper bits reserved.
 	inst.Mask     = (Uint8)(0xFC | (inReflections ? 0x01 : 0x00) | (castShadows ? 0x02 : 0x00));
+	// Every instance stays NON-opaque on purpose: the any-hit alpha test (cutout / hashed / wipe /
+	// particle footprints) must run for reflections, and every RayQuery consumer (RT shadows,
+	// RT-AO, DDGI probes) commits its candidates explicitly — the material checkboxes keep working.
 	inst.Flags    = RAYTRACING_INSTANCE_NONE;
 	inst.CustomId = (Uint32)m_impl->rtInstances.size();   // -> g_Instances index (InstanceID() in the shader)
 	inst.ContributionToHitGroupIndex = TLAS_INSTANCE_OFFSET_AUTO;   // PER_TLAS binding: offset computed by Diligent

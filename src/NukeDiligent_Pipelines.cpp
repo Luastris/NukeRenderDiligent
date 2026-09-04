@@ -146,6 +146,13 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	dfbd.Name = "DrawFlags CB"; dfbd.Size = sizeof(float) * 4; dfbd.Usage = USAGE_DYNAMIC;
 	dfbd.BindFlags = BIND_UNIFORM_BUFFER; dfbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(dfbd, nullptr, &drawFlagsCB);
+	// DDGI cbuffers exist from the start: the world PSOs bind GICB statically.
+	{
+		BufferDesc gd; gd.Usage = USAGE_DYNAMIC; gd.BindFlags = BIND_UNIFORM_BUFFER; gd.CPUAccessFlags = CPU_ACCESS_WRITE;
+		gd.Name = "GICB";      gd.Size = 8 * 96 + 32; device->CreateBuffer(gd, nullptr, &giCB);
+		gd.Name = "GIPassCB";  gd.Size = 48;          device->CreateBuffer(gd, nullptr, &giPassCB);
+		gd.Name = "GIProbeCB"; gd.Size = 64 + 16;     device->CreateBuffer(gd, nullptr, &giProbeCB);
+	}
 
 	// The boot stand-in world pipeline: synchronous and tiny, so the very first frame draws the
 	// scene unlit-textured while the real world pipelines build in the background.
@@ -481,6 +488,9 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	vars.push_back({SHADER_TYPE_PIXEL, "g_MskStamp",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	vars.push_back({SHADER_TYPE_PIXEL, "g_SceneRefr", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	vars.push_back({SHADER_TYPE_PIXEL, "g_ScreenAO",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // Load-only: no sampler
+	vars.push_back({SHADER_TYPE_PIXEL, "g_GIIrr",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // DDGI atlases (shared g_GIIrr_sampler)
+	vars.push_back({SHADER_TYPE_PIXEL, "g_GIVis",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+	vars.push_back({SHADER_TYPE_PIXEL, "g_ScreenGI",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // Load-only: no sampler
 	// Generic per-layer maps: any PS SRV named g_LayerN*/g_LayerMR*/g_LayerH* becomes a DYNAMIC
 	// var, filled from Material::extraTex by name (one shared sampler on g_LayerN0 below).
 	std::vector<std::string> extraNames;
@@ -506,8 +516,9 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	// immutable sampler, and only for the maps this shader actually declares (unassigned ones warn).
 	static const char* const kMapTex[] = { "g_Tex", "g_Normal", "g_MetalRough", "g_Occlusion", "g_Emissive", "g_Spec", "g_WipeMask", "g_Height",
 	                                       "g_Ov0Alb",     // ONE sampler serves the whole overlay block (D3D11 sampler cap)
-	                                       "g_LayerN0" };  // ...and one for the whole g_Layer* block
-	ImmutableSamplerDesc immSamp[10]; Uint32 nImm = 0;
+	                                       "g_LayerN0",    // ...and one for the whole g_Layer* block
+	                                       "g_GIIrr" };    // DDGI atlases (irradiance + visibility share it)
+	ImmutableSamplerDesc immSamp[11]; Uint32 nImm = 0;
 	ps->GetStatus(true);   // async compile (cache miss): reflection needs the FINISHED shader
 	const Uint32 nRes = ps->GetResourceCount();
 	for (const char* nm : kMapTex)
@@ -527,6 +538,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		if (auto* f = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "FrameCB")) f->Set(worldFrameCB);
 		if (auto* b = pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "BendCB"))  b->Set(bendCB);   // instanced variants only (7.4)
 		if (auto* d = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "DrawFlagsCB")) d->Set(drawFlagsCB);   // receiveShadows etc.
+		if (auto* g = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "GICB"))    g->Set(giCB);          // DDGI volumes
 	};
 
 	// Rebuild path: release first — Diligent asserts on Create over a non-null ref.
@@ -746,6 +758,9 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.mskVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_MskStamp");
 	wp.refrVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneRefr");
 	wp.saoVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ScreenAO");
+	wp.giIrrVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GIIrr");
+	wp.giVisVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GIVis");
+	wp.sgiVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ScreenGI");
 	wp.extraVars.clear();
 	for (const std::string& n : extraNames)
 		if (auto* v = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, n.c_str()))
@@ -849,6 +864,9 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				wp.mskVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_MskStamp");
 				wp.refrVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneRefr");
 				wp.saoVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_ScreenAO");
+				wp.giIrrVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_GIIrr");
+				wp.giVisVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_GIVis");
+				wp.sgiVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_ScreenGI");
 				}
 			}
 		}

@@ -467,6 +467,48 @@ struct NukeDiligent::Impl
 	bool BuildAOPipes();
 	void RunAO(int w, int h);
 
+	// --- Dynamic diffuse GI (DDGI) ------------------------------------------------------------
+	// Volumes pushed per frame; two shared atlases (8x8 irradiance / 16x16 visibility tiles + borders);
+	// probe rays by compute + RayQuery, or cube captures folded in by ddgi_cube.cs without RT.
+	struct GIVol { NukeGIVolumeDesc desc; int probes = 0, perRow = 0, rows = 0, irrX = 0, irrY = 0, visX = 0, visY = 0; int scroll[3] = {0, 0, 0}; };
+	struct GIScroll { long long cell[3] = {0, 0, 0}; int scroll[3] = {0, 0, 0}; bool valid = false; };   // per volume id, across frames
+	struct GIReset { int vol, axis, first, count; };
+	std::map<uint64_t, GIScroll> giScroll;
+	std::vector<GIReset> giResets;           // cells that scrolled into range: tiles zeroed before the next update
+	void ApplyGIResets();
+	struct GICapture { uint64_t cube = 0; int vol = 0, probe = 0; bool valid = false; };
+	std::vector<GIVol> giVols;
+	std::vector<GICapture> giCaptures;   // raster fallback: probes captured this frame (budget slots)
+	uint64_t giCursor = 0, giLayoutSig = 0, giFrame = 0;
+	int giIrrW = 0, giIrrH = 0, giVisW = 0, giVisH = 0;
+	float giCaptureMaxD = 0.0f;              // > 0 while a probe cube face renders: world.ps writes distance / this into alpha
+	RefCntAutoPtr<ITexture> giIrrAtlas, giVisAtlas;
+	ITextureView* giIrrSRV = nullptr; ITextureView* giVisSRV = nullptr;
+	RefCntAutoPtr<IBuffer> giCB, giPassCB, giProbeCB, giRayBuf; uint32_t giRayCap = 0;
+	RefCntAutoPtr<IPipelineState> giTracePSO, giUpdatePSO, giCubePSO, giProbePSO;
+	RefCntAutoPtr<IShaderResourceBinding> giTraceSRB, giUpdateSRB, giCubeSRB, giProbeSRB;
+	std::atomic<bool> giBuilding{false}; bool giFailed = false;
+	int giProbeSamples = 0; TEXTURE_FORMAT giProbeFmt = TEX_FORMAT_UNKNOWN;
+	void WriteGICB();
+	bool BuildGIPipes();
+	bool EnsureGIPipes();
+	void EnsureGIRays(uint32_t count);
+	void GIUpdateProbes(int vi, int first, int count, const float rot[4]);
+	void DrawGIProbes();
+
+	// --- Screen-space GI (contact bounce from the lit history) ---------------------------------
+	int   ssgiQuality = 0; float ssgiRadius = 1.0f, ssgiIntensity = 1.0f;
+	PostPipe ssgiPipe, ssgiResolvePipe;
+	RefCntAutoPtr<IBuffer> ssgiCB;
+	std::atomic<bool> ssgiBuilding{false}; bool ssgiFailed = false;
+	struct SSGIState { RefCntAutoPtr<ITexture> lit, raw, den, den2, den3, resolved, hist[2], histZ[2]; int w = 0, h = 0, lw = 0, lh = 0, litW = 0, litH = 0, cur = 0; bool valid = false, litValid = false; uint64_t lastUsed = 0; };
+	std::map<uint64_t, SSGIState> ssgiStates;   // per camera key
+	ITextureView* screenGISRV = nullptr;         // this camera's bounce for the world PS (null = none)
+	int ssgiFrame = 0;
+	bool BuildSSGIPipes();
+	void RunSSGI(int w, int h);
+	void KeepSSGILitHistory(ITextureView* sceneSRV, int w, int h);
+
 	// --- Hi-Z occlusion culling -----------------------------------------------------------------------
 	// Two-phase per camera: draws whose id the visibility history calls visible go straight through
 	// (phase 1); the rest are deferred. endOpaque builds a MAX depth pyramid from what was drawn,
@@ -699,6 +741,8 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              flowVar = nullptr;   // PS "g_Flow"
 		IShaderResourceVariable*              refrVar = nullptr;   // PS "g_SceneRefr"
 		IShaderResourceVariable*              saoVar = nullptr;    // PS "g_ScreenAO" (screen-space AO visibility)
+		IShaderResourceVariable*              giIrrVar = nullptr, *giVisVar = nullptr;   // PS DDGI atlases
+		IShaderResourceVariable*              sgiVar = nullptr;    // PS "g_ScreenGI" (screen-space bounce)
 		IShaderResourceVariable*              mskVar  = nullptr;   // PS "g_MskStamp" (LiveMask stamp)
 		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
@@ -714,13 +758,13 @@ struct NukeDiligent::Impl
 		                        *shadowVarI = nullptr, *cubeVarI = nullptr, *probeVarI = nullptr, *tlasVarI = nullptr,
 		                        *rtInstVarI = nullptr;
 		IShaderResourceVariable *ovVarI[kOvTexCount] = {};
-		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr, *mskVarI = nullptr, *saoVarI = nullptr;
+		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr, *mskVarI = nullptr, *saoVarI = nullptr, *giIrrVarI = nullptr, *giVisVarI = nullptr, *sgiVarI = nullptr;
 		// Redundancy gates: object each DYNAMIC variable currently holds — Diligent rewrites the
 		// descriptor cache on EVERY Set() of a dynamic var, so only Set() on an actual change.
 		// [0..12] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst,wipe,height;
-		// [13..] = overlay-slot maps (OvTexNames() order), then flow, scene-refraction, mask stamp, screen AO.
-		IDeviceObject* lastBind[13 + kOvTexCount + 4]  = {};
-		IDeviceObject* lastBindI[13 + kOvTexCount + 4] = {};
+		// [13..] = overlay-slot maps (OvTexNames() order), then flow, scene-refraction, mask stamp, screen AO, GI irradiance, GI visibility, screen GI.
+		IDeviceObject* lastBind[13 + kOvTexCount + 7]  = {};
+		IDeviceObject* lastBindI[13 + kOvTexCount + 7] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
 		std::string hsSrc, dsSrc;        // CUSTOM tess stages (empty = shared world.hs/world.ds)
 		bool tessCustom = false;         // the shader SHIPPED hs/ds (builder copies resolve the shared pair into hsSrc)
@@ -877,7 +921,8 @@ struct NukeDiligent::Impl
 	                     float shadowVP[16 * 4]; float shadowParams[4];        // 4 = SHADOW_SLOTS
 	                     float skyTop[4]; float skyHorizon[4]; float skyGround[4]; float skyParams[4];      // IBL
 	                     float probePos[4]; float probeParams[4]; float probeBox[4];    // probe: pos.xyz+active, intensity+maxMip, boxHalf.xyz+valid
-	                     float wind[4]; float wind2[4]; };   // dir.xyz+gusted strength; turbAmount, 1/turbScale, time, gustFreq
+	                     float wind[4]; float wind2[4];      // dir.xyz+gusted strength; turbAmount, 1/turbScale, time, gustFreq
+	                     float misc[4]; };                    // x = GI probe capture (alpha = distance / y), y = max distance
 	float windDirStrength[4] = { 1, 0, 0, 0 };   // setWind (pushed per frame)
 	float windParams[4]      = { 0, 0, 0, 0 };
 	// Foliage bend: the VS-side BendCB — wind + up to 8 "pushers" that part the blades. Written

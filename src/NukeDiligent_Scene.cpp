@@ -393,6 +393,9 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		bindIf(wp.refrVar, m_impl->refrSRV ? m_impl->refrSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 1]);
 	bindIf(wp.mskVar, (mat && mat->mskStamp) ? m_impl->GetTexSRV(mat->mskStamp) : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 2]);
 	bindIf(wp.saoVar, m_impl->screenAOSRV ? m_impl->screenAOSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 3]);
+	bindIf(wp.giIrrVar, m_impl->giIrrSRV ? m_impl->giIrrSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 4]);
+	bindIf(wp.giVisVar, m_impl->giVisSRV ? m_impl->giVisSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 5]);
+	bindIf(wp.sgiVar, m_impl->screenGISRV ? m_impl->screenGISRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 6]);
 	// Generic named textures (terrain layer normal/MR maps): shader-declared g_Layer* SRVs fill
 	// from the material's extraTex by name; pointer-gated like everything else.
 	for (auto& ex : wp.extraVars)
@@ -477,6 +480,9 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		TP(SHADER_TYPE_PIXEL, "g_MskStamp",  (mat && mat->mskStamp) ? (IDeviceObject*)m_impl->GetTexSRV(mat->mskStamp) : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_SceneRefr", m_impl->refrSRV ? (IDeviceObject*)m_impl->refrSRV : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_ScreenAO",  m_impl->screenAOSRV ? (IDeviceObject*)m_impl->screenAOSRV : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_GIIrr",     m_impl->giIrrSRV ? (IDeviceObject*)m_impl->giIrrSRV : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_GIVis",     m_impl->giVisSRV ? (IDeviceObject*)m_impl->giVisSRV : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_ScreenGI",  m_impl->screenGISRV ? (IDeviceObject*)m_impl->screenGISRV : (IDeviceObject*)whiteSRV);
 		// Generic named textures (terrain layer maps): EVERY declared g_Layer* var gets bound —
 		// absent maps fall back to white, or Diligent's validation floods the console with
 		// "No resource is bound" on every draw (a slideshow of its own). PIXEL + DOMAIN (the
@@ -726,6 +732,7 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 	fb->probeBox[0] = probeBoxHalf[0]; fb->probeBox[1] = probeBoxHalf[1]; fb->probeBox[2] = probeBoxHalf[2]; fb->probeBox[3] = box ? 1.0f : 0.0f;
 	memcpy(fb->wind,  windDirStrength, sizeof(fb->wind));    // 7.2: g_Wind (dir.xyz, gusted strength)
 	memcpy(fb->wind2, windParams,      sizeof(fb->wind2));   //      g_Wind2 (turbAmount, 1/turbScale, time, gustFreq)
+	fb->misc[0] = giCaptureMaxD > 0.0f ? 1.0f : 0.0f; fb->misc[1] = giCaptureMaxD; fb->misc[2] = fb->misc[3] = 0.0f;
 }
 
 void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
@@ -786,6 +793,7 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 		}
 	}
 
+	m_impl->WriteGICB();   // DDGI volumes for this camera's draws (dynamic CB: every frame)
 	// Screen-space AO off this camera's prepass, before its colour targets bind (the world
 	// PS reads the result through g_ScreenAO; white while off / still building).
 	m_impl->screenAOSRV = nullptr;
@@ -793,6 +801,13 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	{
 		m_impl->GpuPass("ao");
 		m_impl->RunAO(w, h);
+		m_impl->GpuPass("scene");
+	}
+	m_impl->screenGISRV = nullptr;
+	if (m_impl->ssgiQuality > 0 && m_impl->gbufActive)   // screen-space bounce from last frame's lit scene
+	{
+		m_impl->GpuPass("ssgi");
+		m_impl->RunSSGI(w, h);
 		m_impl->GpuPass("scene");
 	}
 
@@ -1497,6 +1512,7 @@ void NukeDiligent::Impl::DrawCostProxyBox(const float pos[3], const float quat[4
 void NukeDiligent::endCamera()
 {
 	if (m_impl->occlPassActive) endOpaque();   // engine skipped the opaque-scope close: never drop geometry
+	m_impl->DrawGIProbes();          // DDGI Debug Probes: lit spheres, depth-tested against the camera
 	m_impl->DrawEditorGridPass();    // the infinite grid, under the gizmo lines
 	m_impl->DrawDepthDebugLines();   // depth-tested gizmos: against this camera's still-bound MS depth
 	m_impl->FlushSprites();     // draw any pending sprite batch WHILE the (MS) camera targets are still bound
@@ -1518,6 +1534,9 @@ void NukeDiligent::endCamera()
 		m_impl->BlitTexture(m_impl->screenAOSRV, m_impl->curPostSrc->GetTexture());
 	}
 	m_impl->screenAOSRV = nullptr;   // this camera's only: shadow/preview passes read white
+	m_impl->screenGISRV = nullptr;
+	if (m_impl->debugView == 0 && m_impl->gbufActive)   // the lit scene (pre-post) becomes next frame's SSGI history
+		m_impl->KeepSSGILitHistory(m_impl->curPostSrc, m_impl->curRTW, m_impl->curRTH);
 	// 1.5) Module post hook — after the resolve, BEFORE the user chain: its output is scene content.
 	ITextureView* chainSrc = m_impl->curPostSrc;
 	{
@@ -1918,6 +1937,9 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 		bindIf(wp.refrVarI, m_impl->refrSRV ? m_impl->refrSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 1]);
 		bindIf(wp.mskVarI, (mat && mat->mskStamp) ? m_impl->GetTexSRV(mat->mskStamp) : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 2]);
 		bindIf(wp.saoVarI, m_impl->screenAOSRV ? m_impl->screenAOSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 3]);
+		bindIf(wp.giIrrVarI, m_impl->giIrrSRV ? m_impl->giIrrSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 4]);
+		bindIf(wp.giVisVarI, m_impl->giVisSRV ? m_impl->giVisSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 5]);
+		bindIf(wp.sgiVarI, m_impl->screenGISRV ? m_impl->screenGISRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 6]);
 	}
 
 	IDeviceContext* ctx = m_impl->context;
