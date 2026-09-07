@@ -95,6 +95,12 @@ public:
 	void giCaptureEnd(int slot, int face) override;
 	void giCaptureCommit() override;
 	void setScreenGI(int quality, float radius, float intensity) override;
+	void setVolumetrics(const NukeVolumetricsDesc& desc) override;
+	void setFogVolumes(const NukeFogVolumeDesc* volumes, int count) override;
+	void setSpriteVolumeLight(float amount) override;
+	void drawSpriteRunSixWay(Texture* lightA, Texture* lightB, const float* verts, int vertCount) override;
+	const char* backendName() override;
+	void setFogDisplacers(const NukeFogDisplacerDesc* displacers, int count) override;
 	// GPU instancing
 	uint64_t createInstanceBuffer() override;
 	void     updateInstanceBuffer(uint64_t id, const NukeInstanceData* data, int count) override;

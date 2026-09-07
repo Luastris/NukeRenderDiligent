@@ -13,7 +13,8 @@ void NukeDiligent::Impl::CreateSpriteResources()
 	std::string vs = shaderSource("sprite.vs"), ps = shaderSource("sprite.ps");
 	if (vs.empty() || ps.empty()) { std::cout << "[NukeDiligent]\tsprite shaders missing" << std::endl; return; }
 
-	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	auto sf = ShaderFactory();   // sprite.ps / sprite_six.ps include vol.hlsli
+	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL; sci.pShaderSourceStreamFactory = sf;
 	RefCntAutoPtr<IShader> v, p;
 	sci.Desc = {"Sprite VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &v);
 	sci.Desc = {"Sprite PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &p);
@@ -47,24 +48,41 @@ void NukeDiligent::Impl::CreateSpriteResources()
 	ci.pVS = v; ci.pPS = p;
 
 	// g_Sprite: dynamic PS texture + a linear-clamp immutable sampler (combined-sampler convention).
+	// g_VolInteg / g_VolLight: this camera's froxel grid (own-column fog + grid light), white3D when off.
 	ShaderResourceVariableDesc vars[] = { {SHADER_TYPE_PIXEL, "g_Sprite",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-	                                      {SHADER_TYPE_PIXEL, "g_SceneDepth", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC} };   // soft particles (Load — no sampler)
+	                                      {SHADER_TYPE_PIXEL, "g_SceneDepth", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},    // soft particles / fog depth (Load — no sampler)
+	                                      {SHADER_TYPE_PIXEL, "g_VolInteg",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+	                                      {SHADER_TYPE_PIXEL, "g_VolLight",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC} };
 	SamplerDesc samp;
 	samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP; samp.AddressW = TEXTURE_ADDRESS_CLAMP;
-	ImmutableSamplerDesc imms[] = { {SHADER_TYPE_PIXEL, "g_Sprite", samp} };
-	ci.PSODesc.ResourceLayout.Variables            = vars; ci.PSODesc.ResourceLayout.NumVariables         = 2;
-	ci.PSODesc.ResourceLayout.ImmutableSamplers    = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+	ImmutableSamplerDesc imms[] = { {SHADER_TYPE_PIXEL, "g_Sprite", samp}, {SHADER_TYPE_PIXEL, "g_VolInteg", samp}, {SHADER_TYPE_PIXEL, "g_VolLight", samp} };
+	ci.PSODesc.ResourceLayout.Variables            = vars; ci.PSODesc.ResourceLayout.NumVariables         = 4;
+	ci.PSODesc.ResourceLayout.ImmutableSamplers    = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 3;
 	ci.PSODesc.ResourceLayout.DefaultVariableType  = SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
+
+	if (!whiteTex3D)
+	{
+		TextureDesc td; td.Name = "White 1x1x1"; td.Type = RESOURCE_DIM_TEX_3D; td.Width = td.Height = td.Depth = 1;
+		td.MipLevels = 1; td.Format = TEX_FORMAT_RGBA8_UNORM; td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
+		const uint8_t px[4] = {255, 255, 255, 255};
+		TextureSubResData sub; sub.pData = px; sub.Stride = 4; sub.DepthStride = 4;
+		TextureData init; init.pSubResources = &sub; init.NumSubresources = 1;
+		device->CreateTexture(td, &init, &whiteTex3D);
+	}
+	ITextureView* white3 = whiteTex3D ? whiteTex3D->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
 
 	CreateGraphicsPipelineStateCached(ci, &spritePSO);
 	if (spritePSO)
 	{
 		if (auto* sv = spritePSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "SpriteCB")) sv->Set(spriteCB);
 		if (auto* sp = spritePSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "SpriteCB")) sp->Set(spriteCB);
+		if (auto* sp = spritePSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "VolCB"))    sp->Set(volCB);
 		spritePSO->CreateShaderResourceBinding(&spriteSRB, true);
 		if (spriteSRB) spriteTexVar   = spriteSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Sprite");
 		if (spriteSRB) spriteDepthVar = spriteSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneDepth");
+		if (spriteSRB) spriteVolIntegVar = spriteSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolInteg");
+		if (spriteSRB) spriteVolLightVar = spriteSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolLight");
 	}
 
 	// After-post screen variants: same shaders, RTV in the output format, single-sample, no depth.
@@ -84,18 +102,21 @@ void NukeDiligent::Impl::CreateSpriteResources()
 		b.SrcBlendAlpha = BLEND_FACTOR_ONE; b.DestBlendAlpha = BLEND_FACTOR_INV_SRC_ALPHA; b.BlendOpAlpha = BLEND_OPERATION_ADD;
 		g.InputLayout.LayoutElements = layout; g.InputLayout.NumElements = 3;
 		si.pVS = v; si.pPS = p;
-		si.PSODesc.ResourceLayout.Variables            = vars; si.PSODesc.ResourceLayout.NumVariables         = 2;
-		si.PSODesc.ResourceLayout.ImmutableSamplers    = imms; si.PSODesc.ResourceLayout.NumImmutableSamplers = 1;
+		si.PSODesc.ResourceLayout.Variables            = vars; si.PSODesc.ResourceLayout.NumVariables         = 4;
+		si.PSODesc.ResourceLayout.ImmutableSamplers    = imms; si.PSODesc.ResourceLayout.NumImmutableSamplers = 3;
 		si.PSODesc.ResourceLayout.DefaultVariableType  = SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
 		CreateGraphicsPipelineStateCached(si, &pso);
 		if (pso)
 		{
 			if (auto* sv = pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "SpriteCB")) sv->Set(spriteCB);
 			if (auto* sp = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "SpriteCB")) sp->Set(spriteCB);
+			if (auto* sp = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "VolCB"))    sp->Set(volCB);
 			pso->CreateShaderResourceBinding(&srb, true);
 			if (srb) tvar = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Sprite");
 			if (srb) if (auto* dv = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneDepth"))
-				dv->Set(whiteTex ? whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr);   // screen sprites: soft always off
+				dv->Set(whiteTex ? whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr);   // screen sprites: soft/fog always off
+			if (srb) if (auto* v = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolInteg")) v->Set(white3);
+			if (srb) if (auto* v = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolLight")) v->Set(white3);
 		}
 	};
 	buildScreen(TEX_FORMAT_RGBA8_UNORM, "Sprite Screen PSO", spriteScreenPSO, spriteScreenSRB, spriteScreenTexVar);
@@ -139,8 +160,62 @@ void NukeDiligent::Impl::CreateSpriteResources()
 		}
 	}
 
+	// Six-way lit smoke (drawSpriteRunSixWay): lit VS (world position through) + sprite_six.ps.
+	spriteSixPSO.Release(); spriteSixSRBs.clear();
+	std::string sps = shaderSource("sprite_six.ps");
+	if (!lvs.empty() && !sps.empty() && worldFrameCB && spriteLitCB)
+	{
+		RefCntAutoPtr<IShader> lv, sp;
+		sci.Desc = {"SpriteLit VS", SHADER_TYPE_VERTEX, true}; sci.Source = lvs.c_str(); CreateShaderCached(sci, &lv);
+		sci.Desc = {"SpriteSix PS", SHADER_TYPE_PIXEL, true};  sci.Source = sps.c_str(); CreateShaderCached(sci, &sp);
+		if (lv && sp)
+		{
+			GraphicsPipelineStateCreateInfo si; si.PSODesc.Name = "SpriteSix PSO";
+			auto& sg = si.GraphicsPipeline;
+			sg = gp;
+			sg.InputLayout.LayoutElements = layout; sg.InputLayout.NumElements = 3;
+			si.pVS = lv; si.pPS = sp;
+			ShaderResourceVariableDesc svars[] = {
+				{SHADER_TYPE_PIXEL, "g_Sprite",     SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+				{SHADER_TYPE_PIXEL, "g_SpriteB",    SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+				{SHADER_TYPE_PIXEL, "g_SceneDepth", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+				{SHADER_TYPE_PIXEL, "g_VolInteg",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+				{SHADER_TYPE_PIXEL, "g_VolLight",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC} };
+			ImmutableSamplerDesc simms[] = { {SHADER_TYPE_PIXEL, "g_Sprite", samp}, {SHADER_TYPE_PIXEL, "g_SpriteB", samp},
+			                                 {SHADER_TYPE_PIXEL, "g_VolInteg", samp}, {SHADER_TYPE_PIXEL, "g_VolLight", samp} };
+			si.PSODesc.ResourceLayout.Variables            = svars; si.PSODesc.ResourceLayout.NumVariables         = 5;
+			si.PSODesc.ResourceLayout.ImmutableSamplers    = simms; si.PSODesc.ResourceLayout.NumImmutableSamplers = 4;
+			si.PSODesc.ResourceLayout.DefaultVariableType  = SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
+			CreateGraphicsPipelineStateCached(si, &spriteSixPSO);
+			if (spriteSixPSO)
+			{
+				if (auto* sv = spriteSixPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "SpriteCB"))    sv->Set(spriteCB);
+				if (auto* sv = spriteSixPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "SpriteCB"))    sv->Set(spriteCB);
+				if (auto* sv = spriteSixPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "SpriteLitCB")) sv->Set(spriteLitCB);
+				if (auto* sv = spriteSixPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "FrameCB"))     sv->Set(worldFrameCB);
+				if (auto* sv = spriteSixPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "VolCB"))       sv->Set(volCB);
+			}
+		}
+	}
+
 	std::cout << "[NukeDiligent]\tsprite pipeline" << (spritePSO ? " ready" : " FAILED")
-	          << (spriteLitPSO ? " (+lit)" : "") << std::endl;
+	          << (spriteLitPSO ? " (+lit)" : "") << (spriteSixPSO ? " (+six-way)" : "") << std::endl;
+}
+
+// The froxel grid for a sprite run: this camera's integrated columns + incident light (white3D
+// when volumetrics are off), the prepass depth for the fog behind the sprite, and g_Soft2 =
+// (grid active, light amount). softOut says whether the soft fade may run (needs the prepass).
+void NukeDiligent::Impl::BindSpriteVolume(IShaderResourceBinding* srb, IShaderResourceVariable* integVar, IShaderResourceVariable* lightVar,
+                                          IShaderResourceVariable* depthVar, float soft2[4], bool& softOut)
+{
+	(void)srb;
+	const bool grid = volCur && volCur->integ && volCur->light && gbufActive && gbufDepthSRV;
+	ITextureView* white3 = whiteTex3D ? whiteTex3D->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
+	if (integVar) integVar->Set(grid ? volCur->integ->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : white3);
+	if (lightVar) lightVar->Set(grid ? volCur->light->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : white3);
+	softOut = spriteSoftDist > 0.f && gbufActive && gbufDepthSRV;
+	if (depthVar) depthVar->Set((softOut || grid) ? gbufDepthSRV : whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	soft2[0] = grid ? 1.f : 0.f; soft2[1] = grid ? spriteVolLight : 0.f; soft2[2] = soft2[3] = 0.f;
 }
 
 // Accumulate one quad; the batch flushes when the texture changes or at endCamera.
@@ -151,6 +226,7 @@ void NukeDiligent::drawSprite(Texture* tex, const float center[3], const float r
 	if (!m_impl->spritePSO || !tex) return;
 	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw
 	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();   // kind switch: keep paint order
+	if (m_impl->spriteSixA) m_impl->FlushSpritesSix();
 	if (m_impl->spriteBatchOpen && tex != m_impl->spriteBatchTex) m_impl->FlushSprites();   // texture changed -> new batch
 	m_impl->spriteBatchTex = tex;
 	m_impl->spriteBatchOpen = true;
@@ -175,7 +251,33 @@ void NukeDiligent::setSpriteSoftDepth(float dist)
 	if (dist < 0.f) dist = 0.f;
 	if (m_impl->spriteSoftDist == dist) return;
 	if (m_impl->spriteBatchOpen) m_impl->FlushSprites();
+	if (m_impl->spriteSixA) m_impl->FlushSpritesSix();
 	m_impl->spriteSoftDist = dist;
+}
+
+// Froxel-grid lighting amount for subsequent sprite runs (0 = off, 1 = the grid's incident light
+// replaces the authored brightness); flushes the open batches.
+void NukeDiligent::setSpriteVolumeLight(float amount)
+{
+	amount = amount < 0.f ? 0.f : (amount > 1.f ? 1.f : amount);
+	if (m_impl->spriteVolLight == amount) return;
+	if (m_impl->spriteBatchOpen) m_impl->FlushSprites();
+	if (m_impl->spriteSixA) m_impl->FlushSpritesSix();
+	m_impl->spriteVolLight = amount;
+}
+
+// Six-way lit smoke run (two lightmaps); falls back to the unlit run without the PSO or maps.
+void NukeDiligent::drawSpriteRunSixWay(Texture* lightA, Texture* lightB, const float* verts, int vertCount)
+{
+	m_impl->lastInstBind.pso = nullptr;
+	if (!m_impl->spriteSixPSO || !lightA || !lightB) { drawSpriteRun(lightA, verts, vertCount); return; }
+	if (!verts || vertCount <= 0 || !m_impl->cameraPassActive) return;
+	if (m_impl->spriteBatchOpen) m_impl->FlushSprites();    // kind switch: keep paint order
+	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();
+	if (m_impl->spriteSixA && (lightA != m_impl->spriteSixA || lightB != m_impl->spriteSixB)) m_impl->FlushSpritesSix();
+	m_impl->spriteSixA = lightA; m_impl->spriteSixB = lightB;
+	std::vector<float>& b = m_impl->spriteSixVerts;
+	b.insert(b.end(), verts, verts + (size_t)vertCount * 9);
 }
 
 // Bulk-append pre-baked quads already in the batch vertex layout (9 floats per vertex).
@@ -186,6 +288,7 @@ void NukeDiligent::drawSpriteRun(Texture* tex, const float* verts, int vertCount
 	if (!m_impl->spritePSO || !verts || vertCount <= 0) return;
 	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw
 	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();   // kind switch: keep paint order
+	if (m_impl->spriteSixA) m_impl->FlushSpritesSix();
 	if (m_impl->spriteBatchOpen && tex != m_impl->spriteBatchTex) m_impl->FlushSprites();
 	m_impl->spriteBatchTex = tex;
 	m_impl->spriteBatchOpen = true;
@@ -203,6 +306,7 @@ void NukeDiligent::drawSpriteRunLit(Texture* tex, Texture* normal, const float* 
 	if (!tex || !verts || vertCount <= 0) return;
 	if (!m_impl->cameraPassActive) return;
 	if (m_impl->spriteBatchOpen) m_impl->FlushSprites();    // kind switch: keep paint order
+	if (m_impl->spriteSixA) m_impl->FlushSpritesSix();
 	if (m_impl->spriteLitTex && (tex != m_impl->spriteLitTex || normal != m_impl->spriteLitNormal))
 		m_impl->FlushSpritesLit();
 	m_impl->spriteLitTex = tex; m_impl->spriteLitNormal = normal; m_impl->spriteLitFlipY = normalFlipY;
@@ -259,16 +363,17 @@ void NukeDiligent::Impl::FlushSprites()
 	{ MapHelper<float>    mv(context, spriteVB, MAP_WRITE, MAP_FLAG_DISCARD); std::memcpy(mv, spriteBatchVerts.data(), spriteBatchVerts.size() * sizeof(float)); }
 	{
 		// Soft particles need the single-sample depth prepass; without it the fade disables.
-		const bool soft = spriteSoftDist > 0.f && gbufActive && gbufDepthSRV;
+		// The froxel grid (own-column fog + light) binds the same way, white3D when off.
+		bool soft = false; float soft2[4];
+		BindSpriteVolume(spriteSRB, spriteVolIntegVar, spriteVolLightVar, spriteDepthVar, soft2, soft);
 		struct SpriteCBData { float4x4 vp; float soft[4]; float soft2[4]; };
 		MapHelper<SpriteCBData> cb(context, spriteCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		if (cb != nullptr)
 		{
 			cb->vp = curView * curProj;
 			cb->soft[0] = spriteSoftDist; cb->soft[1] = curNear; cb->soft[2] = curFar; cb->soft[3] = soft ? 1.f : 0.f;
-			cb->soft2[0] = cb->soft2[1] = cb->soft2[2] = cb->soft2[3] = 0.f;
+			memcpy(cb->soft2, soft2, sizeof(soft2));
 		}
-		if (spriteDepthVar) spriteDepthVar->Set(soft ? gbufDepthSRV : whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
 	}
 	if (spriteTexVar) spriteTexVar->Set(srv);
 
@@ -346,6 +451,79 @@ void NukeDiligent::Impl::FlushSpritesLit()
 	Uint64 offset = 0; IBuffer* vbs[] = { spriteVB };
 	context->SetVertexBuffers(0, 1, vbs, &offset, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	context->SetPipelineState(spriteLitPSO);
+	context->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	DrawAttribs da; da.NumVertices = (Uint32)vertCount; da.Flags = DRAW_FLAG_VERIFY_ALL;
+	context->Draw(da);
+	drop();
+}
+
+// Draw the accumulated six-way batch (one lightmap pair): the billboard frame from the first
+// quad (right, up, toward the eye) in SpriteLitCB, lights from worldFrameCB, the froxel grid
+// like the unlit run.
+void NukeDiligent::Impl::FlushSpritesSix()
+{
+	auto drop = [&]{ spriteSixVerts.clear(); spriteSixA = nullptr; spriteSixB = nullptr; };
+	if (spriteSixVerts.empty() || !spriteSixA || !spriteSixB) { drop(); return; }
+	if (!spriteSixPSO || !cameraPassActive) { drop(); return; }
+	ITextureView* srvA = GetTexSRV(spriteSixA);
+	ITextureView* srvB = GetTexSRV(spriteSixB);
+	if (!srvA || !srvB) { drop(); return; }
+	{
+		const float* v = spriteSixVerts.data();
+		float3 tl(v[0], v[1], v[2]), tr(v[9], v[10], v[11]), br(v[18], v[19], v[20]);
+		float3 T = tr - tl, B = tr - br;
+		float tl2 = length(T), bl2 = length(B);
+		T = (tl2 > 1e-6f) ? T / tl2 : float3(1, 0, 0);
+		B = (bl2 > 1e-6f) ? B / bl2 : float3(0, 1, 0);
+		float3 N = cross(T, B);
+		float nl = length(N); N = (nl > 1e-6f) ? N / nl : float3(0, 0, 1);
+		float3 toEye(curCamPos[0] - tl.x, curCamPos[1] - tl.y, curCamPos[2] - tl.z);
+		if (dot(N, toEye) < 0.f) N = -N;   // "front" = toward the eye
+		MapHelper<float> cb(context, spriteLitCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (cb)
+		{
+			float* d = cb;
+			d[0] = T.x; d[1] = T.y; d[2]  = T.z; d[3]  = 0;
+			d[4] = B.x; d[5] = B.y; d[6]  = B.z; d[7]  = 0;
+			d[8] = N.x; d[9] = N.y; d[10] = N.z; d[11] = 0;
+		}
+	}
+	const int vertCount = (int)(spriteSixVerts.size() / 9);
+	if (!spriteVB || spriteVBSize < vertCount)
+	{
+		Trash(spriteVB);
+		spriteVB.Release();
+		while (spriteVBSize < vertCount) spriteVBSize = spriteVBSize ? spriteVBSize * 2 : 384;
+		BufferDesc bd; bd.Name = "Sprite VB"; bd.BindFlags = BIND_VERTEX_BUFFER;
+		bd.Usage = USAGE_DYNAMIC; bd.CPUAccessFlags = CPU_ACCESS_WRITE; bd.Size = (Uint64)spriteVBSize * 9 * sizeof(float);
+		device->CreateBuffer(bd, nullptr, &spriteVB);
+		if (!spriteVB) { drop(); return; }
+	}
+	{ MapHelper<float> mv(context, spriteVB, MAP_WRITE, MAP_FLAG_DISCARD); std::memcpy(mv, spriteSixVerts.data(), spriteSixVerts.size() * sizeof(float)); }
+	RefCntAutoPtr<IShaderResourceBinding>& srb = spriteSixSRBs[{srvA, srvB}];
+	if (!srb)
+	{
+		spriteSixPSO->CreateShaderResourceBinding(&srb, true);
+		if (!srb) { spriteSixSRBs.erase({srvA, srvB}); drop(); return; }
+		if (auto* v = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Sprite"))  v->Set(srvA);
+		if (auto* v = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_SpriteB")) v->Set(srvB);
+	}
+	{
+		bool soft = false; float soft2[4];
+		BindSpriteVolume(srb, srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolInteg"), srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolLight"),
+		                 srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneDepth"), soft2, soft);
+		struct SpriteCBData { float4x4 vp; float soft[4]; float soft2[4]; };
+		MapHelper<SpriteCBData> cb(context, spriteCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (cb != nullptr)
+		{
+			cb->vp = curView * curProj;
+			cb->soft[0] = spriteSoftDist; cb->soft[1] = curNear; cb->soft[2] = curFar; cb->soft[3] = soft ? 1.f : 0.f;
+			memcpy(cb->soft2, soft2, sizeof(soft2));
+		}
+	}
+	Uint64 offset = 0; IBuffer* vbs[] = { spriteVB };
+	context->SetVertexBuffers(0, 1, vbs, &offset, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	context->SetPipelineState(spriteSixPSO);
 	context->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da; da.NumVertices = (Uint32)vertCount; da.Flags = DRAW_FLAG_VERIFY_ALL;
 	context->Draw(da);

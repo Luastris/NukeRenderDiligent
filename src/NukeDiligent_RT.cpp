@@ -800,7 +800,7 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 	ci.RayTracingPipeline.MaxRecursionDepth = 8;       // primary + bounces; the configured depth caps actual recursion
 	ci.RayTracingPipeline.ShaderRecordSize  = 0;
 	ci.MaxAttributeSize = sizeof(float) * 2;           // BuiltInTriangleIntersectionAttributes (barycentrics)
-	ci.MaxPayloadSize   = sizeof(float) * 4;           // RTPayload { float3 color; uint depth; }
+	ci.MaxPayloadSize   = sizeof(float) * 5;           // RTPayload { float3 color; uint depth; float hitT; }
 
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP; samp.AddressW = TEXTURE_ADDRESS_CLAMP;
@@ -808,15 +808,18 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_Probe",  samp},
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_MatTex", samp},
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_GIIrr",  samp},   // DDGI atlases (hit ambient)
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_VolFogScat", samp},   // froxel scatter grid (the reflected leg's fog)
 	};
 	ShaderResourceVariableDesc vars[] = {
 		{SHADER_TYPE_ALL_RAY_TRACING, "RTRefCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 		{SHADER_TYPE_ALL_RAY_TRACING, "FrameCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 		{SHADER_TYPE_ALL_RAY_TRACING, "GICB",    SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
+		{SHADER_TYPE_ALL_RAY_TRACING, "VolCB",   SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
+		{SHADER_TYPE_ALL_RAY_TRACING, "FogVolCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 	};
 	ci.PSODesc.ResourceLayout.DefaultVariableType = SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC;   // TLAS/gbuffer/bindless/output
-	ci.PSODesc.ResourceLayout.Variables           = vars; ci.PSODesc.ResourceLayout.NumVariables = 3;
-	ci.PSODesc.ResourceLayout.ImmutableSamplers   = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 3;
+	ci.PSODesc.ResourceLayout.Variables           = vars; ci.PSODesc.ResourceLayout.NumVariables = 5;
+	ci.PSODesc.ResourceLayout.ImmutableSamplers   = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 4;
 
 	device->CreateRayTracingPipelineState(ci, &rtPSO);
 	if (!rtPSO) { cout << "[NukeDiligent]\tRT pipeline PSO build failed" << endl; return false; }
@@ -825,6 +828,8 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 		if (auto* v = rtPSO->GetStaticVariableByName(t, "RTRefCB")) v->Set(rtRefCB);
 		if (auto* v = rtPSO->GetStaticVariableByName(t, "FrameCB")) v->Set(worldFrameCB);
 		if (auto* v = rtPSO->GetStaticVariableByName(t, "GICB"))    v->Set(giCB);
+		if (auto* v = rtPSO->GetStaticVariableByName(t, "VolCB"))   v->Set(volCB);
+		if (auto* v = rtPSO->GetStaticVariableByName(t, "FogVolCB")) v->Set(fogVolCB);
 	}
 	rtPSO->CreateShaderResourceBinding(&rtSRB, true);
 
@@ -913,6 +918,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		setv("g_GIIrr", giIrrSRV ? giIrrSRV : white);
 		setv("g_GIVis", giVisSRV ? giVisSRV : white);
 	}
+	setv("g_VolFogScat", VolScatSRV());   // this pass's froxel grid (the reflected leg's fog), or the clear stand-in
 	setv("g_AllNrm",   rtNrmSRV);
 	setv("g_AllUV",    rtUVSRV ? rtUVSRV : rtNrmSRV);
 	setv("g_AllPos",   rtPosSRV ? rtPosSRV : rtNrmSRV);

@@ -1443,3 +1443,9 @@ void NukeDiligent::setOnFileDrop(bst::function<void(const char*)> cb)
 	g_onFileDrop = cb;
 	if (m_window) glfwSetDropCallback(m_window, GlfwDropCB);
 }
+
+const char* NukeDiligent::backendName()
+{
+	if (!m_impl || !m_impl->device) return "";
+	return m_impl->useD3D12 ? "Dx12" : (m_impl->useVulkan ? "Vk" : "Dx11");
+}

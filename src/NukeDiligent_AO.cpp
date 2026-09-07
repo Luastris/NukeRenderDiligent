@@ -195,6 +195,27 @@ void NukeDiligent::Impl::PruneCameraStates()
 		}
 		else ++it;
 	}
+	for (auto it = fluidStates.begin(); it != fluidStates.end();)
+	{
+		if (frameId - it->second.lastUsed > kStale)
+		{
+			FluidState& s = it->second;
+			Trash(s.dens[0]); Trash(s.dens[1]); Trash(s.vel[0]); Trash(s.vel[1]); Trash(s.prs[0]); Trash(s.prs[1]); Trash(s.div);
+			it = fluidStates.erase(it);
+		}
+		else ++it;
+	}
+	for (auto it = volStates.begin(); it != volStates.end();)
+	{
+		if (frameId - it->second.lastUsed > kStale)
+		{
+			VolState& s = it->second;
+			Trash(s.scat[0]); Trash(s.scat[1]); Trash(s.integ); Trash(s.light); Trash(s.out);
+			if (volCur == &s) volCur = nullptr;
+			it = volStates.erase(it);
+		}
+		else ++it;
+	}
 	for (auto it = ssgiStates.begin(); it != ssgiStates.end();)
 	{
 		if (frameId - it->second.lastUsed > kStale)

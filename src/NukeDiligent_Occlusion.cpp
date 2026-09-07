@@ -250,7 +250,12 @@ void NukeDiligent::Impl::OcclDebugBoxes()
 // deferred draws indirect (arguments written), 2 = replay them plain (no usable depth).
 int NukeDiligent::Impl::OcclEndOpaque()
 {
+	const bool wasActive = occlPassActive;
 	occlPassActive = false; occlPending = false; occlDrawTag = false;
+	// Fog volumes (frustum-visible ones, RunVolumetrics) get verdicts with the draws: no draw
+	// records, just the AABB test - RunVolumetrics skips a hidden one next frame.
+	if (wasActive && !occlFreeze) occlTags.insert(occlTags.end(), volOcclTags.begin(), volOcclTags.end());
+	volOcclTags.clear();
 	statOcclTracked = (int)occlTags.size(); statOcclCulled = (int)occlDeferred.size();
 	if (occlTags.empty()) return 2;
 	if (occlFreeze) { OcclDebugBoxes(); return 0; }

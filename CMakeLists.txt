@@ -169,6 +169,7 @@ add_library(NukeRenderDiligent SHARED
     src/NukeDiligent_AO.cpp
     src/NukeDiligent_GI.cpp
     src/NukeDiligent_SSGI.cpp
+    src/NukeDiligent_Vol.cpp
     src/NukeDiligent_Post.cpp
     src/NukeDiligent_UI.cpp
     src/NukeDiligent_RT.cpp

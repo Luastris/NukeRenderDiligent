@@ -335,6 +335,7 @@ struct NukeDiligent::Impl
 	// Custom post-effect chain: one fullscreen pipeline per effect, ping-ponged in HDR before tonemap.
 	struct PostPipe { RefCntAutoPtr<IPipelineState> pso; RefCntAutoPtr<IShaderResourceBinding> srb; IShaderResourceVariable* srcVar = nullptr; bool isBloom = false;
 	                  IShaderResourceVariable* gbufVar = nullptr; IShaderResourceVariable* depthVar = nullptr; bool isSSR = false;
+	                  IShaderResourceVariable* volVar = nullptr;   // SSR: this frame's froxel scatter grid (the reflected leg's fog)
 	                  IShaderResourceVariable* objIdVar = nullptr;   // musicvis: generic per-OBJECT id (gbuffer RT2)
 	                  IShaderResourceVariable* histVar = nullptr; IShaderResourceVariable* velVar = nullptr; bool isTAA = false;   // temporal AA (history + depth + velocity)
 	                  bool isRTRef = false;   // built-in ray-traced reflections (D3D12)
@@ -476,11 +477,7 @@ struct NukeDiligent::Impl
 	std::map<uint64_t, GIScroll> giScroll;
 	std::vector<GIReset> giResets;           // cells that scrolled into range: tiles zeroed before the next update
 	void ApplyGIResets();
-	struct GICapture
-	{
-		uint64_t cube = 0; int vol = 0, probe = 0; bool valid = false; float nearZ = 0.05f;
-		RefCntAutoPtr<ITexture> back; RefCntAutoPtr<ITextureView> backDSV[6];   // back-face depth cube (faces 6..11)
-	};
+	struct GICapture { uint64_t cube = 0; int vol = 0, probe = 0; bool valid = false; };
 	std::vector<GIVol> giVols;
 	std::vector<GICapture> giCaptures;   // raster fallback: probes captured this frame (budget slots)
 	uint64_t giCursor = 0, giLayoutSig = 0, giFrame = 0;
@@ -492,6 +489,9 @@ struct NukeDiligent::Impl
 	// steady-state smoothing. Slow drift (a running day) is tracked by the normal hysteresis.
 	static const int kGIEnvN = 40;
 	float giEnvAnchor[kGIEnvN] = {}; bool giEnvValid = false; int giBoost = 0;   // giBoost = settle frames left
+	int   giQuietFrames = 0;                 // raster path: frames since the last lighting jump (a quiet grid trickles)
+	std::vector<std::pair<int, int>> giDirty; // raster path: (volume, probe) of cells that entered the grid - captured first
+	bool  giCapturing = false;               // a GI probe cube face is being captured (no sky draw, no mips)
 	void  GIEnvTick();
 	float GIHysteresis(float h) const { return giBoost > 0 ? (h < 0.6f ? h : 0.6f) : h; }
 	int   GICaptureBudget(int total) const;
@@ -522,6 +522,57 @@ struct NukeDiligent::Impl
 	void RunSSGI(int w, int h);
 	void KeepSSGILitHistory(ITextureView* sceneSRV, int w, int h);
 
+	// --- Froxel volumetric lighting / fog ---------------------------------------------------------
+	// Per camera: a view-aligned grid (scatter ping-pong for the temporal blend + the integrated
+	// columns) built in beginCamera off the prepass camera, composited in endCamera before the
+	// post chain into its own texture (volCur names this camera's grid between the two).
+	NukeVolumetricsDesc vol;
+	std::vector<NukeFogVolumeDesc> fogVols;   // this frame's local volumes (World, nearest first)
+	static const int kVolCBSize = 4 * 64 + 8 * 16;            // VolCB (vol.hlsli); shared with the sprite PSOs (static)
+	static const int kFogVolMax = 32, kFogVolCBSize = 32 + 32 * 112;
+	// Fluid volumes: a 3D field per volume id (density + velocity, pressure solve), stepped in
+	// RunVolumetrics before the inject reads the density through g_Fluid0..3.
+	static const int kFluidSlots = 4, kFluidCBSize = 7 * 16 + 16 * 16 + 16;
+	struct FluidState
+	{
+		RefCntAutoPtr<ITexture> dens[2], vel[2], prs[2], div;
+		int rx = 0, ry = 0, rz = 0, cur = 0; uint64_t lastUsed = 0; bool valid = false;
+	};
+	std::map<uint64_t, FluidState> fluidStates;
+	std::vector<NukeFogDisplacerDesc> fogDisplacers;
+	RefCntAutoPtr<IBuffer> fluidCB;
+	RefCntAutoPtr<IPipelineState> fluidPSO; RefCntAutoPtr<IShaderResourceBinding> fluidSRB;
+	std::atomic<bool> fluidBuilding{false}; bool fluidFailed = false;
+	float volLastTime = -1.0f;
+	bool BuildFluidPipes();
+	ITextureView* StepFluid(const NukeFogVolumeDesc& d, float dt);   // this frame's density field (null while the pipes build)
+	RefCntAutoPtr<IBuffer> fogVolCB;
+	RefCntAutoPtr<ITexture> whiteTex3D;        // 1x1x1 white: the grid stand-in for sprites when volumetrics are off
+	RefCntAutoPtr<IPipelineState> volInjectPSO, volIntegratePSO;
+	RefCntAutoPtr<IShaderResourceBinding> volInjectSRB, volIntegrateSRB;
+	PostPipe volApplyPipe;
+	RefCntAutoPtr<IBuffer> volCB;
+	std::atomic<bool> volBuilding{false}; bool volFailed = false;
+	struct VolState { RefCntAutoPtr<ITexture> scat[2], integ, light, out; int w = 0, h = 0, sw = 0, sh = 0, d = 0, cur = 0; bool valid = false; float4x4 prevView, prevProj; uint64_t lastUsed = 0; };
+	std::map<uint64_t, VolState> volStates;
+	VolState* volCur = nullptr;
+	int volFrame = 0;
+	bool BuildVolPipes();
+	void TouchVolCB();                                       // beginCamera: the sprite PSOs bind VolCB statically, so it must be mapped every pass
+	void RunVolumetrics(int w, int h);
+	RefCntAutoPtr<ITexture> clearTex3D;                      // 1x1x1 (0,0,0,1): the scatter-grid stand-in for reflections when the grid is off
+	void EnsureVolFallbacks();
+	ITextureView* VolScatSRV();                              // this pass's scatter grid (RT / SSR / water reflections), or the stand-in
+	static uint64_t FogVolOcclId(const NukeFogVolumeDesc& d);
+	// Screen-space sun shafts (crepuscular rays), after the fog composite; no grid needed.
+	RefCntAutoPtr<IPipelineState> sunShaftPSO; RefCntAutoPtr<IShaderResourceBinding> sunShaftSRB; RefCntAutoPtr<IBuffer> sunShaftCB;
+	IShaderResourceVariable* ssSrcVar = nullptr; IShaderResourceVariable* ssDepthVar = nullptr; IShaderResourceVariable* ssMaskVar = nullptr;
+	RefCntAutoPtr<ITexture> ssMask[2], ssOut; int ssW = 0, ssH = 0;
+	std::atomic<bool> ssBuilding{false}; bool ssFailed = false;
+	bool BuildSunShaftPipes();
+	ITextureView* RunSunShafts(ITextureView* sceneSRV, int w, int h);
+	ITextureView* ApplyVolumetrics(ITextureView* sceneSRV, int w, int h);
+
 	// --- Hi-Z occlusion culling -----------------------------------------------------------------------
 	// Two-phase per camera: draws whose id the visibility history calls visible go straight through
 	// (phase 1); the rest are deferred. endOpaque builds a MAX depth pyramid from what was drawn,
@@ -529,6 +580,7 @@ struct NukeDiligent::Impl
 	// arguments that pass wrote (survivors render this same frame) and copies the verdicts into a
 	// staging ring — read back a few frames later into the per-target history.
 	struct OcclTag { uint64_t id; float mn[3], mx[3]; };
+	std::vector<OcclTag> volOcclTags;   // this pass's fog volumes (frustum-visible), tested with the draws for next frame's verdicts
 	struct OcclDeferred
 	{
 		int       tag = -1;            // index into occlTags
@@ -1077,7 +1129,11 @@ struct NukeDiligent::Impl
 	Texture*                              spriteBatchTex = nullptr;
 	bool                                  spriteBatchOpen = false;   // batch live (tex may legally be null -> white 1x1)
 	float                                 spriteSoftDist = 0.f;      // soft-particle fade distance for the CURRENT run (0 = off)
+	float                                 spriteVolLight = 0.f;      // froxel-grid lighting amount for the CURRENT run (0 = off)
 	IShaderResourceVariable*              spriteDepthVar = nullptr;  // PS "g_SceneDepth" (prepass depth; white when absent)
+	IShaderResourceVariable*              spriteVolIntegVar = nullptr;   // PS "g_VolInteg" / "g_VolLight" (this camera's grid, else white3D)
+	IShaderResourceVariable*              spriteVolLightVar = nullptr;
+	void BindSpriteVolume(IShaderResourceBinding* srb, IShaderResourceVariable* integVar, IShaderResourceVariable* lightVar, IShaderResourceVariable* depthVar, float soft2[4], bool& softOut);
 	float                                 curNear = 0.1f, curFar = 1000.f;   // camera planes (soft-particle linearization)
 	std::vector<float>                    spriteBatchVerts;
 	void CreateSpriteResources();
@@ -1094,6 +1150,16 @@ struct NukeDiligent::Impl
 	bool                                  spriteLitFlipY = true;
 	std::vector<float>                    spriteLitVerts;
 	void FlushSpritesLit();
+
+	// SIX-WAY lit sprite runs (drawSpriteRunSixWay — hero smoke): two lightmaps, lit by the
+	// frame's lights in the batch's billboard frame (SpriteLitCB = right/up/toward-eye), plus the
+	// froxel-grid treatment of the unlit run. SRBs cached per (A, B) pair.
+	RefCntAutoPtr<IPipelineState>         spriteSixPSO;
+	std::map<std::pair<ITextureView*, ITextureView*>, RefCntAutoPtr<IShaderResourceBinding>> spriteSixSRBs;
+	Texture*                              spriteSixA = nullptr;
+	Texture*                              spriteSixB = nullptr;
+	std::vector<float>                    spriteSixVerts;
+	void FlushSpritesSix();
 
 	// Screen-space (Canvas HUD) sprites — verts already in NDC, identity transform. Two queues:
 	// PRE = drawn with the scene before post (reuses spritePSO); POST = drawn on the final image

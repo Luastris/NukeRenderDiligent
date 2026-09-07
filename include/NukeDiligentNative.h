@@ -82,6 +82,13 @@ struct Frame
 	Diligent::IBuffer* giCB = nullptr;
 	Diligent::ITextureView* giIrrSRV = nullptr;
 	Diligent::ITextureView* giVisSRV = nullptr;
+
+	// Froxel volumetrics for module reflections (vol.hlsli VolFogSegment with VOL_REFLECT): the
+	// grid constants and this pass's scatter grid (a 1x1x1 clear texture when the grid is off,
+	// never null after init). ABI: appended.
+	Diligent::IBuffer* volCB = nullptr;
+	Diligent::ITextureView* volScatSRV = nullptr;
+	Diligent::IBuffer* fogVolCB = nullptr;   // the local volumes (VOL_REFLECT_VOLUMES). ABI: appended.
 };
 
 // Fill `out` with the current state. Returns false before init / after shutdown.

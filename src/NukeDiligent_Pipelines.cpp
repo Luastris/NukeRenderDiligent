@@ -152,6 +152,8 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 		gd.Name = "GICB";      gd.Size = 8 * 96 + 32; device->CreateBuffer(gd, nullptr, &giCB);
 		gd.Name = "GIPassCB";  gd.Size = 48;          device->CreateBuffer(gd, nullptr, &giPassCB);
 		gd.Name = "GIProbeCB"; gd.Size = 64 + 16;     device->CreateBuffer(gd, nullptr, &giProbeCB);
+		gd.Name = "VolCB";     gd.Size = kVolCBSize;    device->CreateBuffer(gd, nullptr, &volCB);      // froxel fog (static on sprite PSOs too)
+		gd.Name = "FogVolCB";  gd.Size = kFogVolCBSize; device->CreateBuffer(gd, nullptr, &fogVolCB);
 	}
 
 	// The boot stand-in world pipeline: synchronous and tiny, so the very first frame draws the

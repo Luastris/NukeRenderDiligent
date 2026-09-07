@@ -96,7 +96,7 @@ void NukeDiligent::beginCubeFace(uint64_t cube, int face, const float pos[3], fl
 	ctx->SetViewports(1, &vp, c.res, c.res);
 
 	m_impl->WriteFrameCB(P);   // probe off (probeActive=false) -> analytic IBL during capture
-	m_impl->DrawSky();
+	if (!m_impl->giCapturing) m_impl->DrawSky();   // GI probe captures: a miss is the analytic sky in ddgi_cube.cs
 }
 
 void NukeDiligent::endCubeFace(uint64_t cube, int face)
@@ -114,7 +114,7 @@ void NukeDiligent::endCubeFace(uint64_t cube, int face)
 		ra.DstMipLevel = 0;
 		m_impl->context->ResolveTextureSubresource(c.msColor, c.color, ra);
 	}
-	if (face != 5) return;   // all six faces captured -> build the mip chain for rough reflections
+	if (face != 5 || m_impl->giCapturing) return;   // all six faces captured -> build the mip chain for rough reflections (GI cubes read mip 0 only)
 	if (c.srv) m_impl->context->GenerateMips(c.srv);
 }
 

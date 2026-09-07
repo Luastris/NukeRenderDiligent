@@ -48,6 +48,7 @@ bool GetFrame(Frame& out)
 	out.lightCount = (int)d->lights.size();
 	out.debugView = d->debugView;
 	out.giCB = d->giCB; out.giIrrSRV = d->giIrrSRV; out.giVisSRV = d->giVisSRV;
+	out.volCB = d->volCB; out.volScatSRV = d->VolScatSRV(); out.fogVolCB = d->fogVolCB;
 	return true;
 }
 
@@ -112,6 +113,7 @@ void FlushBatches()
 	if (!NukeDiligent::nativeImpl) return;
 	NukeDiligent::nativeImpl->FlushSprites();
 	NukeDiligent::nativeImpl->FlushSpritesLit();
+	NukeDiligent::nativeImpl->FlushSpritesSix();
 }
 
 void NoteDraw(int tris)

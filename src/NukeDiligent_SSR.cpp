@@ -274,6 +274,7 @@ void NukeDiligent::Impl::RunSSR(PostPipe& pp, ITextureView* srcSRV, ITextureView
 	if (pp.srcVar)   pp.srcVar->Set(srcSRV);
 	if (pp.gbufVar)  pp.gbufVar->Set(gbufSRV);
 	if (pp.depthVar) pp.depthVar->Set(gbufDepthSRV);
+	if (pp.volVar)   pp.volVar->Set(VolScatSRV());   // this pass's froxel grid, or the clear stand-in
 	if (pp.objIdVar && gbufObjIdSRV) pp.objIdVar->Set(gbufObjIdSRV);
 	context->SetPipelineState(pp.pso);
 	context->CommitShaderResources(pp.srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);

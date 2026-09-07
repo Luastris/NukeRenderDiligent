@@ -207,6 +207,7 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	std::string vs = shaderSource("post.vs");
 	if (vs.empty() || ps.empty()) return 0;
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	auto sf = ShaderFactory(); sci.pShaderSourceStreamFactory = sf;   // post shaders may #include the engine's .hlsli (ssr: vol.hlsli)
 	RefCntAutoPtr<IShader> v, p;
 	sci.Desc = {"Post Effect VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &v);
 	sci.Desc = {"Post Effect PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &p);
@@ -237,6 +238,11 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 		imms.push_back({SHADER_TYPE_PIXEL, "g_GBuffer", psamp});
 		imms.push_back({SHADER_TYPE_PIXEL, "g_Depth",   psamp});
 	}
+	if (name == "ssr")   // the reflected leg's fog (musicvis shares the layout but not the grid)
+	{
+		vars.push_back({SHADER_TYPE_PIXEL, "g_VolFogScat", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+		imms.push_back({SHADER_TYPE_PIXEL, "g_VolFogScat", samp});
+	}
 	if (mvis)   // per-object id (gbuffer RT2), point-sampled: ids must not blend
 	{
 		vars.push_back({SHADER_TYPE_PIXEL, "g_ObjId", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
@@ -260,10 +266,14 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	if (auto* c = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostParams")) c->Set(postParamsCB);
 	if (auto* f = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostFrame"))  f->Set(postFrameCB);
 	if (ssr) if (auto* s = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "SSRCB")) s->Set(ssrCB);
+	if (ssr) if (auto* s = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "VolCB"))  s->Set(volCB);
+	if (ssr) if (auto* s = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "FrameCB")) s->Set(worldFrameCB);
+	if (ssr) if (auto* s = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "FogVolCB")) s->Set(fogVolCB);
 	if (taa) if (auto* s = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "TAACB")) s->Set(taaCB);
 	pp.pso->CreateShaderResourceBinding(&pp.srb, true);
 	pp.srcVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Source");
-	if (ssr) { pp.gbufVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GBuffer"); pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.isSSR = true; }
+	if (ssr) { pp.gbufVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GBuffer"); pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.isSSR = true;
+	           pp.volVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolFogScat"); }
 	if (mvis) pp.objIdVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ObjId");
 	if (taa) { pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.histVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_History"); pp.velVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Velocity"); pp.isTAA = true; }
 	pp.isBloom = (name == "bloom");   // multi-pass: the renderer drives the passes itself

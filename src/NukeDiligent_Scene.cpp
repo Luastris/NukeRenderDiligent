@@ -701,6 +701,7 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 		n = kMaxLights;
 	}
 	fb->lightCount[0] = (float)n;
+	fb->lightCount[1] = lights.empty() ? 1.0f : 0.0f;   // the stand-in sun above: surfaces keep it, the volumetrics ignore it (no light, no rays)
 	for (int k = 0; k < n; ++k)
 	{
 		const NukeLight& L = src[k]; GPULight& g = fb->lights[k];
@@ -717,8 +718,10 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 		const float depthRange = 2.0f * (shadowDistance > 0.5f ? shadowDistance : 0.5f);
 		const float ndcCap     = 0.03f / depthRange;
 		fb->shadowParams[3] = shadowDepthBias < ndcCap ? shadowDepthBias : ndcCap;
-		float nof = 0.5f * shadowDistance / (float)shadowRes;
-		nof = nof < 0.005f ? 0.005f : (nof > 0.03f ? 0.03f : nof);
+		// Normal offset floor = one shadow texel (2 * distance / res): the world PS scales it up to 4x
+		// at grazing incidence (normal-offset shadows), which is what keeps grazing walls acne-free.
+		float nof = 2.0f * shadowDistance / (float)shadowRes;
+		nof = nof < 0.005f ? 0.005f : (nof > 0.15f ? 0.15f : nof);
 		fb->shadowParams[1] = (shadowNormalBias > nof) ? shadowNormalBias : nof;
 	}
 	fb->shadowParams[2] = (1.0f / (float)shadowRes) * shadowSoftness;
@@ -832,6 +835,18 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 
 	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
 	m_impl->WriteFrameCB(P);
+
+	// Volumetric fog grid off this camera's prepass + lights (compute: the targets rebind after).
+	m_impl->volCur = nullptr;
+	m_impl->TouchVolCB();
+	if (m_impl->vol.quality > 0 && m_impl->gbufActive)
+	{
+		m_impl->GpuPass("volumetrics");
+		m_impl->RunVolumetrics(w, h);
+		m_impl->GpuPass("scene");
+		ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->SetViewports(1, &vp, w, h);
+	}
 
 	m_impl->OcclBeginCamera();   // open the tag scope, consume matured visibility readbacks
 
@@ -1517,6 +1532,7 @@ void NukeDiligent::endCamera()
 	m_impl->DrawDepthDebugLines();   // depth-tested gizmos: against this camera's still-bound MS depth
 	m_impl->FlushSprites();     // draw any pending sprite batch WHILE the (MS) camera targets are still bound
 	m_impl->FlushSpritesLit();  // ...and the pending lit batch (tilemap normal-mapped runs)
+	m_impl->FlushSpritesSix();  // ...and the six-way smoke batch
 	m_impl->FlushScreenPre();   // WithWorld screen-space canvas sprites: into the scene, before post
 	// 1) Resolve the multisampled HDR color into the single-sample HDR texture (post-pass input).
 	if (m_impl->curMSAA && m_impl->curResolveSrc && m_impl->curResolveDst)
@@ -1539,6 +1555,7 @@ void NukeDiligent::endCamera()
 		m_impl->KeepSSGILitHistory(m_impl->curPostSrc, m_impl->curRTW, m_impl->curRTH);
 	// 1.5) Module post hook — after the resolve, BEFORE the user chain: its output is scene content.
 	ITextureView* chainSrc = m_impl->curPostSrc;
+	bool preDone = false;   // fog composite + sun shafts: once per camera pass, before the first non-reflection effect
 	{
 		const nukediligent::WaterHooks& wh = nukediligent::ActiveWaterHooks();
 		if (wh.onCameraPost && chainSrc)
@@ -1560,6 +1577,16 @@ void NukeDiligent::endCamera()
 			auto pit = m_impl->postPipes.find(cs.pipeline);
 			if (pit == m_impl->postPipes.end()) continue;
 			if (!pit->second.pso && !pit->second.isRTRef) continue;   // RT reflections run a ray-tracing pipeline, not a graphics PSO
+			// Volumetric fog + sun shafts go in after the reflection composites (surface shading;
+			// the reflections fog their own leg) and before everything else (bloom, TAA, grades).
+			if (!preDone && !(pit->second.isSSR || pit->second.isRTRef))
+			{
+				preDone = true;
+				m_impl->GpuPass("volumetrics");
+				if (m_impl->volCur) srcSRV = m_impl->ApplyVolumetrics(srcSRV, w, h);
+				srcSRV = m_impl->RunSunShafts(srcSRV, w, h);
+				m_impl->GpuPass("post");
+			}
 			Diligent::ITexture* dstTex = m_impl->scratch[idx % 2];
 			if (!dstTex) break;
 			ITextureView* dstRTV = dstTex->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
@@ -1621,6 +1648,14 @@ void NukeDiligent::endCamera()
 		}
 		chainSrc = srcSRV;
 	}
+	if (!preDone && chainSrc && m_impl->curRTW > 0 && m_impl->curRTH > 0)   // no chain, or reflections only
+	{
+		m_impl->GpuPass("volumetrics");
+		if (m_impl->volCur) chainSrc = m_impl->ApplyVolumetrics(chainSrc, m_impl->curRTW, m_impl->curRTH);
+		chainSrc = m_impl->RunSunShafts(chainSrc, m_impl->curRTW, m_impl->curRTH);
+		m_impl->GpuPass("post");
+	}
+	m_impl->volCur = nullptr;
 	// 3) Final tonemap/encode into the output (RT's post texture, or the backbuffer for target 0).
 	m_impl->GpuPass("tonemap");
 	if (chainSrc && m_impl->curPostDst)
