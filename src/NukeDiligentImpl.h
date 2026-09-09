@@ -532,10 +532,13 @@ struct NukeDiligent::Impl
 	static const int kFogVolMax = 32, kFogVolCBSize = 32 + 32 * 112;
 	// Fluid volumes: a 3D field per volume id (density + velocity, pressure solve), stepped in
 	// RunVolumetrics before the inject reads the density through g_Fluid0..3.
-	static const int kFluidSlots = 4, kFluidCBSize = 7 * 16 + 16 * 16 + 16;
+	static const int kFluidSlots = 4, kFluidCBSize = 8 * 16 + 16 * 16 + 40 * 16 + 32;
 	struct FluidState
 	{
-		RefCntAutoPtr<ITexture> dens[2], vel[2], prs[2], div;
+		RefCntAutoPtr<ITexture> map[3], vel[2], prs[2], div, rho;   // map = the density (in / MacCormack scratch / out, rotating), rho = the fog the froxels sample
+		float accum = 0.0f;                                          // wall seconds since the last step (the fog steps at a fixed rate)
+		RefCntAutoPtr<IBuffer> ledger; int ledgerCur = 0;            // ledger (4 uints): the resting amount per step, the parcels are normalised to it
+		RefCntAutoPtr<IBuffer> parcels; RefCntAutoPtr<ITexture> acc, rhoS; int parcelCount = 0; float parcelRadius = 1.0f; int sx = 0, sy = 0, sz = 0; int mode = 0;   // clumps: the parcels, their splat grid (its own resolution) and the fog on it
 		int rx = 0, ry = 0, rz = 0, cur = 0; uint64_t lastUsed = 0; bool valid = false;
 	};
 	std::map<uint64_t, FluidState> fluidStates;
@@ -543,17 +546,18 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer> fluidCB;
 	RefCntAutoPtr<IPipelineState> fluidPSO; RefCntAutoPtr<IShaderResourceBinding> fluidSRB;
 	std::atomic<bool> fluidBuilding{false}; bool fluidFailed = false;
-	float volLastTime = -1.0f;
+	double volLastTime = -1.0;   // steady_clock seconds of the last fluid step (double: a float loses the frame at a day's uptime)
+	float volWindClock = 0.0f;   // real seconds the medium has drifted with the wind (the fog CBs' wind time)
 	bool BuildFluidPipes();
 	ITextureView* StepFluid(const NukeFogVolumeDesc& d, float dt);   // this frame's density field (null while the pipes build)
 	RefCntAutoPtr<IBuffer> fogVolCB;
 	RefCntAutoPtr<ITexture> whiteTex3D;        // 1x1x1 white: the grid stand-in for sprites when volumetrics are off
-	RefCntAutoPtr<IPipelineState> volInjectPSO, volIntegratePSO;
-	RefCntAutoPtr<IShaderResourceBinding> volInjectSRB, volIntegrateSRB;
+	RefCntAutoPtr<IPipelineState> volInjectPSO, volTemporalPSO, volIntegratePSO;
+	RefCntAutoPtr<IShaderResourceBinding> volInjectSRB, volTemporalSRB, volIntegrateSRB;
 	PostPipe volApplyPipe;
 	RefCntAutoPtr<IBuffer> volCB;
 	std::atomic<bool> volBuilding{false}; bool volFailed = false;
-	struct VolState { RefCntAutoPtr<ITexture> scat[2], integ, light, out; int w = 0, h = 0, sw = 0, sh = 0, d = 0, cur = 0; bool valid = false; float4x4 prevView, prevProj; uint64_t lastUsed = 0; };
+	struct VolState { RefCntAutoPtr<ITexture> raw, scat[2], integ, light, out; int w = 0, h = 0, sw = 0, sh = 0, d = 0, cur = 0; bool valid = false; float4x4 prevView, prevProj; uint64_t lastUsed = 0; };
 	std::map<uint64_t, VolState> volStates;
 	VolState* volCur = nullptr;
 	int volFrame = 0;
@@ -996,7 +1000,7 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer> bendCB;
 	float bendPushers[8][4] = {};
 	int   bendPusherCount = 0;
-	float bendVolumes[16][12] = {};   // (pos,r)(dir,strength)(mode,falloff,seed,0) per volume
+	float bendVolumes[16][20] = {};   // (pos,r)(dir,strength)(mode,falloff,seed,pull)(inner,dentDepth,dentSharp,dentSize)(dentDensity,0,0,0) per volume; the bend CB takes the first 12
 	int   bendVolumeCount = 0;
 	void  UpdateBendCB();
 	void WriteFrameCB(const Diligent::float3& P);   // fill worldFrameCB (lights/shadows/sky/probe)

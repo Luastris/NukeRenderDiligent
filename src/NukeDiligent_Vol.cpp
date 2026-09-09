@@ -1,6 +1,7 @@
 #include "NukeDiligentImpl.h"
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 
 using namespace Diligent;
 using namespace std;
@@ -13,7 +14,7 @@ using namespace std;
 namespace {
 struct VolCBData { float4x4 view, proj, invViewProj, prevViewProj; float grid[4], range[4], cam[4], medium[4], albedo[4], misc[4], jitter[4], screen[4]; };
 struct FogVolGPU  { float posShape[4], extDensity[4], rot[4], albedoFall[4], emisNoise[4], noiseMisc[4], fluidInfo[4]; };   // = vol_inject.cs FogVol
-struct FluidCBData { float res[4], box[4], rot[4], pos[4], wind[4], params[4], params2[4], dispPos[8][4], dispVel[8][4], misc[4]; };
+struct FluidCBData { float res[4], box[4], up[4], pos[4], wind[4], params[4], params2[4], counts[4], dispPos[8][4], dispVel[8][4], forcePos[8][4], forceDir[8][4], forceMisc[8][4], forceDent[8][4], forceDent2[8][4], misc[4], splat[4]; };
 struct FogVolCBData { float wind[4]; int count[4]; FogVolGPU vols[32]; };
 static_assert(sizeof(VolCBData) == NukeDiligent::Impl::kVolCBSize, "VolCB size");
 static_assert(sizeof(FogVolCBData) == NukeDiligent::Impl::kFogVolCBSize, "FogVolCB size");
@@ -41,7 +42,7 @@ void NukeDiligent::setFogVolumes(const NukeFogVolumeDesc* volumes, int count)
 
 bool NukeDiligent::Impl::BuildVolPipes()
 {
-	const string csI = shaderSource("vol_inject.cs"), csN = shaderSource("vol_integrate.cs");
+	const string csI = shaderSource("vol_inject.cs"), csT = shaderSource("vol_temporal.cs"), csN = shaderSource("vol_integrate.cs");
 	const string vs = shaderSource("post.vs"), psA = shaderSource("vol_apply.ps");
 	if (csI.empty() || csN.empty() || vs.empty() || psA.empty()) return false;
 	auto sf = ShaderFactory();   // vol.hlsli / ddgi.hlsli / rt_common.hlsl includes
@@ -81,13 +82,15 @@ bool NukeDiligent::Impl::BuildVolPipes()
 		pso->CreateShaderResourceBinding(&srb, true);
 		return srb != nullptr;
 	};
-	RefCntAutoPtr<IShader> sI, sN, sV, sP;
+	RefCntAutoPtr<IShader> sI, sT, sN, sV, sP;
 	if (!compile(csI, "Vol inject CS", SHADER_TYPE_COMPUTE, rtSupported, sI)) return false;
+	if (!compile(csT, "Vol temporal CS", SHADER_TYPE_COMPUTE, false, sT)) return false;
 	if (!compile(csN, "Vol integrate CS", SHADER_TYPE_COMPUTE, false, sN)) return false;
 	if (!compile(vs, "Vol apply VS", SHADER_TYPE_VERTEX, false, sV)) return false;
 	if (!compile(psA, "Vol apply PS", SHADER_TYPE_PIXEL, false, sP)) return false;
-	RefCntAutoPtr<IPipelineState> pI, pN; RefCntAutoPtr<IShaderResourceBinding> bI, bN;
-	if (!buildCS("Vol inject PSO",    sI, {"g_ScatPrev", "g_GIIrr", "g_Fluid0", "g_Fluid1", "g_Fluid2", "g_Fluid3"}, pI, bI)) return false;
+	RefCntAutoPtr<IPipelineState> pI, pT, pN; RefCntAutoPtr<IShaderResourceBinding> bI, bT, bN;
+	if (!buildCS("Vol inject PSO",    sI, {"g_GIIrr", "g_Fluid0", "g_Fluid1", "g_Fluid2", "g_Fluid3"}, pI, bI)) return false;
+	if (!buildCS("Vol temporal PSO",  sT, {"g_ScatPrev"}, pT, bT)) return false;
 	if (!buildCS("Vol integrate PSO", sN, {}, pN, bN)) return false;
 	// Composite: a fullscreen pass over the scene colour (own output texture, not the chain scratch).
 	PostPipe pp;
@@ -114,7 +117,7 @@ bool NukeDiligent::Impl::BuildVolPipes()
 		pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth");
 		pp.histVar  = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Volume");   // the integrated grid
 	}
-	volInjectPSO = pI; volInjectSRB = bI; volIntegratePSO = pN; volIntegrateSRB = bN; volApplyPipe = std::move(pp);
+	volInjectPSO = pI; volInjectSRB = bI; volTemporalPSO = pT; volTemporalSRB = bT; volIntegratePSO = pN; volIntegrateSRB = bN; volApplyPipe = std::move(pp);
 	return true;
 }
 
@@ -165,9 +168,9 @@ void NukeDiligent::Impl::RunVolumetrics(int w, int h)
 		td.MipLevels = 1; td.Format = TEX_FORMAT_RGBA16_FLOAT; td.BindFlags = BIND_SHADER_RESOURCE | BIND_UNORDERED_ACCESS; td.Usage = USAGE_DEFAULT;
 		device->CreateTexture(td, nullptr, &t);
 	};
-	if (!st.scat[0] || !st.scat[1] || !st.integ || !st.light || st.sw != gw || st.sh != gh || st.d != gd)
+	if (!st.raw || !st.scat[0] || !st.scat[1] || !st.integ || !st.light || st.sw != gw || st.sh != gh || st.d != gd)
 	{
-		make3(st.scat[0], "Vol scatter A"); make3(st.scat[1], "Vol scatter B"); make3(st.integ, "Vol integrated"); make3(st.light, "Vol light");
+		make3(st.raw, "Vol scatter raw"); make3(st.scat[0], "Vol scatter A"); make3(st.scat[1], "Vol scatter B"); make3(st.integ, "Vol integrated"); make3(st.light, "Vol light");
 		st.sw = gw; st.sh = gh; st.d = gd; st.valid = false; st.cur = 0;
 	}
 	if (!st.out || st.w != w || st.h != h)
@@ -178,13 +181,14 @@ void NukeDiligent::Impl::RunVolumetrics(int w, int h)
 		device->CreateTexture(td, nullptr, &st.out);
 		st.w = w; st.h = h;
 	}
-	if (!st.scat[0] || !st.scat[1] || !st.integ || !st.light || !st.out) return;
+	if (!st.raw || !st.scat[0] || !st.scat[1] || !st.integ || !st.light || !st.out) return;
 	// Fluid volumes: step every visible one this frame; the density field replaces its analytic shape.
 	float fluidDt = 0.0f;
-	{
-		const float t = windParams[2];
-		if (volLastTime >= 0.0f) fluidDt = std::max(0.0f, std::min(0.05f, t - volLastTime));
+	{   // wall-clock step, capped (a hitch must not fling the fluid): the wind clock runs in its own units
+		const double t = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+		if (volLastTime >= 0.0) fluidDt = (float)std::max(0.0, std::min(0.05, t - volLastTime));
 		volLastTime = t;
+		volWindClock += fluidDt;   // the medium drifts at the wind's m/s over REAL seconds
 	}
 	ITextureView* fluidSRV[kFluidSlots] = { nullptr, nullptr, nullptr, nullptr };
 	std::map<uint64_t, int> fluidSlotOf;
@@ -195,7 +199,7 @@ void NukeDiligent::Impl::RunVolumetrics(int w, int h)
 		{
 			memset(fc, 0, sizeof(FogVolCBData));
 			fc->wind[0] = windDirStrength[0] * windDirStrength[3]; fc->wind[1] = windDirStrength[1] * windDirStrength[3];
-			fc->wind[2] = windDirStrength[2] * windDirStrength[3]; fc->wind[3] = windParams[2];
+			fc->wind[2] = windDirStrength[2] * windDirStrength[3]; fc->wind[3] = volWindClock;
 			// Culling: a volume outside the frustum, or behind the scene by last frame's Hi-Z
 			// verdict (the volumes ride the occlusion pass with the draws), costs nothing.
 			float vpm[16]; { const float4x4 VP = gbufView * gbufProj; memcpy(vpm, &VP, sizeof(vpm)); }
@@ -209,7 +213,7 @@ void NukeDiligent::Impl::RunVolumetrics(int w, int h)
 				g.rot[0] = -d.rot[0]; g.rot[1] = -d.rot[1]; g.rot[2] = -d.rot[2]; g.rot[3] = d.rot[3];   // conjugate: world -> local
 				g.albedoFall[0] = d.albedo[0]; g.albedoFall[1] = d.albedo[1]; g.albedoFall[2] = d.albedo[2]; g.albedoFall[3] = std::max(0.0f, std::min(1.0f, d.falloff));
 				g.emisNoise[0] = d.emission[0]; g.emisNoise[1] = d.emission[1]; g.emisNoise[2] = d.emission[2]; g.emisNoise[3] = std::max(0.0f, std::min(1.0f, d.noise));
-				g.noiseMisc[0] = std::max(d.noiseScale, 0.1f); g.noiseMisc[1] = d.windAdvect; g.noiseMisc[2] = std::max(d.shaftDensity, 0.0f); g.noiseMisc[3] = 0.0f;
+				g.noiseMisc[0] = std::max(d.noiseScale, 0.1f); g.noiseMisc[1] = d.windAdvect; g.noiseMisc[2] = std::max(d.shaftDensity, 0.0f); g.noiseMisc[3] = std::max(d.heightFalloff, 0.0f);
 			};
 			for (const NukeFogVolumeDesc& d : fogVols)
 			{
@@ -303,8 +307,7 @@ void NukeDiligent::Impl::RunVolumetrics(int w, int h)
 	auto set = [&](IShaderResourceBinding* srb, const char* n, IDeviceObject* o) { if (auto* s = srb->GetVariableByName(SHADER_TYPE_COMPUTE, n)) s->Set(o); };
 	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 	// 1) inject
-	set(volInjectSRB, "g_ScatPrev", st.scat[st.cur ^ 1]->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
-	set(volInjectSRB, "g_Scat",     st.scat[st.cur]->GetDefaultView(TEXTURE_VIEW_UNORDERED_ACCESS));
+	set(volInjectSRB, "g_Scat",     st.raw->GetDefaultView(TEXTURE_VIEW_UNORDERED_ACCESS));
 	set(volInjectSRB, "g_VolLightOut", st.light->GetDefaultView(TEXTURE_VIEW_UNORDERED_ACCESS));
 	set(volInjectSRB, "g_GIIrr",    giIrrSRV ? giIrrSRV : white);
 	EnsureVolFallbacks();
@@ -327,6 +330,13 @@ void NukeDiligent::Impl::RunVolumetrics(int w, int h)
 	else { set(volInjectSRB, "g_Shadow", shadowSRV); set(volInjectSRB, "g_ShadowCube", shadowCubeSRV); }
 	context->SetPipelineState(volInjectPSO);
 	context->CommitShaderResources(volInjectSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	context->DispatchCompute(DispatchComputeAttribs((Uint32)(gw + 7) / 8, (Uint32)(gh + 7) / 8, (Uint32)(gd + 3) / 4));
+	// 1b) temporal: the raw grid against the clamped, reprojected history
+	set(volTemporalSRB, "g_ScatRaw",  st.raw->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	set(volTemporalSRB, "g_ScatPrev", st.scat[st.cur ^ 1]->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	set(volTemporalSRB, "g_Scat",     st.scat[st.cur]->GetDefaultView(TEXTURE_VIEW_UNORDERED_ACCESS));
+	context->SetPipelineState(volTemporalPSO);
+	context->CommitShaderResources(volTemporalSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	context->DispatchCompute(DispatchComputeAttribs((Uint32)(gw + 7) / 8, (Uint32)(gh + 7) / 8, (Uint32)(gd + 3) / 4));
 	// 2) integrate the columns
 	set(volIntegrateSRB, "g_Scat",  st.scat[st.cur]->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
@@ -394,27 +404,73 @@ ITextureView* NukeDiligent::Impl::StepFluid(const NukeFogVolumeDesc& d, float dt
 	}
 	FluidState& st = fluidStates[d.id];
 	st.lastUsed = frameId;
+	// The air steps at 30 Hz (a 250 Hz step moves a thirtieth of a cell: all interpolation blur);
+	// the parcels move and splat every frame with the frame's dt - a 30 Hz hop printed stepped trails.
+	st.accum += dt;
+	const bool airDue = st.accum >= 1.0f / 30.0f || !st.valid;
+	const float airDt = std::min(st.accum, 0.05f);
+	if (airDue) st.accum = 0.0f;
+	dt = std::min(dt, 0.05f);
 	// resolution: fluidRes along the longest half extent, the others in proportion (multiples of 4)
 	const float he[3] = { std::max(d.halfExt[0], 0.01f), std::max(d.halfExt[1], 0.01f), std::max(d.halfExt[2], 0.01f) };
 	const float hmax = std::max(he[0], std::max(he[1], he[2]));
 	const int res = std::max(8, std::min(192, d.fluidRes));
 	int r[3];
 	for (int a = 0; a < 3; ++a) r[a] = std::max(8, ((int)std::lround(res * he[a] / hmax) + 3) / 4 * 4);
-	if (!st.dens[0] || st.rx != r[0] || st.ry != r[1] || st.rz != r[2])
+	if (!st.map[0] || st.rx != r[0] || st.ry != r[1] || st.rz != r[2])
 	{
-		for (auto& t : st.dens) { Trash(t); t.Release(); } for (auto& t : st.vel) { Trash(t); t.Release(); } for (auto& t : st.prs) { Trash(t); t.Release(); } Trash(st.div); st.div.Release();
+		for (auto& t : st.map) { Trash(t); t.Release(); } for (auto& t : st.vel) { Trash(t); t.Release(); } for (auto& t : st.prs) { Trash(t); t.Release(); } Trash(st.div); st.div.Release(); Trash(st.rho); st.rho.Release();
 		auto make = [&](RefCntAutoPtr<ITexture>& t, const char* name, TEXTURE_FORMAT fmt)
 		{
 			TextureDesc td; td.Name = name; td.Type = RESOURCE_DIM_TEX_3D; td.Width = (Uint32)r[0]; td.Height = (Uint32)r[1]; td.Depth = (Uint32)r[2];
 			td.MipLevels = 1; td.Format = fmt; td.BindFlags = BIND_SHADER_RESOURCE | BIND_UNORDERED_ACCESS; td.Usage = USAGE_DEFAULT;
 			device->CreateTexture(td, nullptr, &t);
 		};
-		make(st.dens[0], "Fluid density A", TEX_FORMAT_R16_FLOAT); make(st.dens[1], "Fluid density B", TEX_FORMAT_R16_FLOAT);
+		make(st.map[0], "Fluid density A", TEX_FORMAT_R16_FLOAT); make(st.map[1], "Fluid density B", TEX_FORMAT_R16_FLOAT); make(st.map[2], "Fluid density C", TEX_FORMAT_R16_FLOAT);
 		make(st.vel[0], "Fluid velocity A", TEX_FORMAT_RGBA16_FLOAT); make(st.vel[1], "Fluid velocity B", TEX_FORMAT_RGBA16_FLOAT);
 		make(st.prs[0], "Fluid pressure A", TEX_FORMAT_R16_FLOAT); make(st.prs[1], "Fluid pressure B", TEX_FORMAT_R16_FLOAT);
-		make(st.div, "Fluid divergence", TEX_FORMAT_R16_FLOAT);
-		st.rx = r[0]; st.ry = r[1]; st.rz = r[2]; st.cur = 0; st.valid = false;
-		if (!st.dens[0] || !st.dens[1] || !st.vel[0] || !st.vel[1] || !st.prs[0] || !st.prs[1] || !st.div) return nullptr;
+		make(st.div, "Fluid divergence", TEX_FORMAT_R16_FLOAT); make(st.rho, "Fluid fog", TEX_FORMAT_R16_FLOAT);
+		if (!st.ledger)
+		{
+			BufferDesc bd; bd.Name = "Fluid mass ledger"; bd.Size = 32; bd.BindFlags = BIND_UNORDERED_ACCESS; bd.Usage = USAGE_DEFAULT;
+			bd.Mode = BUFFER_MODE_STRUCTURED; bd.ElementByteStride = 4;
+			const unsigned zeros[8] = { 0, 0, 0, 0, 0, 0, 0, 0 }; BufferData init; init.pData = zeros; init.DataSize = 32;
+			device->CreateBuffer(bd, &init, &st.ledger);
+		}
+		st.rx = r[0]; st.ry = r[1]; st.rz = r[2]; st.cur = 0; st.valid = false; st.ledgerCur = 0;
+	}
+	// Clumps: a parcel's radius is the Clump Size (or a tenth of the shape's smaller side), the
+	// parcels stand 0.55 radii apart (overlapping into one fog), the splat grid has three cells
+	// per radius - none of it tied to the air grid, so the look does not change with the
+	// resolution or the shape's size.
+	const bool clumps = d.fluidMode == 1;
+	if (clumps)
+	{
+		const float hmin = std::min(he[0], std::min(he[1], he[2]));
+		const float rad = d.clumpSize > 0.01f ? d.clumpSize : std::max(0.1f, 0.2f * hmin);
+		const float vol = 8.0f * he[0] * he[1] * he[2], spacing = rad * 0.55f;
+		const int n = std::max(256, std::min(65536, (int)(vol / (spacing * spacing * spacing)))) / 256 * 256;
+		int sr[3]; for (int a = 0; a < 3; ++a) sr[a] = std::max(8, std::min(96, ((int)std::ceil(2.0f * he[a] / (rad / 3.0f)) + 3) / 4 * 4));
+		if (!st.parcels || !st.acc || !st.rhoS || st.parcelCount != n || st.sx != sr[0] || st.sy != sr[1] || st.sz != sr[2] || std::fabs(st.parcelRadius - rad) > 1e-4f)
+		{
+			Trash(st.parcels); st.parcels.Release(); Trash(st.acc); st.acc.Release(); Trash(st.rhoS); st.rhoS.Release();
+			auto make3 = [&](RefCntAutoPtr<ITexture>& t, const char* name, TEXTURE_FORMAT fmt)
+			{
+				TextureDesc td; td.Name = name; td.Type = RESOURCE_DIM_TEX_3D; td.Width = (Uint32)sr[0]; td.Height = (Uint32)sr[1]; td.Depth = (Uint32)sr[2];
+				td.MipLevels = 1; td.Format = fmt; td.BindFlags = BIND_SHADER_RESOURCE | BIND_UNORDERED_ACCESS; td.Usage = USAGE_DEFAULT;
+				device->CreateTexture(td, nullptr, &t);
+			};
+			make3(st.acc, "Fluid parcel splat", TEX_FORMAT_R32_UINT); make3(st.rhoS, "Fluid clump fog", TEX_FORMAT_R16_FLOAT);
+			BufferDesc bd; bd.Name = "Fluid parcels"; bd.Size = (Uint64)n * 32; bd.BindFlags = BIND_UNORDERED_ACCESS; bd.Usage = USAGE_DEFAULT;
+			bd.Mode = BUFFER_MODE_STRUCTURED; bd.ElementByteStride = 16;
+			device->CreateBuffer(bd, nullptr, &st.parcels);
+			st.parcelCount = n; st.parcelRadius = rad; st.sx = sr[0]; st.sy = sr[1]; st.sz = sr[2]; st.valid = false;
+			if (!st.acc || !st.rhoS || !st.parcels) return nullptr;
+		}
+	}
+	if (st.mode != d.fluidMode) { st.mode = d.fluidMode; st.valid = false; }
+	{
+		if (!st.map[0] || !st.map[1] || !st.map[2] || !st.vel[0] || !st.vel[1] || !st.prs[0] || !st.prs[1] || !st.div || !st.rho) return nullptr;
 	}
 	// displacers in the box's local frame
 	const float qx = -d.rot[0], qy = -d.rot[1], qz = -d.rot[2], qw = d.rot[3];   // world -> local
@@ -426,20 +482,21 @@ ITextureView* NukeDiligent::Impl::StepFluid(const NukeFogVolumeDesc& d, float dt
 		const float tx = 2.0f * (qy * z - qz * y), ty = 2.0f * (qz * x - qx * z), tz = 2.0f * (qx * y - qy * x);
 		o[0] = x + qw * tx + (qy * tz - qz * ty); o[1] = y + qw * ty + (qz * tx - qx * tz); o[2] = z + qw * tz + (qx * ty - qy * tx);
 	};
+	float passDt = dt;
 	auto fill = [&](int mode)
 	{
 		MapHelper<FluidCBData> cb(context, fluidCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		if (cb == nullptr) return false;
 		memset(cb, 0, sizeof(FluidCBData));
 		cb->res[0] = (float)r[0]; cb->res[1] = (float)r[1]; cb->res[2] = (float)r[2]; cb->res[3] = (float)mode;
-		cb->box[0] = he[0]; cb->box[1] = he[1]; cb->box[2] = he[2]; cb->box[3] = st.valid ? dt : 0.0f;
-		cb->rot[0] = qx; cb->rot[1] = qy; cb->rot[2] = qz; cb->rot[3] = qw;
+		cb->box[0] = he[0]; cb->box[1] = he[1]; cb->box[2] = he[2]; cb->box[3] = st.valid ? passDt : 0.0f;
+		{ const float wu[3] = { 0.0f, 1.0f, 0.0f }; float lu[3]; toLocal(wu, false, lu); cb->up[0] = lu[0]; cb->up[1] = lu[1]; cb->up[2] = lu[2]; cb->up[3] = 0.0f; }   // world up in the box frame (vortex axis)
 		cb->pos[0] = d.pos[0]; cb->pos[1] = d.pos[1]; cb->pos[2] = d.pos[2]; cb->pos[3] = (float)d.shape;
 		float wl[3]; const float ww[3] = { windDirStrength[0] * windDirStrength[3], windDirStrength[1] * windDirStrength[3], windDirStrength[2] * windDirStrength[3] };
 		toLocal(ww, false, wl);
 		cb->wind[0] = wl[0]; cb->wind[1] = wl[1]; cb->wind[2] = wl[2]; cb->wind[3] = d.fluidRefill;
 		cb->params[0] = d.fluidTurbulence; cb->params[1] = d.fluidDissipation; cb->params[2] = std::max(0.0f, std::min(1.0f, d.noise)); cb->params[3] = std::max(d.noiseScale, 0.1f);
-		cb->params2[0] = std::max(0.0f, std::min(1.0f, d.falloff)); cb->params2[1] = windParams[2]; cb->params2[2] = d.windAdvect; cb->params2[3] = st.valid ? 1.0f : 0.0f;
+		cb->params2[0] = std::max(0.0f, std::min(1.0f, d.falloff)); cb->params2[1] = volWindClock; cb->params2[2] = d.windAdvect; cb->params2[3] = st.valid ? 1.0f : 0.0f;
 		int n = 0;
 		for (const NukeFogDisplacerDesc& dp : fogDisplacers)
 		{
@@ -450,7 +507,25 @@ ITextureView* NukeDiligent::Impl::StepFluid(const NukeFogVolumeDesc& d, float dt
 			cb->dispVel[n][0] = lv[0]; cb->dispVel[n][1] = lv[1]; cb->dispVel[n][2] = lv[2]; cb->dispVel[n][3] = dp.strength;
 			++n;
 		}
+		// Force Fields / wind zones: the frame's bend volumes, in the box frame (strength = m/s^2)
+		int nf = 0;
+		for (int i = 0; i < bendVolumeCount && nf < 8; ++i)
+		{
+			const float* bv = bendVolumes[i];
+			float lp[3], ld[3]; toLocal(bv, true, lp); toLocal(bv + 4, false, ld);
+			const float rad = std::max(bv[3], 0.01f);
+			if (std::fabs(lp[0]) > he[0] + rad || std::fabs(lp[1]) > he[1] + rad || std::fabs(lp[2]) > he[2] + rad) continue;
+			cb->forcePos[nf][0] = lp[0]; cb->forcePos[nf][1] = lp[1]; cb->forcePos[nf][2] = lp[2]; cb->forcePos[nf][3] = rad;
+			cb->forceDir[nf][0] = ld[0]; cb->forceDir[nf][1] = ld[1]; cb->forceDir[nf][2] = ld[2]; cb->forceDir[nf][3] = bv[7];
+			cb->forceMisc[nf][0] = bv[8]; cb->forceMisc[nf][1] = bv[9]; cb->forceMisc[nf][2] = bv[10]; cb->forceMisc[nf][3] = bv[11];   // vortex pull
+			cb->forceDent[nf][0] = bv[13]; cb->forceDent[nf][1] = bv[14]; cb->forceDent[nf][2] = bv[15]; cb->forceDent[nf][3] = bv[16];   // depth, sharpness, size, density
+			cb->forceDent2[nf][0] = bv[12]; cb->forceDent2[nf][1] = cb->forceDent2[nf][2] = cb->forceDent2[nf][3] = 0.0f;               // inner radius
+			++nf;
+		}
+		cb->counts[0] = (float)n; cb->counts[1] = (float)nf; cb->counts[2] = std::max(d.heightFalloff, 0.0f); cb->counts[3] = (float)st.ledgerCur;
 		cb->misc[0] = (float)n; cb->misc[1] = 2.0f * he[0] / r[0]; cb->misc[2] = 2.0f * he[1] / r[1]; cb->misc[3] = 2.0f * he[2] / r[2];
+		cb->pos[0] = st.parcelRadius;
+		cb->splat[0] = (float)st.sx; cb->splat[1] = (float)st.sy; cb->splat[2] = (float)st.sz; cb->splat[3] = (float)st.parcelCount;
 		return true;
 	};
 	auto set = [&](const char* n, IDeviceObject* o) { if (auto* v = fluidSRB->GetVariableByName(SHADER_TYPE_COMPUTE, n)) v->Set(o); };
@@ -466,18 +541,67 @@ ITextureView* NukeDiligent::Impl::StepFluid(const NukeFogVolumeDesc& d, float dt
 		context->CommitShaderResources(fluidSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		context->DispatchCompute(da);
 	};
-	const int c = st.cur, o = c ^ 1;
-	ITexture *vA = st.vel[c], *vB = st.vel[o], *dA = st.dens[c], *dB = st.dens[o], *pA = st.prs[0], *pB = st.prs[1], *dv = st.div;
+	const int c = st.cur % 2, o = c ^ 1, mi = st.cur % 3, ms = (mi + 1) % 3, mo = (mi + 2) % 3;
+	ITexture *vA = st.vel[c], *vB = st.vel[o], *dA = st.map[mi], *dS = st.map[ms], *dB = st.map[mo], *pA = st.prs[0], *pB = st.prs[1], *dv = st.div;
 	// 0: velocity advection + forces (vA -> vB); 1: divergence of vB + clear pressure (-> dv, pA);
-	// 2: Jacobi x12 (pA <-> pB); 3: project vB - grad p (-> vA); 4: density advection by vA + refill (dA -> dB)
-	run(0, vA, dA, pA, dv, vB, dB, pB, dv);
-	run(1, vB, dA, pA, dv, vA, dB, pA, dv);
+	// 2: Jacobi x12 (pA <-> pB); 3: project vB - grad p (-> vA); 4/5: the reference map advected by vA (dA -> dS -> dB), the fog -> rho
+	set("g_RhoOut", uav(clumps ? st.rhoS : st.rho)); set("g_Ledger", st.ledger->GetDefaultView(BUFFER_VIEW_UNORDERED_ACCESS));   // every pass commits the whole SRB
+	set("g_Scratch", srv(dB));
+	if (!st.parcels || !st.acc)
+	{   // grid mode: the clump resources still have to be bound (the SRB is committed whole) - tiny stand-ins of the right type
+		TextureDesc td; td.Name = "Fluid parcel splat (stand-in)"; td.Type = RESOURCE_DIM_TEX_3D; td.Width = td.Height = td.Depth = 8;
+		td.MipLevels = 1; td.Format = TEX_FORMAT_R32_UINT; td.BindFlags = BIND_SHADER_RESOURCE | BIND_UNORDERED_ACCESS; td.Usage = USAGE_DEFAULT;
+		if (!st.acc) device->CreateTexture(td, nullptr, &st.acc);
+		BufferDesc bd; bd.Name = "Fluid parcels (stand-in)"; bd.Size = 256 * 32; bd.BindFlags = BIND_UNORDERED_ACCESS; bd.Usage = USAGE_DEFAULT;
+		bd.Mode = BUFFER_MODE_STRUCTURED; bd.ElementByteStride = 16;
+		if (!st.parcels) device->CreateBuffer(bd, nullptr, &st.parcels);
+		if (!st.acc || !st.parcels) return nullptr;
+	}
+	set("g_Parcels", st.parcels->GetDefaultView(BUFFER_VIEW_UNORDERED_ACCESS)); set("g_Acc", uav(st.acc));
+	auto runP = [&](int mode, ITexture* velIn)   // per-parcel passes: 256 threads a group
+	{
+		if (!fill(mode)) return;
+		set("g_VelIn", srv(velIn));
+		context->SetPipelineState(fluidPSO);
+		context->CommitShaderResources(fluidSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		context->DispatchCompute(DispatchComputeAttribs((Uint32)(st.parcelCount + 255) / 256, 1, 1));
+	};
 	ITexture* pin = pA; ITexture* pout = pB;
-	for (int i = 0; i < 12; ++i) { run(2, vB, dA, pin, dv, vA, dB, pout, dv); std::swap(pin, pout); }
-	run(3, vB, dA, pin, dv, vA, dB, pout, dv);
-	run(4, vA, dA, pin, dv, vB, dB, pout, dv);
-	st.cur = o; st.valid = true;
-	return srv(dB);
+	if (airDue)
+	{
+		passDt = airDt;
+		run(0, vA, dA, pA, dv, vB, dB, pB, dv);
+		run(1, vB, dA, pA, dv, vA, dB, pA, dv);
+		for (int i = 0; i < 12; ++i) { run(2, vB, dA, pin, dv, vA, dB, pout, dv); std::swap(pin, pout); }
+		run(3, vB, dA, pin, dv, vA, dB, pout, dv);
+		passDt = dt;
+	}
+	if (clumps)
+	{
+		const DispatchComputeAttribs ds((Uint32)(st.sx + 7) / 8, (Uint32)(st.sy + 7) / 8, (Uint32)(st.sz + 3) / 4);
+		auto runS = [&](int mode)   // splat-grid passes
+		{
+			if (!fill(mode)) return;
+			set("g_VelIn", srv(vA));
+			context->SetPipelineState(fluidPSO);
+			context->CommitShaderResources(fluidSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			context->DispatchCompute(ds);
+		};
+		runS(5);        // clear the splat and next frame's ledger slot, sum the resting amount
+		runP(4, vA);    // the parcels ride the air + the fields (the air of the last 30 Hz step)
+		runP(6, vA);    // splat
+		runS(7);        // resolve -> rhoS
+		if (airDue) st.cur = (st.cur + 5) % 6;   // the velocity flips only when the air stepped
+		st.valid = true; st.ledgerCur = (st.ledgerCur + 1) % 3;
+		return srv(st.rhoS);
+	}
+	if (!airDue) { return srv(st.rho); }   // grid mode: everything at the air's rate
+	passDt = airDt;
+	run(8, vA, dA, pin, dv, vB, dS, pout, dv);   // density: forward advection -> the scratch
+	set("g_Scratch", srv(dS));
+	run(9, vA, dA, pin, dv, vB, dB, pout, dv);   // MacCormack correction, continuity, relaxation -> dB, rho
+	st.cur = (st.cur + 5) % 6; st.valid = true; st.ledgerCur = (st.ledgerCur + 1) % 3;
+	return srv(st.rho);
 }
 
 // A fog volume's occlusion tag: stable while the volume stands still (the hash of its placement;

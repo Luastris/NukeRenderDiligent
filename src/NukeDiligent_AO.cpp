@@ -200,7 +200,7 @@ void NukeDiligent::Impl::PruneCameraStates()
 		if (frameId - it->second.lastUsed > kStale)
 		{
 			FluidState& s = it->second;
-			Trash(s.dens[0]); Trash(s.dens[1]); Trash(s.vel[0]); Trash(s.vel[1]); Trash(s.prs[0]); Trash(s.prs[1]); Trash(s.div);
+			Trash(s.map[0]); Trash(s.map[1]); Trash(s.map[2]); Trash(s.rho); Trash(s.rhoS); Trash(s.ledger); Trash(s.parcels); Trash(s.acc); Trash(s.vel[0]); Trash(s.vel[1]); Trash(s.prs[0]); Trash(s.prs[1]); Trash(s.div);
 			it = fluidStates.erase(it);
 		}
 		else ++it;

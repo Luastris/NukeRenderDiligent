@@ -1702,7 +1702,7 @@ void NukeDiligent::setBendVolumes(const float* vols, int count)
 {
 	m_impl->bendVolumeCount = (!vols || count <= 0) ? 0 : (count > 16 ? 16 : count);
 	if (m_impl->bendVolumeCount > 0)
-		memcpy(m_impl->bendVolumes, vols, (size_t)m_impl->bendVolumeCount * 12 * sizeof(float));
+		memcpy(m_impl->bendVolumes, vols, (size_t)m_impl->bendVolumeCount * 20 * sizeof(float));
 }
 
 // Write BendCB. Layout MUST match the instanced vertex shaders: g_WindV (dir.xyz, strength),
