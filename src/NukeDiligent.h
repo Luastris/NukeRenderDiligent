@@ -101,6 +101,8 @@ public:
 	void drawSpriteRunSixWay(Texture* lightA, Texture* lightB, const float* verts, int vertCount) override;
 	const char* backendName() override;
 	void setFogDisplacers(const NukeFogDisplacerDesc* displacers, int count) override;
+	void setClouds(const NukeCloudsDesc& clouds) override;
+	int  cloudsState() override;
 	// GPU instancing
 	uint64_t createInstanceBuffer() override;
 	void     updateInstanceBuffer(uint64_t id, const NukeInstanceData* data, int count) override;

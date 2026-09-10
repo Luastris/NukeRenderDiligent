@@ -96,7 +96,12 @@ void NukeDiligent::beginCubeFace(uint64_t cube, int face, const float pos[3], fl
 	ctx->SetViewports(1, &vp, c.res, c.res);
 
 	m_impl->WriteFrameCB(P);   // probe off (probeActive=false) -> analytic IBL during capture
-	if (!m_impl->giCapturing) m_impl->DrawSky();   // GI probe captures: a miss is the analytic sky in ddgi_cube.cs
+	m_impl->WriteGICB();       // the world PSO binds GICB statically: a dynamic CB must be mapped before its first use in a frame (a capture before any camera)
+	if (!m_impl->giCapturing)
+	{
+		m_impl->DrawSky();   // GI probe captures: a miss is the analytic sky in ddgi_cube.cs
+		m_impl->RunCloudsCubeFace(rtv, dsv, c.res);   // VL3: the cloud layer over the face's sky (reflections see the clouds)
+	}
 }
 
 void NukeDiligent::endCubeFace(uint64_t cube, int face)

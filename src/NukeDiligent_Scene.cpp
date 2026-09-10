@@ -396,6 +396,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	bindIf(wp.giIrrVar, m_impl->giIrrSRV ? m_impl->giIrrSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 4]);
 	bindIf(wp.giVisVar, m_impl->giVisSRV ? m_impl->giVisSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 5]);
 	bindIf(wp.sgiVar, m_impl->screenGISRV ? m_impl->screenGISRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 6]);
+	bindIf(wp.cloudShVar, m_impl->cloudShadowSRV ? m_impl->cloudShadowSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 7]);
 	// Generic named textures (terrain layer normal/MR maps): shader-declared g_Layer* SRVs fill
 	// from the material's extraTex by name; pointer-gated like everything else.
 	for (auto& ex : wp.extraVars)
@@ -480,6 +481,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		TP(SHADER_TYPE_PIXEL, "g_MskStamp",  (mat && mat->mskStamp) ? (IDeviceObject*)m_impl->GetTexSRV(mat->mskStamp) : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_SceneRefr", m_impl->refrSRV ? (IDeviceObject*)m_impl->refrSRV : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_ScreenAO",  m_impl->screenAOSRV ? (IDeviceObject*)m_impl->screenAOSRV : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_CloudShadowMap", m_impl->cloudShadowSRV ? (IDeviceObject*)m_impl->cloudShadowSRV : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_GIIrr",     m_impl->giIrrSRV ? (IDeviceObject*)m_impl->giIrrSRV : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_GIVis",     m_impl->giVisSRV ? (IDeviceObject*)m_impl->giVisSRV : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_ScreenGI",  m_impl->screenGISRV ? (IDeviceObject*)m_impl->screenGISRV : (IDeviceObject*)whiteSRV);
@@ -736,6 +738,7 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 	memcpy(fb->wind,  windDirStrength, sizeof(fb->wind));    // 7.2: g_Wind (dir.xyz, gusted strength)
 	memcpy(fb->wind2, windParams,      sizeof(fb->wind2));   //      g_Wind2 (turbAmount, 1/turbScale, time, gustFreq)
 	fb->misc[0] = giCaptureMaxD > 0.0f ? 1.0f : 0.0f; fb->misc[1] = giCaptureMaxD; fb->misc[2] = fb->misc[3] = 0.0f;
+	memcpy(fb->cloudShadow, cloudShadowOrigin, sizeof(fb->cloudShadow));   // VL3: cloud shadow map origin x,z, 1/size, strength
 }
 
 void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
@@ -834,6 +837,7 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	}
 
 	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
+	if (m_impl->cloudShadowFrame != m_impl->frameId) { m_impl->cloudShadowFrame = m_impl->frameId; m_impl->RunCloudShadow(); }   // VL3, once a frame
 	m_impl->WriteFrameCB(P);
 
 	// Volumetric fog grid off this camera's prepass + lights (compute: the targets rebind after).
@@ -854,6 +858,8 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 }
 
 void NukeDiligent::setSky(const NukeSky& s) { m_impl->sky = s; m_impl->toneExposure = s.exposure; m_impl->toneWhite = s.whitePoint; }
+void NukeDiligent::setClouds(const NukeCloudsDesc& c) { m_impl->clouds = c; }
+int  NukeDiligent::cloudsState() { return m_impl->CloudsState(); }
 
 // Halton low-discrepancy sequence (1-based index) — even sub-pixel coverage for the TAA jitter.
 static float Halton(int i, int b) { float f = 1.0f, r = 0.0f; while (i > 0) { f /= b; r += f * (i % b); i /= b; } return r; }
@@ -1582,6 +1588,8 @@ void NukeDiligent::endCamera()
 			if (!preDone && !(pit->second.isSSR || pit->second.isRTRef))
 			{
 				preDone = true;
+				m_impl->GpuPass("clouds");
+				srcSRV = m_impl->RunClouds(srcSRV, w, h);
 				m_impl->GpuPass("volumetrics");
 				if (m_impl->volCur) srcSRV = m_impl->ApplyVolumetrics(srcSRV, w, h);
 				srcSRV = m_impl->RunSunShafts(srcSRV, w, h);
@@ -1650,6 +1658,8 @@ void NukeDiligent::endCamera()
 	}
 	if (!preDone && chainSrc && m_impl->curRTW > 0 && m_impl->curRTH > 0)   // no chain, or reflections only
 	{
+		m_impl->GpuPass("clouds");
+		chainSrc = m_impl->RunClouds(chainSrc, m_impl->curRTW, m_impl->curRTH);
 		m_impl->GpuPass("volumetrics");
 		if (m_impl->volCur) chainSrc = m_impl->ApplyVolumetrics(chainSrc, m_impl->curRTW, m_impl->curRTH);
 		chainSrc = m_impl->RunSunShafts(chainSrc, m_impl->curRTW, m_impl->curRTH);
@@ -1975,6 +1985,7 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 		bindIf(wp.giIrrVarI, m_impl->giIrrSRV ? m_impl->giIrrSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 4]);
 		bindIf(wp.giVisVarI, m_impl->giVisSRV ? m_impl->giVisSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 5]);
 		bindIf(wp.sgiVarI, m_impl->screenGISRV ? m_impl->screenGISRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 6]);
+		bindIf(wp.cloudShVarI, m_impl->cloudShadowSRV ? m_impl->cloudShadowSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 7]);
 	}
 
 	IDeviceContext* ctx = m_impl->context;

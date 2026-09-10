@@ -493,6 +493,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	vars.push_back({SHADER_TYPE_PIXEL, "g_GIIrr",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // DDGI atlases (shared g_GIIrr_sampler)
 	vars.push_back({SHADER_TYPE_PIXEL, "g_GIVis",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	vars.push_back({SHADER_TYPE_PIXEL, "g_ScreenGI",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // Load-only: no sampler
+	vars.push_back({SHADER_TYPE_PIXEL, "g_CloudShadowMap", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // VL3 cloud shadow map, Load-only
 	// Generic per-layer maps: any PS SRV named g_LayerN*/g_LayerMR*/g_LayerH* becomes a DYNAMIC
 	// var, filled from Material::extraTex by name (one shared sampler on g_LayerN0 below).
 	std::vector<std::string> extraNames;
@@ -763,6 +764,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.giIrrVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GIIrr");
 	wp.giVisVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GIVis");
 	wp.sgiVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ScreenGI");
+	wp.cloudShVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_CloudShadowMap");
 	wp.extraVars.clear();
 	for (const std::string& n : extraNames)
 		if (auto* v = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, n.c_str()))
@@ -869,6 +871,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				wp.giIrrVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_GIIrr");
 				wp.giVisVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_GIVis");
 				wp.sgiVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_ScreenGI");
+				wp.cloudShVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_CloudShadowMap");
 				}
 			}
 		}

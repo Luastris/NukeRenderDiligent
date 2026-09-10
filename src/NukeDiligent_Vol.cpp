@@ -665,10 +665,11 @@ bool NukeDiligent::Impl::BuildSunShaftPipes()
 		{SHADER_TYPE_PIXEL, "g_Source", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Depth",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Mask",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_Clouds", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 	};
-	ImmutableSamplerDesc imms[] = {{SHADER_TYPE_PIXEL, "g_Source", lin}, {SHADER_TYPE_PIXEL, "g_Depth", pt}, {SHADER_TYPE_PIXEL, "g_Mask", lin}};
-	ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 3;
-	ci.PSODesc.ResourceLayout.ImmutableSamplers = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 3;
+	ImmutableSamplerDesc imms[] = {{SHADER_TYPE_PIXEL, "g_Source", lin}, {SHADER_TYPE_PIXEL, "g_Depth", pt}, {SHADER_TYPE_PIXEL, "g_Mask", lin}, {SHADER_TYPE_PIXEL, "g_Clouds", lin}};
+	ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 4;
+	ci.PSODesc.ResourceLayout.ImmutableSamplers = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 4;
 	ci.pVS = sV; ci.pPS = sP;
 	RefCntAutoPtr<IPipelineState> pso;
 	CreateGraphicsPipelineStateCached(ci, &pso);
@@ -680,6 +681,7 @@ bool NukeDiligent::Impl::BuildSunShaftPipes()
 	ssSrcVar = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Source");
 	ssDepthVar = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth");
 	ssMaskVar = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Mask");
+	ssCloudVar = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Clouds");
 	sunShaftSRB = srb; sunShaftPSO = pso;
 	return true;
 }
@@ -748,6 +750,7 @@ ITextureView* NukeDiligent::Impl::RunSunShafts(ITextureView* sceneSRV, int w, in
 		if (ssSrcVar)   ssSrcVar->Set(src);
 		if (ssDepthVar) ssDepthVar->Set(gbufDepthSRV);
 		if (ssMaskVar)  ssMaskVar->Set(mask);
+		if (ssCloudVar) ssCloudVar->Set(cloudCurSRV ? (IDeviceObject*)cloudCurSRV : (IDeviceObject*)whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
 		ITextureView* rtv = dst->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
 		context->SetRenderTargets(1, &rtv, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)dw; vp.Height = (float)dh; vp.MinDepth = 0; vp.MaxDepth = 1;

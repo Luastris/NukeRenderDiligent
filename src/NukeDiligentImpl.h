@@ -574,8 +574,42 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<ITexture> ssMask[2], ssOut; int ssW = 0, ssH = 0;
 	std::atomic<bool> ssBuilding{false}; bool ssFailed = false;
 	bool BuildSunShaftPipes();
+	IShaderResourceVariable* ssCloudVar = nullptr;   // the sun shafts' source through the clouds' transmittance
 	ITextureView* RunSunShafts(ITextureView* sceneSRV, int w, int h);
 	ITextureView* ApplyVolumetrics(ITextureView* sceneSRV, int w, int h);
+
+	// --- Volumetric clouds (VL3, NukeDiligent_Clouds.cpp) --------------------------------------
+	// A planet-shell cloud layer: noise + weather generated once, marched per camera at a reduced
+	// resolution, resolved temporally, composited before the fog; a sun-transmittance shadow map
+	// once a frame for the surfaces (FrameCB g_CloudShadow + g_CloudShadowMap).
+	static const int kCloudCBSize = 2 * 64 + 13 * 16;
+	NukeCloudsDesc clouds;
+	RefCntAutoPtr<IBuffer> cloudCB;
+	RefCntAutoPtr<IPipelineState> cloudGenPSO, cloudMarchPSO, cloudTemporalPSO, cloudShadowPSO;
+	RefCntAutoPtr<IShaderResourceBinding> cloudGenSRB, cloudMarchSRB, cloudTemporalSRB, cloudShadowSRB;
+	PostPipe cloudApplyPipe;
+	RefCntAutoPtr<ITexture> cloudBase, cloudDetail, cloudWeather, cloudShadowTex;
+	bool cloudNoiseReady = false, cloudsFailed = false;
+	std::atomic<bool> cloudsBuilding{false};
+	double cloudLastTime = -1.0; float cloudClock = 0.0f, cloudWindX = 0.0f, cloudWindZ = 0.0f;
+	uint64_t cloudFrameStamp = ~0ull, cloudShadowFrame = ~0ull;
+	ITextureView* cloudCurSRV = nullptr;      // this camera pass's resolved clouds (rgb in-scatter, a transmittance)
+	ITextureView* cloudShadowSRV = nullptr;   // this frame's shadow map (null = none)
+	float cloudShadowOrigin[4] = { 0, 0, 1, 0 };
+	struct CloudState { RefCntAutoPtr<ITexture> march, dist, hist[2], distFull, out; int mw = 0, mh = 0, w = 0, h = 0, cur = 0; bool valid = false; float4x4 prevVP, prevView; uint64_t lastUsed = 0; };
+	std::map<uint64_t, CloudState> cloudStates;   // keyed by curCamKey
+	// the reflection-probe path: the face's march + an in-place blend PSO (sample count / format stamped like the sky)
+	RefCntAutoPtr<IPipelineState> cloudProbePSO; RefCntAutoPtr<IShaderResourceBinding> cloudProbeSRB; IShaderResourceVariable* cloudProbeVar = nullptr;
+	Uint8 cloudProbeSmp = 0; TEXTURE_FORMAT cloudProbeFmt = TEX_FORMAT_UNKNOWN;   // what the probe PSO was built for
+	RefCntAutoPtr<ITexture> cloudProbeMarch, cloudProbeDist; int cloudProbeRes = 0; bool cloudProbeSaid = false;
+	bool BuildCloudPipes();
+	bool BuildCloudProbePipe();
+	void FillCloudCB(int rw, int rh, int w, int h, float mode, const float4x4* prevVP, float shadowOx, float shadowOz, float shadowSize, bool probe = false);
+	void GenerateCloudNoise();
+	ITextureView* RunClouds(ITextureView* sceneSRV, int w, int h);
+	void RunCloudsCubeFace(ITextureView* rtv, ITextureView* dsv, int res);
+	void RunCloudShadow();
+	int  CloudsState() const { return !clouds.enabled || cloudsFailed ? 0 : (cloudMarchPSO && cloudNoiseReady ? 2 : 1); }   // 0 off, 1 building, 2 ready
 
 	// --- Hi-Z occlusion culling -----------------------------------------------------------------------
 	// Two-phase per camera: draws whose id the visibility history calls visible go straight through
@@ -812,6 +846,7 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              saoVar = nullptr;    // PS "g_ScreenAO" (screen-space AO visibility)
 		IShaderResourceVariable*              giIrrVar = nullptr, *giVisVar = nullptr;   // PS DDGI atlases
 		IShaderResourceVariable*              sgiVar = nullptr;    // PS "g_ScreenGI" (screen-space bounce)
+		IShaderResourceVariable*              cloudShVar = nullptr;   // PS "g_CloudShadowMap" (VL3 cloud shadow map)
 		IShaderResourceVariable*              mskVar  = nullptr;   // PS "g_MskStamp" (LiveMask stamp)
 		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
@@ -827,13 +862,13 @@ struct NukeDiligent::Impl
 		                        *shadowVarI = nullptr, *cubeVarI = nullptr, *probeVarI = nullptr, *tlasVarI = nullptr,
 		                        *rtInstVarI = nullptr;
 		IShaderResourceVariable *ovVarI[kOvTexCount] = {};
-		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr, *mskVarI = nullptr, *saoVarI = nullptr, *giIrrVarI = nullptr, *giVisVarI = nullptr, *sgiVarI = nullptr;
+		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr, *mskVarI = nullptr, *saoVarI = nullptr, *giIrrVarI = nullptr, *giVisVarI = nullptr, *sgiVarI = nullptr, *cloudShVarI = nullptr;
 		// Redundancy gates: object each DYNAMIC variable currently holds — Diligent rewrites the
 		// descriptor cache on EVERY Set() of a dynamic var, so only Set() on an actual change.
 		// [0..12] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst,wipe,height;
-		// [13..] = overlay-slot maps (OvTexNames() order), then flow, scene-refraction, mask stamp, screen AO, GI irradiance, GI visibility, screen GI.
-		IDeviceObject* lastBind[13 + kOvTexCount + 7]  = {};
-		IDeviceObject* lastBindI[13 + kOvTexCount + 7] = {};
+		// [13..] = overlay-slot maps (OvTexNames() order), then flow, scene-refraction, mask stamp, screen AO, GI irradiance, GI visibility, screen GI, cloud shadow.
+		IDeviceObject* lastBind[13 + kOvTexCount + 8]  = {};
+		IDeviceObject* lastBindI[13 + kOvTexCount + 8] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
 		std::string hsSrc, dsSrc;        // CUSTOM tess stages (empty = shared world.hs/world.ds)
 		bool tessCustom = false;         // the shader SHIPPED hs/ds (builder copies resolve the shared pair into hsSrc)
@@ -991,7 +1026,8 @@ struct NukeDiligent::Impl
 	                     float skyTop[4]; float skyHorizon[4]; float skyGround[4]; float skyParams[4];      // IBL
 	                     float probePos[4]; float probeParams[4]; float probeBox[4];    // probe: pos.xyz+active, intensity+maxMip, boxHalf.xyz+valid
 	                     float wind[4]; float wind2[4];      // dir.xyz+gusted strength; turbAmount, 1/turbScale, time, gustFreq
-	                     float misc[4]; };                    // x = GI probe capture (alpha = distance / y), y = max distance
+	                     float misc[4];                       // x = GI probe capture (alpha = distance / y), y = max distance
+	                     float cloudShadow[4]; };             // VL3 cloud shadow map: origin x, z, 1/size, strength (appended)
 	float windDirStrength[4] = { 1, 0, 0, 0 };   // setWind (pushed per frame)
 	float windParams[4]      = { 0, 0, 0, 0 };
 	// Foliage bend: the VS-side BendCB — wind + up to 8 "pushers" that part the blades. Written

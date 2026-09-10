@@ -205,6 +205,16 @@ void NukeDiligent::Impl::PruneCameraStates()
 		}
 		else ++it;
 	}
+	for (auto it = cloudStates.begin(); it != cloudStates.end();)
+	{
+		if (frameId - it->second.lastUsed > kStale)
+		{
+			CloudState& s = it->second;
+			Trash(s.march); Trash(s.dist); Trash(s.hist[0]); Trash(s.hist[1]); Trash(s.distFull); Trash(s.out);
+			it = cloudStates.erase(it);
+		}
+		else ++it;
+	}
 	for (auto it = volStates.begin(); it != volStates.end();)
 	{
 		if (frameId - it->second.lastUsed > kStale)
