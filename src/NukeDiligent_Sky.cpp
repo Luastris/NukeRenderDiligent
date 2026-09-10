@@ -66,7 +66,8 @@ void NukeDiligent::Impl::DrawSky()
 		cb->invVP = invVP;
 		cb->camPos[0] = curCamPos[0]; cb->camPos[1] = curCamPos[1]; cb->camPos[2] = curCamPos[2]; cb->camPos[3] = 1;
 		for (int k = 0; k < 3; ++k) { cb->top[k] = sky.top[k]; cb->horizon[k] = sky.horizon[k]; cb->ground[k] = sky.ground[k]; cb->sunDir[k] = sky.sunDir[k]; cb->sunCol[k] = sky.sunColor[k]; cb->moonDir[k] = sky.moonDir[k]; }
-		cb->top[3] = cb->horizon[3] = cb->ground[3] = cb->sunDir[3] = cb->sunCol[3] = cb->moonDir[3] = 1;
+		cb->top[3] = cb->horizon[3] = cb->ground[3] = cb->moonDir[3] = 1;
+		cb->sunDir[3] = std::max(sky.sunSize, 0.0005f); cb->sunCol[3] = std::max(sky.sunGlow, 0.0f);   // disc radius (radians), glow strength
 		cb->params[0] = sky.skyIntensity; cb->params[1] = sky.sunIntensity; cb->params[2] = sky.stars;
 		cb->params[3] = starSRV ? 1.0f : 0.0f;   // has a star texture (else procedural)
 		cb->moonParams[0] = moonSRV ? sky.moonAmount : 0.0f; cb->moonParams[1] = sky.moonSize; cb->moonParams[2] = sky.moonPhase;

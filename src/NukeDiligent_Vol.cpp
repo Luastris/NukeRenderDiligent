@@ -744,7 +744,7 @@ ITextureView* NukeDiligent::Impl::RunSunShafts(ITextureView* sceneSRV, int w, in
 			cb->sun[0] = ux; cb->sun[1] = uy; cb->sun[2] = onScreen; cb->sun[3] = vol.sunShaftIntensity;
 			cb->prm[0] = reach; cb->prm[1] = 0.94f; cb->prm[2] = (float)mode; cb->prm[3] = hdr ? 0.0f : 1.0f;
 			cb->col[0] = col[0] * strength; cb->col[1] = col[1] * strength; cb->col[2] = col[2] * strength; cb->col[3] = sky.whitePoint;
-			cb->dir[0] = dir[0]; cb->dir[1] = dir[1]; cb->dir[2] = dir[2]; cb->dir[3] = 0.0f;
+			cb->dir[0] = dir[0]; cb->dir[1] = dir[1]; cb->dir[2] = dir[2]; cb->dir[3] = std::max(sky.sunSize, 0.0005f);   // w = the disc's angular radius
 			cb->invVP = invVP;
 		}
 		if (ssSrcVar)   ssSrcVar->Set(src);
