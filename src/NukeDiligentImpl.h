@@ -582,7 +582,7 @@ struct NukeDiligent::Impl
 	// A planet-shell cloud layer: noise + weather generated once, marched per camera at a reduced
 	// resolution, resolved temporally, composited before the fog; a sun-transmittance shadow map
 	// once a frame for the surfaces (FrameCB g_CloudShadow + g_CloudShadowMap).
-	static const int kCloudCBSize = 2 * 64 + 13 * 16;
+	static const int kCloudCBSize = 2 * 64 + 15 * 16;
 	NukeCloudsDesc clouds;
 	RefCntAutoPtr<IBuffer> cloudCB;
 	RefCntAutoPtr<IPipelineState> cloudGenPSO, cloudMarchPSO, cloudTemporalPSO, cloudShadowPSO;
@@ -610,6 +610,32 @@ struct NukeDiligent::Impl
 	void RunCloudsCubeFace(ITextureView* rtv, ITextureView* dsv, int res);
 	void RunCloudShadow();
 	int  CloudsState() const { return !clouds.enabled || cloudsFailed ? 0 : (cloudMarchPSO && cloudNoiseReady ? 2 : 1); }   // 0 off, 1 building, 2 ready
+
+	// --- Physical atmosphere (NukeDiligent_Atmo.cpp) ---------------------------------------------
+	// Hillaire LUTs: transmittance + multi-scatter (per medium), sky-view + aerial perspective (per
+	// camera pass), a zenith / horizon / ground summary read back for the FrameCB sky colours.
+	static const int kAtmoCBSize = 10 * 16 + 64 + 16;
+	RefCntAutoPtr<IBuffer> atmoCB;
+	RefCntAutoPtr<IPipelineState> atmoLutPSO; RefCntAutoPtr<IShaderResourceBinding> atmoLutSRB;
+	PostPipe atmoApplyPipe;
+	RefCntAutoPtr<ITexture> atmoTrans, atmoMulti, atmoSkyView, atmoAP, atmoOut, atmoDummy;
+	RefCntAutoPtr<IBuffer> atmoSummaryBuf;
+	struct AtmoRing { RefCntAutoPtr<IBuffer> staging; int pending = -1; };
+	AtmoRing atmoRing[3]; int atmoRingHead = 0;
+	float atmoSummary[3][4] = {}; bool atmoSummaryValid = false;
+	float skyTopEff[3] = {0, 0, 0}, skyHorEff[3] = {0, 0, 0}, skyGndEff[3] = {0, 0, 0};   // the sky colours the FrameCB / clouds use (the summary when physical)
+	uint64_t atmoMediumHash = 0;
+	int atmoW = 0, atmoH = 0;
+	bool atmoFailed = false; std::atomic<bool> atmoBuilding{false};
+	bool BuildAtmoPipes();
+	static SamplerDesc AtmoSampler();
+	bool AtmoActive() const;
+	void FillAtmoCB(int mode, int w, int h, bool probe);
+	void AtmoBind(IShaderResourceBinding* srb, SHADER_TYPE stage);   // the LUTs (or stand-ins) on an SRB that includes atmosphere.hlsli
+	ITextureView* AtmoSkyViewSRV();
+	ITextureView* AtmoTransSRV();
+	void RunAtmosphere(bool probe);
+	ITextureView* ApplyAtmosphere(ITextureView* sceneSRV, int w, int h);
 
 	// --- Hi-Z occlusion culling -----------------------------------------------------------------------
 	// Two-phase per camera: draws whose id the visibility history calls visible go straight through
@@ -847,6 +873,7 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              giIrrVar = nullptr, *giVisVar = nullptr;   // PS DDGI atlases
 		IShaderResourceVariable*              sgiVar = nullptr;    // PS "g_ScreenGI" (screen-space bounce)
 		IShaderResourceVariable*              cloudShVar = nullptr;   // PS "g_CloudShadowMap" (VL3 cloud shadow map)
+		IShaderResourceVariable*              atmoSkyVar = nullptr, *atmoTransVar = nullptr;   // PS "g_AtmoSkyView" / "g_AtmoTrans" (physical atmosphere LUTs)
 		IShaderResourceVariable*              mskVar  = nullptr;   // PS "g_MskStamp" (LiveMask stamp)
 		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
 		IShaderResourceVariable*              cubeVar   = nullptr;// PS "g_ShadowCube" (dynamic)
@@ -862,13 +889,13 @@ struct NukeDiligent::Impl
 		                        *shadowVarI = nullptr, *cubeVarI = nullptr, *probeVarI = nullptr, *tlasVarI = nullptr,
 		                        *rtInstVarI = nullptr;
 		IShaderResourceVariable *ovVarI[kOvTexCount] = {};
-		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr, *mskVarI = nullptr, *saoVarI = nullptr, *giIrrVarI = nullptr, *giVisVarI = nullptr, *sgiVarI = nullptr, *cloudShVarI = nullptr;
+		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr, *mskVarI = nullptr, *saoVarI = nullptr, *giIrrVarI = nullptr, *giVisVarI = nullptr, *sgiVarI = nullptr, *cloudShVarI = nullptr, *atmoSkyVarI = nullptr, *atmoTransVarI = nullptr;
 		// Redundancy gates: object each DYNAMIC variable currently holds — Diligent rewrites the
 		// descriptor cache on EVERY Set() of a dynamic var, so only Set() on an actual change.
 		// [0..12] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst,wipe,height;
 		// [13..] = overlay-slot maps (OvTexNames() order), then flow, scene-refraction, mask stamp, screen AO, GI irradiance, GI visibility, screen GI, cloud shadow.
-		IDeviceObject* lastBind[13 + kOvTexCount + 8]  = {};
-		IDeviceObject* lastBindI[13 + kOvTexCount + 8] = {};
+		IDeviceObject* lastBind[13 + kOvTexCount + 10]  = {};
+		IDeviceObject* lastBindI[13 + kOvTexCount + 10] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
 		std::string hsSrc, dsSrc;        // CUSTOM tess stages (empty = shared world.hs/world.ds)
 		bool tessCustom = false;         // the shader SHIPPED hs/ds (builder copies resolve the shared pair into hsSrc)
@@ -1027,7 +1054,8 @@ struct NukeDiligent::Impl
 	                     float probePos[4]; float probeParams[4]; float probeBox[4];    // probe: pos.xyz+active, intensity+maxMip, boxHalf.xyz+valid
 	                     float wind[4]; float wind2[4];      // dir.xyz+gusted strength; turbAmount, 1/turbScale, time, gustFreq
 	                     float misc[4];                       // x = GI probe capture (alpha = distance / y), y = max distance
-	                     float cloudShadow[4]; };             // VL3 cloud shadow map: origin x, z, 1/size, strength (appended)
+	                     float cloudShadow[4];                // VL3 cloud shadow map: origin x, z, 1/size, strength (appended)
+	                     float atmoA[4]; float atmoB[4]; };   // physical atmosphere: mode, Rg km, Rt km, sky-view w | sun dir xyz, sky-view h (appended)
 	float windDirStrength[4] = { 1, 0, 0, 0 };   // setWind (pushed per frame)
 	float windParams[4]      = { 0, 0, 0, 0 };
 	// Foliage bend: the VS-side BendCB — wind + up to 8 "pushers" that part the blades. Written
@@ -1176,6 +1204,14 @@ struct NukeDiligent::Impl
 	void BindSpriteVolume(IShaderResourceBinding* srb, IShaderResourceVariable* integVar, IShaderResourceVariable* lightVar, IShaderResourceVariable* depthVar, float soft2[4], bool& softOut);
 	float                                 curNear = 0.1f, curFar = 1000.f;   // camera planes (soft-particle linearization)
 	std::vector<float>                    spriteBatchVerts;
+	// Quads a water surface left for AFTER itself (their centre is above the surface's rest
+	// level): the water writes depth, so drawing them later is what makes them stand in front of
+	// it; drawn at endCamera before the final flush. One entry per source texture (six-way: A,B).
+	struct DeferredSprites { Texture* tex = nullptr; Texture* texB = nullptr; bool six = false; std::vector<float> verts; };
+	std::vector<DeferredSprites>          spriteDeferred;
+	void FlushSpritesBelow(float y);      // draw the open batch's quads below y, defer the rest
+	void FlushSpritesSixBelow(float y);
+	void FlushSpritesDeferred();          // endCamera: the quads the water left for later
 	void CreateSpriteResources();
 	void FlushSprites();
 
@@ -1364,6 +1400,25 @@ struct NukeDiligent::Impl
 	bool StorageRequestTex(Texture* t, int base, bool low);   // queue mips [base..] into a fresh GPU texture
 	void StorageVerify(Texture* t, ITexture* tex, int base);  // NUKE_DSTORAGE_VERIFY readback check
 	float4x4 curView, curProj;   // set in beginCamera, used in renderObject
+	// The projection with a short far plane (1000 x near): the sky / clouds / atmosphere reconstruct
+	// VIEW DIRECTIONS from ndc through the inverse view-projection, and a 2000 km far plane (space
+	// flight) makes that inverse ill-conditioned in float (directions stair-step per screen row).
+	// Rays do not depend on the far plane, so a well-conditioned stand-in gives the same directions.
+	float4x4 DirProj(bool probe) const
+	{
+		float4x4 p = probe ? curProj : curProjNoJitter;
+		const float n = std::max(curNear, 1e-3f), f = n * 1000.0f;
+		if (std::fabs(p.m[2][3] - 1.0f) < 1e-4f) { p.m[2][2] = f / (f - n); p.m[3][2] = -n * f / (f - n); }   // perspective only
+		return p;
+	}
+	// ... and no translation: a camera 400 km from the origin turns the inverse's rotation into
+	// noise (cofactor cancellation), so the direction matrix is built from the view ROTATION only
+	// and the shaders take normalize(wp.xyz / wp.w) as the direction (no camera subtraction).
+	float4x4 DirInvVP(bool probe) const
+	{
+		float4x4 v = curView; v.m[3][0] = v.m[3][1] = v.m[3][2] = 0.0f;
+		return (v * DirProj(probe)).Inverse();
+	}
 
 	// Selection outline (editor): pass 1 renders the selected mesh into a mask RT; pass 2 is a
 	// fullscreen edge-detect drawing a constant-pixel-thickness border around the mask.

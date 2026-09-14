@@ -16,7 +16,7 @@ using std::string; using std::vector; using std::cout; using std::endl;
 struct CloudCBData
 {
 	float4x4 invVP, prevVP;
-	float cam[4], sunDir[4], sunCol[4], skyTop[4], skyHor[4], layer[4], shape[4], cover[4], phase[4], wind[4], screen[4], misc[4], shadow[4];
+	float cam[4], sunDir[4], sunCol[4], skyTop[4], skyHor[4], layer[4], shape[4], cover[4], phase[4], wind[4], screen[4], misc[4], shadow[4], moon[4], moonCol[4];
 };
 
 bool NukeDiligent::Impl::BuildCloudPipes()
@@ -47,19 +47,26 @@ bool NukeDiligent::Impl::BuildCloudPipes()
 	auto buildCS = [&](const char* dbg, IShader* cs, const vector<std::pair<const char*, SamplerDesc>>& samplers, RefCntAutoPtr<IPipelineState>& pso, RefCntAutoPtr<IShaderResourceBinding>& srb)
 	{
 		ComputePipelineStateCreateInfo ci; ci.PSODesc.Name = dbg;
-		ShaderResourceVariableDesc vars[] = { {SHADER_TYPE_COMPUTE, "CloudCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC} };
+		ShaderResourceVariableDesc vars[] = { {SHADER_TYPE_COMPUTE, "CloudCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC}, {SHADER_TYPE_COMPUTE, "AtmoCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC} };
 		vector<ImmutableSamplerDesc> imms;
 		for (const auto& s : samplers) imms.push_back({SHADER_TYPE_COMPUTE, s.first, s.second});
-		ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 1;
+		ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 2;
 		ci.PSODesc.ResourceLayout.DefaultVariableType = SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC;
 		ci.PSODesc.ResourceLayout.ImmutableSamplers = imms.data(); ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)imms.size();
 		ci.pCS = cs;
 		CreateComputePipelineStateCached(ci, &pso);
 		if (!pso) return false;
 		if (auto* v = pso->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "CloudCB")) v->Set(cloudCB);
+		if (auto* a = pso->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "AtmoCB")) { if (atmoCB) a->Set(atmoCB); }
 		pso->CreateShaderResourceBinding(&srb, true);
 		return srb != nullptr;
 	};
+	if (!atmoCB)
+	{
+		BufferDesc d; d.Name = "AtmoCB"; d.Size = kAtmoCBSize; d.Usage = USAGE_DYNAMIC;
+		d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE;
+		device->CreateBuffer(d, nullptr, &atmoCB);
+	}
 	RefCntAutoPtr<IShader> sG, sM, sT, sS, sV, sP;
 	if (!compile(csG, "Clouds gen CS", SHADER_TYPE_COMPUTE, sG)) return false;
 	if (!compile(csM, "Clouds march CS", SHADER_TYPE_COMPUTE, sM)) return false;
@@ -68,7 +75,8 @@ bool NukeDiligent::Impl::BuildCloudPipes()
 	if (!compile(vs, "Clouds apply VS", SHADER_TYPE_VERTEX, sV)) return false;
 	if (!compile(psA, "Clouds apply PS", SHADER_TYPE_PIXEL, sP)) return false;
 	// immutable samplers per pass: only the textures each shader actually samples (Diligent warns on the rest)
-	const vector<std::pair<const char*, SamplerDesc>> noiseSamp = { {"g_CloudBase", wrap}, {"g_CloudDetail", wrap}, {"g_CloudWeather", wrap} };
+	const SamplerDesc lutS = AtmoSampler();
+	const vector<std::pair<const char*, SamplerDesc>> noiseSamp = { {"g_CloudBase", wrap}, {"g_CloudDetail", wrap}, {"g_CloudWeather", wrap}, {"g_AtTrans", lutS}, {"g_AtMulti", lutS} };
 	const vector<std::pair<const char*, SamplerDesc>> coarseSamp = { {"g_CloudBase", wrap}, {"g_CloudWeather", wrap} };
 	const vector<std::pair<const char*, SamplerDesc>> tempSamp = { {"g_CloudIn", clampS}, {"g_CloudHist", clampS} };
 	const vector<std::pair<const char*, SamplerDesc>> noSamp;
@@ -184,6 +192,8 @@ void NukeDiligent::Impl::RunCloudsCubeFace(ITextureView* rtv, ITextureView* dsv,
 	FillCloudCB(res, res, 1, 1, 0.0f, nullptr, 0.0f, 0.0f, 1.0f, true);
 	set("g_CloudBase", srv(cloudBase)); set("g_CloudDetail", srv(cloudDetail)); set("g_CloudWeather", srv(cloudWeather));
 	set("g_Depth", whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	AtmoBind(cloudMarchSRB, SHADER_TYPE_COMPUTE);
+	FillAtmoCB(0, 0, 0, true);
 	set("g_CloudOut", cloudProbeMarch->GetDefaultView(TEXTURE_VIEW_UNORDERED_ACCESS)); set("g_CloudDist", cloudProbeDist->GetDefaultView(TEXTURE_VIEW_UNORDERED_ACCESS));
 	context->SetPipelineState(cloudMarchPSO);
 	context->CommitShaderResources(cloudMarchSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -208,8 +218,9 @@ void NukeDiligent::Impl::FillCloudCB(int rw, int rh, int w, int h, float mode, c
 	if (cb == nullptr) return;
 	const NukeCloudsDesc& c = clouds;
 	const float4x4 proj = probe ? curProj : curProjNoJitter;   // a cube face sets curProj only
-	cb->invVP = (curView * proj).Inverse();
-	cb->prevVP = prevVP ? *prevVP : (curView * proj);
+	(void)proj;
+	cb->invVP = DirInvVP(probe);                            // directions only: the short-far stand-in
+	cb->prevVP = prevVP ? *prevVP : (curView * DirProj(probe));   // x, y, w of a projected point do not depend on the far plane
 	cb->cam[0] = curCamPos[0]; cb->cam[1] = curCamPos[1]; cb->cam[2] = curCamPos[2]; cb->cam[3] = probe ? 0.0f : (float)(frameId % 4096);
 	// the sun: the first directional light (the sky's sun), as the sun shafts take it
 	float sd[3] = { 0.0f, 1.0f, 0.0f }, sc[3] = { 1.0f, 1.0f, 1.0f }, si = 0.0f;
@@ -222,8 +233,9 @@ void NukeDiligent::Impl::FillCloudCB(int rw, int rh, int w, int h, float mode, c
 	}
 	cb->sunDir[0] = sd[0]; cb->sunDir[1] = sd[1]; cb->sunDir[2] = sd[2]; cb->sunDir[3] = si * std::max(c.sunIntensity, 0.0f);
 	cb->sunCol[0] = sc[0]; cb->sunCol[1] = sc[1]; cb->sunCol[2] = sc[2]; cb->sunCol[3] = std::max(c.ambientIntensity, 0.0f);
-	cb->skyTop[0] = sky.top[0]; cb->skyTop[1] = sky.top[1]; cb->skyTop[2] = sky.top[2]; cb->skyTop[3] = sky.skyIntensity;
-	cb->skyHor[0] = sky.horizon[0]; cb->skyHor[1] = sky.horizon[1]; cb->skyHor[2] = sky.horizon[2]; cb->skyHor[3] = 6371000.0f;
+	const bool physical = (sky.mode == 2 && atmoSummaryValid);   // the summary carries the physical sky (intensity included)
+	cb->skyTop[0] = skyTopEff[0]; cb->skyTop[1] = skyTopEff[1]; cb->skyTop[2] = skyTopEff[2]; cb->skyTop[3] = physical ? 1.0f : sky.skyIntensity;
+	cb->skyHor[0] = skyHorEff[0]; cb->skyHor[1] = skyHorEff[1]; cb->skyHor[2] = skyHorEff[2]; cb->skyHor[3] = (sky.mode == 2) ? std::max(sky.planetRadius, 1.0f) * 1000.0f : 6371000.0f;
 	const int steps[3] = { 40, 64, 96 };
 	cb->layer[0] = c.bottom; cb->layer[1] = c.bottom + std::max(c.thickness, 10.0f); cb->layer[2] = std::max(c.maxDistance, 1000.0f); cb->layer[3] = (float)steps[std::max(0, std::min(2, c.quality))];
 	cb->shape[0] = std::max(c.shapeScale, 10.0f); cb->shape[1] = std::max(c.detailScale, 1.0f); cb->shape[2] = std::max(c.weatherScale, 100.0f); cb->shape[3] = std::max(0.0f, std::min(1.0f, c.erosion));
@@ -234,6 +246,19 @@ void NukeDiligent::Impl::FillCloudCB(int rw, int rh, int w, int h, float mode, c
 	cb->screen[0] = (float)rw; cb->screen[1] = (float)rh; cb->screen[2] = (float)w; cb->screen[3] = (float)h;
 	cb->misc[0] = curNear; cb->misc[1] = curFar; cb->misc[2] = hdr ? 0.0f : 1.0f; cb->misc[3] = sky.whitePoint;
 	cb->shadow[0] = shadowOx; cb->shadow[1] = shadowOz; cb->shadow[2] = 1.0f / std::max(shadowSize, 1.0f); cb->shadow[3] = c.shadows ? std::max(0.0f, std::min(1.0f, c.shadowStrength)) : 0.0f;
+	// the moon: the SECOND directional light (World appends it after the scene's lights)
+	cb->moon[0] = 0; cb->moon[1] = 1; cb->moon[2] = 0; cb->moon[3] = 0; cb->moonCol[0] = cb->moonCol[1] = cb->moonCol[2] = 1; cb->moonCol[3] = 0;
+	{
+		int nDir = 0;
+		for (const NukeLight& l : lights) if (l.type == 0 && ++nDir == 2)
+		{
+			float md[3] = { -l.dir[0], -l.dir[1], -l.dir[2] };
+			const float len = std::sqrt(md[0] * md[0] + md[1] * md[1] + md[2] * md[2]); if (len > 1e-6f) for (float& v : md) v /= len;
+			cb->moon[0] = md[0]; cb->moon[1] = md[1]; cb->moon[2] = md[2]; cb->moon[3] = std::max(l.intensity, 0.0f) * std::max(c.sunIntensity, 0.0f);
+			cb->moonCol[0] = l.color[0]; cb->moonCol[1] = l.color[1]; cb->moonCol[2] = l.color[2];
+			break;
+		}
+	}
 }
 
 // The tileable noises and the weather map, once (they depend on nothing the user changes;
@@ -276,7 +301,7 @@ void NukeDiligent::Impl::GenerateCloudNoise()
 ITextureView* NukeDiligent::Impl::RunClouds(ITextureView* sceneSRV, int w, int h)
 {
 	cloudCurSRV = nullptr;
-	if (!clouds.enabled || !sceneSRV || !gbufDepthSRV || debugView != 0 || w <= 0 || h <= 0 || cloudsFailed) return sceneSRV;
+	if (!clouds.enabled || !sceneSRV || !gbufActive || !gbufDepthSRV || debugView != 0 || w <= 0 || h <= 0 || cloudsFailed) return sceneSRV;   // this camera's own prepass depth only
 	if (!cloudMarchPSO)
 	{
 		if (!cloudsBuilding.exchange(true))
@@ -333,6 +358,8 @@ ITextureView* NukeDiligent::Impl::RunClouds(ITextureView* sceneSRV, int w, int h
 	FillCloudCB(mw, mh, w, h, 0.0f, nullptr, 0.0f, 0.0f, 1.0f);
 	set(cloudMarchSRB, "g_CloudBase", srv(cloudBase)); set(cloudMarchSRB, "g_CloudDetail", srv(cloudDetail)); set(cloudMarchSRB, "g_CloudWeather", srv(cloudWeather));
 	set(cloudMarchSRB, "g_Depth", gbufDepthSRV);
+	AtmoBind(cloudMarchSRB, SHADER_TYPE_COMPUTE);
+	FillAtmoCB(0, 0, 0, false);   // the march binds AtmoCB statically: mapped every pass (physical or not)
 	set(cloudMarchSRB, "g_CloudOut", uav(st.march)); set(cloudMarchSRB, "g_CloudDist", uav(st.dist));
 	context->SetPipelineState(cloudMarchPSO);
 	context->CommitShaderResources(cloudMarchSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -368,7 +395,7 @@ ITextureView* NukeDiligent::Impl::RunClouds(ITextureView* sceneSRV, int w, int h
 	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};
 	context->Draw(da);
 	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
-	st.prevVP = curView * curProjNoJitter; st.prevView = curView; st.cur ^= 1; st.valid = true;
+	st.prevVP = curView * DirProj(false); st.prevView = curView; st.cur ^= 1; st.valid = true;
 	cloudCurSRV = resolved;   // the sun shafts' source is occluded by it
 	return srv(st.out);
 }

@@ -56,6 +56,8 @@ struct Frame
 	uint64_t frameId = 0;
 	uint32_t passSerial = 0;
 	uint64_t curTarget = 0;      // render-target id bound by beginCamera (per-target ownership)
+	uint64_t camKey = 0;         // per-camera state key (target + camera id): what TAA / AO history is keyed by.
+	                             // Two cameras on one target are two keys - per-camera masks must use this, never curTarget.
 
 	// Engine-owned resources (may be null — always fall back).
 	Diligent::ITextureView* sceneDepthSRV = nullptr;    // single-sample prepass depth (gbuf)
@@ -130,6 +132,9 @@ NUKEDLG_API void Trash(Diligent::IDeviceObject* obj);
 // Flush pending sprite batches. Call before unbinding the camera targets for raw
 // compute/offscreen work mid-pass.
 NUKEDLG_API void FlushBatches();
+// A water surface at rest level y is about to draw: flush the sprite quads below it (they are
+// the scene it refracts), keep the ones above it for after the water (it writes depth).
+NUKEDLG_API void FlushBatchesBelow(float y);
 
 // Report `tris` drawn by a module pass and invalidate the instancing bind cache; call after
 // raw SetPipelineState/Draw work.

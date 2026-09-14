@@ -6,7 +6,8 @@ void NukeDiligent::Impl::CreateSkyResources()
 	skyPSO.Release(); skySRB.Release(); skyCB.Release();   // rebuild-safe (MSAA change re-calls this)
 	std::string vs = shaderSource("sky.vs"), ps = shaderSource("sky.ps");
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tsky shaders missing" << endl; return; }
-	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+	auto sf = ShaderFactory();   // sky.ps includes atmosphere.hlsli
+	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL; sci.pShaderSourceStreamFactory = sf;
 	RefCntAutoPtr<IShader> v, p;
 	sci.Desc = {"Sky VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &v);
 	sci.Desc = {"Sky PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &p);
@@ -27,24 +28,37 @@ void NukeDiligent::Impl::CreateSkyResources()
 	gp.SmplDesc.Count = samples;   // MSAA: sky draws into the MS camera target
 	gp.InputLayout.NumElements = 0;   // fullscreen triangle from SV_VertexID
 	ShaderResourceVariableDesc svars[] = {
-		{SHADER_TYPE_PIXEL, "g_StarTex", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-		{SHADER_TYPE_PIXEL, "g_MoonTex", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_StarTex",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_MoonTex",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_AtTrans",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // the physical atmosphere's LUTs
+		{SHADER_TYPE_PIXEL, "g_AtMulti",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_AtSkyView", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "AtmoCB",      SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 	};
-	ci.PSODesc.ResourceLayout.Variables = svars; ci.PSODesc.ResourceLayout.NumVariables = 2;
+	ci.PSODesc.ResourceLayout.Variables = svars; ci.PSODesc.ResourceLayout.NumVariables = 6;
 	SamplerDesc ssamp; ssamp.MinFilter = FILTER_TYPE_LINEAR; ssamp.MagFilter = FILTER_TYPE_LINEAR; ssamp.MipFilter = FILTER_TYPE_LINEAR;
 	ssamp.AddressU = TEXTURE_ADDRESS_WRAP; ssamp.AddressV = TEXTURE_ADDRESS_CLAMP;
 	SamplerDesc msamp; msamp.MinFilter = FILTER_TYPE_LINEAR; msamp.MagFilter = FILTER_TYPE_LINEAR; msamp.MipFilter = FILTER_TYPE_LINEAR;
 	msamp.AddressU = TEXTURE_ADDRESS_CLAMP; msamp.AddressV = TEXTURE_ADDRESS_CLAMP;
+	const SamplerDesc lutS = AtmoSampler();
 	ImmutableSamplerDesc simm[] = {
 		{SHADER_TYPE_PIXEL, "g_StarTex", ssamp},
 		{SHADER_TYPE_PIXEL, "g_MoonTex", msamp},
+		{SHADER_TYPE_PIXEL, "g_AtTrans", lutS}, {SHADER_TYPE_PIXEL, "g_AtMulti", lutS}, {SHADER_TYPE_PIXEL, "g_AtSkyView", lutS},
 	};
-	ci.PSODesc.ResourceLayout.ImmutableSamplers = simm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 2;
+	ci.PSODesc.ResourceLayout.ImmutableSamplers = simm; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 5;
+	if (!atmoCB)
+	{
+		BufferDesc d; d.Name = "AtmoCB"; d.Size = kAtmoCBSize; d.Usage = USAGE_DYNAMIC;
+		d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE;
+		device->CreateBuffer(d, nullptr, &atmoCB);
+	}
 	ci.pVS = v; ci.pPS = p;
 	CreateGraphicsPipelineStateCached(ci, &skyPSO);
 	if (skyPSO)
 	{
 		if (auto* sv = skyPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL, "SkyCB")) sv->Set(skyCB);
+		if (auto* av = skyPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL, "AtmoCB")) av->Set(atmoCB);
 		skyPSO->CreateShaderResourceBinding(&skySRB, true);
 		skyStarVar = skySRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_StarTex");
 		skyMoonVar = skySRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_MoonTex");
@@ -56,25 +70,30 @@ void NukeDiligent::Impl::DrawSky()
 {
 	// Stale after an MSAA/format change until the warm-up rebuilds it — skipping beats a
 	// pipeline that does not match the target.
-	if (!skyPSO || !skyStamp.current(samples, SceneFmt()) || sky.mode != 1) return;
-	float4x4 invVP = (curView * curProj).Inverse();
+	if (!skyPSO || !skyStamp.current(samples, SceneFmt()) || sky.mode < 1) return;
+	const bool physical = AtmoActive();   // mode 2 draws the procedural gradient until the LUTs exist
+	FillAtmoCB(0, 0, 0, false);   // the sky PSO binds AtmoCB statically: a dynamic buffer must be mapped every pass it is drawn with
+	float4x4 invVP = DirInvVP(true);   // directions only: the short-far stand-in (curProj here = this pass's, jitter included is fine)
 	ITextureView* starSRV = sky.starsTex ? GetTexSRV(sky.starsTex) : nullptr;
 	ITextureView* moonSRV = (sky.moonTex && sky.moonAmount > 0.0f) ? GetTexSRV(sky.moonTex) : nullptr;
 	struct SkyData { float4x4 invVP; float camPos[4]; float top[4]; float horizon[4]; float ground[4]; float params[4]; float sunDir[4]; float sunCol[4]; float moonDir[4]; float moonParams[4]; };
 	{
 		MapHelper<SkyData> cb(context, skyCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		cb->invVP = invVP;
-		cb->camPos[0] = curCamPos[0]; cb->camPos[1] = curCamPos[1]; cb->camPos[2] = curCamPos[2]; cb->camPos[3] = 1;
+		cb->camPos[0] = curCamPos[0]; cb->camPos[1] = curCamPos[1]; cb->camPos[2] = curCamPos[2]; cb->camPos[3] = physical ? 2.0f : 1.0f;
 		for (int k = 0; k < 3; ++k) { cb->top[k] = sky.top[k]; cb->horizon[k] = sky.horizon[k]; cb->ground[k] = sky.ground[k]; cb->sunDir[k] = sky.sunDir[k]; cb->sunCol[k] = sky.sunColor[k]; cb->moonDir[k] = sky.moonDir[k]; }
-		cb->top[3] = cb->horizon[3] = cb->ground[3] = cb->moonDir[3] = 1;
+		cb->horizon[3] = cb->ground[3] = cb->moonDir[3] = 1;
+		cb->top[3] = sky.eclipse;   // the eclipsing moon's offset (sun radii; >= 1000 = none)
 		cb->sunDir[3] = std::max(sky.sunSize, 0.0005f); cb->sunCol[3] = std::max(sky.sunGlow, 0.0f);   // disc radius (radians), glow strength
-		cb->params[0] = sky.skyIntensity; cb->params[1] = sky.sunIntensity; cb->params[2] = sky.stars;
+		cb->params[0] = sky.skyIntensity; cb->params[1] = sky.sunIntensity;
+		cb->params[2] = (sky.mode == 2 && !physical) ? 0.0f : sky.stars;   // the physical sky's stars are always on (it fades them itself); its gradient stand-in has no way to, so none
 		cb->params[3] = starSRV ? 1.0f : 0.0f;   // has a star texture (else procedural)
 		cb->moonParams[0] = moonSRV ? sky.moonAmount : 0.0f; cb->moonParams[1] = sky.moonSize; cb->moonParams[2] = sky.moonPhase;
 		cb->moonParams[3] = hdr ? 0.0f : 1.0f;   // HDR off: sky tonemaps itself (RGBA8 scene, post is passthrough)
 	}
 	if (skyStarVar) skyStarVar->Set(starSRV ? starSRV : whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
 	if (skyMoonVar) skyMoonVar->Set(moonSRV ? moonSRV : whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	AtmoBind(skySRB, SHADER_TYPE_PIXEL);
 	context->SetPipelineState(skyPSO);
 	context->CommitShaderResources(skySRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da{3, DRAW_FLAG_VERIFY_STATES};

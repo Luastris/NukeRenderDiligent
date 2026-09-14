@@ -35,6 +35,7 @@ bool GetFrame(Frame& out)
 	out.frameId = d->frameId;
 	out.passSerial = d->passSerial;
 	out.curTarget = d->curTarget;
+	out.camKey = d->curCamKey;
 	out.sceneDepthSRV = d->gbufDepthSRV;
 	out.gbufActive = d->gbufActive;
 	out.whiteSRV = d->whiteTex ? d->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
@@ -114,6 +115,14 @@ void FlushBatches()
 	NukeDiligent::nativeImpl->FlushSprites();
 	NukeDiligent::nativeImpl->FlushSpritesLit();
 	NukeDiligent::nativeImpl->FlushSpritesSix();
+}
+
+void FlushBatchesBelow(float y)
+{
+	if (!NukeDiligent::nativeImpl) return;
+	NukeDiligent::nativeImpl->FlushSpritesBelow(y);
+	NukeDiligent::nativeImpl->FlushSpritesLit();
+	NukeDiligent::nativeImpl->FlushSpritesSixBelow(y);
 }
 
 void NoteDraw(int tris)

@@ -316,6 +316,52 @@ void NukeDiligent::drawSpriteRunLit(Texture* tex, Texture* normal, const float* 
 
 // Draw the accumulated batch (one texture) in a single call. Must run while the camera targets
 // are still bound — i.e. before the MSAA resolve.
+// Split the open batch at a water surface: quads whose centre sits below `y` are drawn now (they
+// belong to the pre-water scene, refracted through it); the rest wait for FlushSpritesDeferred.
+// The paint order inside the batch is kept on both sides.
+static void SplitQuads(std::vector<float>& verts, float y, std::vector<float>& below, std::vector<float>& above)
+{
+	const size_t quad = 6 * 9;
+	for (size_t q = 0; q + quad <= verts.size(); q += quad)
+	{
+		const float cy = 0.5f * (verts[q + 1] + verts[q + 2 * 9 + 1]);   // TL.y + BR.y
+		std::vector<float>& dst = (cy < y) ? below : above;
+		dst.insert(dst.end(), verts.begin() + q, verts.begin() + q + quad);
+	}
+	verts.clear();
+}
+void NukeDiligent::Impl::FlushSpritesBelow(float y)
+{
+	if (!spriteBatchOpen || spriteBatchVerts.empty()) { FlushSprites(); return; }
+	std::vector<float> below, above;
+	SplitQuads(spriteBatchVerts, y, below, above);
+	Texture* tex = spriteBatchTex;
+	if (!above.empty()) { DeferredSprites d; d.tex = tex; d.verts = std::move(above); spriteDeferred.push_back(std::move(d)); }
+	spriteBatchVerts = std::move(below);
+	FlushSprites();   // draws what is left (or clears an empty batch)
+}
+void NukeDiligent::Impl::FlushSpritesSixBelow(float y)
+{
+	if (spriteSixVerts.empty() || !spriteSixA || !spriteSixB) { FlushSpritesSix(); return; }
+	std::vector<float> below, above;
+	SplitQuads(spriteSixVerts, y, below, above);
+	if (!above.empty()) { DeferredSprites d; d.tex = spriteSixA; d.texB = spriteSixB; d.six = true; d.verts = std::move(above); spriteDeferred.push_back(std::move(d)); }
+	spriteSixVerts = std::move(below);
+	FlushSpritesSix();
+}
+void NukeDiligent::Impl::FlushSpritesDeferred()
+{
+	if (spriteDeferred.empty()) return;
+	FlushSprites(); FlushSpritesSix();   // whatever is still open goes first (paint order)
+	std::vector<DeferredSprites> list = std::move(spriteDeferred);
+	spriteDeferred.clear();
+	for (DeferredSprites& d : list)
+	{
+		if (d.six) { spriteSixA = d.tex; spriteSixB = d.texB; spriteSixVerts = std::move(d.verts); FlushSpritesSix(); }
+		else       { spriteBatchTex = d.tex; spriteBatchOpen = true; spriteBatchVerts = std::move(d.verts); FlushSprites(); }
+	}
+}
+
 void NukeDiligent::Impl::FlushSprites()
 {
 	if (!spritePSO || !spriteStamp.current(samples, SceneFmt()) || spriteBatchVerts.empty())

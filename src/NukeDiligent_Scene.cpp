@@ -397,6 +397,11 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	bindIf(wp.giVisVar, m_impl->giVisSRV ? m_impl->giVisSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 5]);
 	bindIf(wp.sgiVar, m_impl->screenGISRV ? m_impl->screenGISRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 6]);
 	bindIf(wp.cloudShVar, m_impl->cloudShadowSRV ? m_impl->cloudShadowSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 7]);
+	{
+		ITextureView* asv = m_impl->AtmoSkyViewSRV(); ITextureView* atr = m_impl->AtmoTransSRV();
+		bindIf(wp.atmoSkyVar, asv ? asv : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 8]);
+		bindIf(wp.atmoTransVar, atr ? atr : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 9]);
+	}
 	// Generic named textures (terrain layer normal/MR maps): shader-declared g_Layer* SRVs fill
 	// from the material's extraTex by name; pointer-gated like everything else.
 	for (auto& ex : wp.extraVars)
@@ -482,6 +487,8 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		TP(SHADER_TYPE_PIXEL, "g_SceneRefr", m_impl->refrSRV ? (IDeviceObject*)m_impl->refrSRV : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_ScreenAO",  m_impl->screenAOSRV ? (IDeviceObject*)m_impl->screenAOSRV : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_CloudShadowMap", m_impl->cloudShadowSRV ? (IDeviceObject*)m_impl->cloudShadowSRV : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_AtmoSkyView", m_impl->AtmoSkyViewSRV() ? (IDeviceObject*)m_impl->AtmoSkyViewSRV() : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_AtmoTrans",   m_impl->AtmoTransSRV() ? (IDeviceObject*)m_impl->AtmoTransSRV() : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_GIIrr",     m_impl->giIrrSRV ? (IDeviceObject*)m_impl->giIrrSRV : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_GIVis",     m_impl->giVisSRV ? (IDeviceObject*)m_impl->giVisSRV : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_ScreenGI",  m_impl->screenGISRV ? (IDeviceObject*)m_impl->screenGISRV : (IDeviceObject*)whiteSRV);
@@ -727,8 +734,15 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 		fb->shadowParams[1] = (shadowNormalBias > nof) ? shadowNormalBias : nof;
 	}
 	fb->shadowParams[2] = (1.0f / (float)shadowRes) * shadowSoftness;
-	for (int k = 0; k < 3; ++k) { fb->skyTop[k] = sky.top[k]; fb->skyHorizon[k] = sky.horizon[k]; fb->skyGround[k] = sky.ground[k]; }
-	fb->skyParams[0] = sky.skyIntensity; fb->skyParams[1] = (sky.mode == 1) ? 1.0f : 0.0f;
+	for (int k = 0; k < 3; ++k) { fb->skyTop[k] = skyTopEff[k]; fb->skyHorizon[k] = skyHorEff[k]; fb->skyGround[k] = skyGndEff[k]; }   // the physical sky's summary when on
+	fb->skyParams[0] = (sky.mode == 2 && atmoSummaryValid) ? 1.0f : sky.skyIntensity; fb->skyParams[1] = (sky.mode >= 1) ? 1.0f : 0.0f;   // the summary already carries the intensity
+	{
+		const bool on = AtmoActive();
+		fb->atmoA[0] = on ? 2.0f : 0.0f; fb->atmoA[1] = std::max(sky.planetRadius, 1.0f); fb->atmoA[2] = fb->atmoA[1] + std::max(sky.atmosphereHeight, 1.0f); fb->atmoA[3] = 192.0f;
+		float sd[3] = { -sky.sunDir[0], -sky.sunDir[1], -sky.sunDir[2] };
+		const float l = std::sqrt(sd[0] * sd[0] + sd[1] * sd[1] + sd[2] * sd[2]); if (l > 1e-6f) for (float& v : sd) v /= l; else { sd[0] = 0; sd[1] = 1; sd[2] = 0; }
+		fb->atmoB[0] = sd[0]; fb->atmoB[1] = sd[1]; fb->atmoB[2] = sd[2]; fb->atmoB[3] = 108.0f;
+	}
 	fb->skyParams[2] = hdr ? 0.0f : 1.0f; fb->skyParams[3] = sky.whitePoint;   // .w = SDR tonemap white point (world.ps HDR-off path)
 	const bool probe = probeActive && probeCubeSRV;   // off during the probe's own capture -> no feedback
 	fb->probePos[0] = probePos[0]; fb->probePos[1] = probePos[1]; fb->probePos[2] = probePos[2]; fb->probePos[3] = probe ? 1.0f : 0.0f;
@@ -838,6 +852,13 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 
 	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
 	if (m_impl->cloudShadowFrame != m_impl->frameId) { m_impl->cloudShadowFrame = m_impl->frameId; m_impl->RunCloudShadow(); }   // VL3, once a frame
+	if (m_impl->sky.mode == 2)   // the physical sky's LUTs for this camera (compute: the targets rebind after)
+	{
+		m_impl->RunAtmosphere(false);
+		ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->SetViewports(1, &vp, w, h);
+	}
+	else m_impl->RunAtmosphere(false);
 	m_impl->WriteFrameCB(P);
 
 	// Volumetric fog grid off this camera's prepass + lights (compute: the targets rebind after).
@@ -857,7 +878,12 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	m_impl->DrawSky();   // procedural sky behind the scene (after clear, before geometry)
 }
 
-void NukeDiligent::setSky(const NukeSky& s) { m_impl->sky = s; m_impl->toneExposure = s.exposure; m_impl->toneWhite = s.whitePoint; }
+void NukeDiligent::setSky(const NukeSky& s)
+{
+	m_impl->sky = s; m_impl->toneExposure = s.exposure; m_impl->toneWhite = s.whitePoint;
+	if (s.mode != 2 || !m_impl->atmoSummaryValid)   // the physical sky's summary replaces these per camera pass
+	{ memcpy(m_impl->skyTopEff, s.top, sizeof(s.top)); memcpy(m_impl->skyHorEff, s.horizon, sizeof(s.horizon)); memcpy(m_impl->skyGndEff, s.ground, sizeof(s.ground)); }
+}
 void NukeDiligent::setClouds(const NukeCloudsDesc& c) { m_impl->clouds = c; }
 int  NukeDiligent::cloudsState() { return m_impl->CloudsState(); }
 
@@ -1536,6 +1562,7 @@ void NukeDiligent::endCamera()
 	m_impl->DrawGIProbes();          // DDGI Debug Probes: lit spheres, depth-tested against the camera
 	m_impl->DrawEditorGridPass();    // the infinite grid, under the gizmo lines
 	m_impl->DrawDepthDebugLines();   // depth-tested gizmos: against this camera's still-bound MS depth
+	m_impl->FlushSpritesDeferred();   // quads a water surface left for after itself
 	m_impl->FlushSprites();     // draw any pending sprite batch WHILE the (MS) camera targets are still bound
 	m_impl->FlushSpritesLit();  // ...and the pending lit batch (tilemap normal-mapped runs)
 	m_impl->FlushSpritesSix();  // ...and the six-way smoke batch
@@ -1588,6 +1615,8 @@ void NukeDiligent::endCamera()
 			if (!preDone && !(pit->second.isSSR || pit->second.isRTRef))
 			{
 				preDone = true;
+				m_impl->GpuPass("atmosphere");
+				srcSRV = m_impl->ApplyAtmosphere(srcSRV, w, h);
 				m_impl->GpuPass("clouds");
 				srcSRV = m_impl->RunClouds(srcSRV, w, h);
 				m_impl->GpuPass("volumetrics");
@@ -1658,6 +1687,8 @@ void NukeDiligent::endCamera()
 	}
 	if (!preDone && chainSrc && m_impl->curRTW > 0 && m_impl->curRTH > 0)   // no chain, or reflections only
 	{
+		m_impl->GpuPass("atmosphere");
+		chainSrc = m_impl->ApplyAtmosphere(chainSrc, m_impl->curRTW, m_impl->curRTH);
 		m_impl->GpuPass("clouds");
 		chainSrc = m_impl->RunClouds(chainSrc, m_impl->curRTW, m_impl->curRTH);
 		m_impl->GpuPass("volumetrics");
@@ -1986,6 +2017,11 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 		bindIf(wp.giVisVarI, m_impl->giVisSRV ? m_impl->giVisSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 5]);
 		bindIf(wp.sgiVarI, m_impl->screenGISRV ? m_impl->screenGISRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 6]);
 		bindIf(wp.cloudShVarI, m_impl->cloudShadowSRV ? m_impl->cloudShadowSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 7]);
+		{
+			ITextureView* asv = m_impl->AtmoSkyViewSRV(); ITextureView* atr = m_impl->AtmoTransSRV();
+			bindIf(wp.atmoSkyVarI, asv ? asv : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 8]);
+			bindIf(wp.atmoTransVarI, atr ? atr : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 9]);
+		}
 	}
 
 	IDeviceContext* ctx = m_impl->context;

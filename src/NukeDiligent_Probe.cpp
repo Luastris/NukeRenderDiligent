@@ -79,6 +79,7 @@ void NukeDiligent::beginCubeFace(uint64_t cube, int face, const float pos[3], fl
 	float3 F = F6[face], U = U6[face], R = normalize(cross(U, F)); U = cross(F, R);
 	m_impl->curView = float4x4(R.x,U.x,F.x,0, R.y,U.y,F.y,0, R.z,U.z,F.z,0, -dot(P,R),-dot(P,U),-dot(P,F),1);
 	m_impl->curProj = float4x4::Projection(1.5707963f, 1.0f, nearZ, farZ, false);   // 90deg, square
+	m_impl->curNear = nearZ; m_impl->curFar = farZ;   // the sky / atmosphere / clouds read them (direction stand-in, depth linearisation)
 	m_impl->curCamPos[0] = P.x; m_impl->curCamPos[1] = P.y; m_impl->curCamPos[2] = P.z;
 	// MSAA on: render into the MS intermediate, resolved into the cube slice by endCubeFace.
 	const bool ms = c.msColor && c.msDepth;
@@ -95,6 +96,9 @@ void NukeDiligent::beginCubeFace(uint64_t cube, int face, const float pos[3], fl
 	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)c.res; vp.Height = (float)c.res; vp.MinDepth = 0; vp.MaxDepth = 1;
 	ctx->SetViewports(1, &vp, c.res, c.res);
 
+	m_impl->RunAtmosphere(true);   // the physical sky from the probe's position (compute: the targets rebind)
+	ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ctx->SetViewports(1, &vp, c.res, c.res);
 	m_impl->WriteFrameCB(P);   // probe off (probeActive=false) -> analytic IBL during capture
 	m_impl->WriteGICB();       // the world PSO binds GICB statically: a dynamic CB must be mapped before its first use in a frame (a capture before any camera)
 	if (!m_impl->giCapturing)

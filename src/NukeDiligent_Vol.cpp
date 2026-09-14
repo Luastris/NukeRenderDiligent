@@ -131,6 +131,14 @@ void NukeDiligent::Impl::TouchVolCB()
 	memset(cb, 0, sizeof(VolCBData));
 	cb->grid[2] = 1.0f; cb->range[0] = 1.0f; cb->range[1] = 2.0f; cb->range[2] = 0.693f; cb->range[3] = 1.44f;
 	cb->cam[0] = curNear; cb->cam[1] = curFar; cb->screen[0] = (float)std::max(curRTW, 1); cb->screen[1] = (float)std::max(curRTH, 1);
+	// FogVolCB too: the water PSOs bind it statically, and a pass without the fog grid (quality 0,
+	// no prepass) never mapped it -> Vulkan "dynamic buffer not mapped" on the first water draw.
+	// RunVolumetrics remaps it with the real volumes when the grid runs.
+	if (fogVolCB)
+	{
+		MapHelper<FogVolCBData> fc(context, fogVolCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (fc != nullptr) memset(fc, 0, sizeof(FogVolCBData));
+	}
 }
 
 // beginCamera (after AO / SSGI): this camera's grid off its prepass camera.
@@ -648,7 +656,7 @@ bool NukeDiligent::Impl::BuildSunShaftPipes()
 	}
 	if (!sunShaftCB)
 	{
-		BufferDesc d; d.Name = "SunShaftCB"; d.Size = 4 * 16 + 64; d.Usage = USAGE_DYNAMIC;
+		BufferDesc d; d.Name = "SunShaftCB"; d.Size = 5 * 16 + 64; d.Usage = USAGE_DYNAMIC;
 		d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE;
 		device->CreateBuffer(d, nullptr, &sunShaftCB);
 		if (!sunShaftCB) return false;
@@ -666,15 +674,24 @@ bool NukeDiligent::Impl::BuildSunShaftPipes()
 		{SHADER_TYPE_PIXEL, "g_Depth",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Mask",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 		{SHADER_TYPE_PIXEL, "g_Clouds", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_PIXEL, "g_AtTrans", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // the physical atmosphere: the source through it
+		{SHADER_TYPE_PIXEL, "AtmoCB",   SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 	};
-	ImmutableSamplerDesc imms[] = {{SHADER_TYPE_PIXEL, "g_Source", lin}, {SHADER_TYPE_PIXEL, "g_Depth", pt}, {SHADER_TYPE_PIXEL, "g_Mask", lin}, {SHADER_TYPE_PIXEL, "g_Clouds", lin}};
-	ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 4;
-	ci.PSODesc.ResourceLayout.ImmutableSamplers = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 4;
+	ImmutableSamplerDesc imms[] = {{SHADER_TYPE_PIXEL, "g_Source", lin}, {SHADER_TYPE_PIXEL, "g_Depth", pt}, {SHADER_TYPE_PIXEL, "g_Mask", lin}, {SHADER_TYPE_PIXEL, "g_Clouds", lin}, {SHADER_TYPE_PIXEL, "g_AtTrans", AtmoSampler()}};
+	ci.PSODesc.ResourceLayout.Variables = vars; ci.PSODesc.ResourceLayout.NumVariables = 6;
+	ci.PSODesc.ResourceLayout.ImmutableSamplers = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 5;
 	ci.pVS = sV; ci.pPS = sP;
+	if (!atmoCB)
+	{
+		BufferDesc d; d.Name = "AtmoCB"; d.Size = kAtmoCBSize; d.Usage = USAGE_DYNAMIC;
+		d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE;
+		device->CreateBuffer(d, nullptr, &atmoCB);
+	}
 	RefCntAutoPtr<IPipelineState> pso;
 	CreateGraphicsPipelineStateCached(ci, &pso);
 	if (!pso) return false;
 	if (auto* c = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "SunShaftCB")) c->Set(sunShaftCB);
+	if (auto* a = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "AtmoCB")) a->Set(atmoCB);
 	RefCntAutoPtr<IShaderResourceBinding> srb;
 	pso->CreateShaderResourceBinding(&srb, true);
 	if (!srb) return false;
@@ -729,8 +746,8 @@ ITextureView* NukeDiligent::Impl::RunSunShafts(ITextureView* sceneSRV, int w, in
 		ssW = w; ssH = h;
 		if (!ssMask[0] || !ssMask[1] || !ssOut) return sceneSRV;
 	}
-	struct CB { float sun[4], prm[4], col[4], dir[4]; float4x4 invVP; };
-	const float4x4 invVP = (curView * curProjNoJitter).Inverse();
+	struct CB { float sun[4], prm[4], col[4], dir[4]; float4x4 invVP; float ecl[4]; };
+	const float4x4 invVP = DirInvVP(false);   // directions only
 	// Shaft radiance at the sun: the light's colour, normalised, scaled by its strength (soft):
 	// the user's intensity is the artistic gain on top.
 	float col[3] = { sun->color[0], sun->color[1], sun->color[2] };
@@ -746,6 +763,7 @@ ITextureView* NukeDiligent::Impl::RunSunShafts(ITextureView* sceneSRV, int w, in
 			cb->col[0] = col[0] * strength; cb->col[1] = col[1] * strength; cb->col[2] = col[2] * strength; cb->col[3] = sky.whitePoint;
 			cb->dir[0] = dir[0]; cb->dir[1] = dir[1]; cb->dir[2] = dir[2]; cb->dir[3] = std::max(sky.sunSize, 0.0005f);   // w = the disc's angular radius
 			cb->invVP = invVP;
+			cb->ecl[0] = sky.eclipse; cb->ecl[1] = cb->ecl[2] = cb->ecl[3] = 0.0f;   // the eclipsing moon's offset (sun radii)
 		}
 		if (ssSrcVar)   ssSrcVar->Set(src);
 		if (ssDepthVar) ssDepthVar->Set(gbufDepthSRV);
@@ -764,9 +782,14 @@ ITextureView* NukeDiligent::Impl::RunSunShafts(ITextureView* sceneSRV, int w, in
 	const float reach = std::max(0.05f, std::min(1.0f, vol.sunShaftLength));
 	ITextureView* m0 = ssMask[0]->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 	ITextureView* m1 = ssMask[1]->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+	AtmoBind(sunShaftSRB, SHADER_TYPE_PIXEL);
+	FillAtmoCB(0, 0, 0, false);   // the PSO binds AtmoCB statically: mapped every pass
 	if (!pass(0, reach, sceneSRV, m1, ssMask[0], hw, hh)) return sceneSRV;   // mask
-	pass(1, reach, sceneSRV, m0, ssMask[1], hw, hh);                          // radial blur: the full reach, 32 taps
-	pass(1, reach / 32.0f, sceneSRV, m1, ssMask[0], hw, hh);                  // ... and one tap's worth again (1024 effective)
+	// Radial blur, SHORT reach first: 32 taps over one long-tap's length box-filter the source, so
+	// the long pass then samples a continuous smear (the other order left a comb: a 1-degree disc
+	// is narrower than a long tap, and the rays came out dashed).
+	pass(1, reach / 32.0f, sceneSRV, m0, ssMask[1], hw, hh);
+	pass(1, reach, sceneSRV, m1, ssMask[0], hw, hh);
 	pass(2, reach, sceneSRV, m0, ssOut, w, h);                                // composite
 	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 	return ssOut->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
