@@ -383,6 +383,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	bindIf(wp.probeVar,  (m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV, wp.lastBind[8]);
 	bindIf(wp.tlasVar,   (m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr(), wp.lastBind[9]);
 	bindIf(wp.rtInstVar, (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV), wp.lastBind[10]);
+	bindIf(wp.rtDynPosVar, (IDeviceObject*)(m_impl->rtDynPosSRV ? m_impl->rtDynPosSRV : m_impl->rtNrmSRV), wp.lastBind[13 + Impl::kOvTexCount + 10]);
 	bindIf(wp.wipeVar, wipesrv ? wipesrv : whiteSRV, wp.lastBind[11]);
 	bindIf(wp.heightVar, heightsrv ? heightsrv : whiteSRV, wp.lastBind[12]);
 	{
@@ -480,6 +481,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		TP(SHADER_TYPE_PIXEL, "g_Probe",      (m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV);
 		TP(SHADER_TYPE_PIXEL, "g_TLAS",       (m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr());
 		TP(SHADER_TYPE_PIXEL, "g_RTInst",     (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV));
+		TP(SHADER_TYPE_PIXEL, "g_DynPos",     (IDeviceObject*)(m_impl->rtDynPosSRV ? m_impl->rtDynPosSRV : m_impl->rtNrmSRV));
 		for (int k = 0; k < Impl::kOvTexCount; ++k)
 			TP(SHADER_TYPE_PIXEL, Impl::OvTexNames()[k].c_str(), ovsrv[k] ? ovsrv[k] : (((k < Impl::kOvSlots * 4 && (k & 3) == 1) || k == Impl::kOvSlots * 4 + 2) ? (IDeviceObject*)flatN : (IDeviceObject*)whiteSRV));
 		TP(SHADER_TYPE_PIXEL, "g_Flow",      (mat && mat->flow) ? (IDeviceObject*)m_impl->GetTexSRV(mat->flow) : (IDeviceObject*)whiteSRV);
@@ -767,6 +769,9 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	// depth-aware occlusion would discard along the MAIN viewport's geometry (a screen-locked
 	// "bite" in the preview grid), soft sprites would fade on foreign depth, etc.
 	if (cam.target != m_impl->gbufTarget) m_impl->gbufActive = false;
+	// Sprite coverage for the RT reflection composite: collected only when the tracer runs here.
+	m_impl->coverWanted = m_impl->RTReflectWanted();
+	m_impl->coverVerts.clear(); m_impl->coverBatches.clear(); m_impl->coverSRV = nullptr;
 	// LOD anchor: mesh LOD selection measures distance from the camera drawing the frame
 	// (shadow/probe passes reuse the latest camera, not the light).
 	m_impl->lodCamPos[0] = cam.camPos[0]; m_impl->lodCamPos[1] = cam.camPos[1]; m_impl->lodCamPos[2] = cam.camPos[2];
@@ -1566,6 +1571,7 @@ void NukeDiligent::endCamera()
 	m_impl->FlushSprites();     // draw any pending sprite batch WHILE the (MS) camera targets are still bound
 	m_impl->FlushSpritesLit();  // ...and the pending lit batch (tilemap normal-mapped runs)
 	m_impl->FlushSpritesSix();  // ...and the six-way smoke batch
+	m_impl->DrawSpriteCoverage();   // the pass's sprite quads into the R8 mask the tracer composites with
 	m_impl->FlushScreenPre();   // WithWorld screen-space canvas sprites: into the scene, before post
 	// 1) Resolve the multisampled HDR color into the single-sample HDR texture (post-pass input).
 	if (m_impl->curMSAA && m_impl->curResolveSrc && m_impl->curResolveDst)
@@ -1797,6 +1803,11 @@ void NukeDiligent::updateInstanceBuffer(uint64_t id, const NukeInstanceData* dat
 	}
 	m_impl->context->UpdateBuffer(ib.buf, 0, (Uint64)count * sizeof(NukeInstanceData), data,
 	                              RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	// Back to VERTEX_BUFFER right here: the instanced draws skip re-binding a vertex set they
+	// bound last (the redundancy gate), and a skipped bind is a skipped transition - a buffer
+	// refilled between two draws of the same set was drawn in COPY_DEST state.
+	StateTransitionDesc st(ib.buf, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_VERTEX_BUFFER, STATE_TRANSITION_FLAG_UPDATE_STATE);
+	m_impl->context->TransitionResourceStates(1, &st);
 	ib.count = count;
 }
 
@@ -1986,6 +1997,7 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	bindIf(wp.probeVarI,  (m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV, wp.lastBindI[8]);
 	bindIf(wp.tlasVarI,   (m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr(), wp.lastBindI[9]);
 	bindIf(wp.rtInstVarI, (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV), wp.lastBindI[10]);
+	bindIf(wp.rtDynPosVarI, (IDeviceObject*)(m_impl->rtDynPosSRV ? m_impl->rtDynPosSRV : m_impl->rtNrmSRV), wp.lastBindI[13 + Impl::kOvTexCount + 10]);
 	bindIf(wp.wipeVarI, wipesrv ? wipesrv : whiteSRV, wp.lastBindI[11]);
 	bindIf(wp.heightVarI, heightsrv ? heightsrv : whiteSRV, wp.lastBindI[12]);
 	// Overlay slots: the whole-set draw context (source atom's values + painted mask) was pushed

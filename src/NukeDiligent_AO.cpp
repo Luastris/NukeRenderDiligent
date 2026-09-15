@@ -47,7 +47,12 @@ bool NukeDiligent::Impl::BuildAOPipes()
 			vars.push_back({SHADER_TYPE_PIXEL, t.first, SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 			imms.push_back({SHADER_TYPE_PIXEL, t.first, t.second ? lin : pt});
 		}
-		if (tlas && rtSupported) vars.push_back({SHADER_TYPE_PIXEL, "g_TLAS", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+		if (tlas && rtSupported)
+		{
+			vars.push_back({SHADER_TYPE_PIXEL, "g_TLAS",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+			vars.push_back({SHADER_TYPE_PIXEL, "g_RTInst", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // sprite footprints
+			vars.push_back({SHADER_TYPE_PIXEL, "g_DynPos", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
+		}
 		ci.PSODesc.ResourceLayout.Variables = vars.data(); ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
 		ci.PSODesc.ResourceLayout.ImmutableSamplers = imms.data(); ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)imms.size();
 		ci.pVS = v; ci.pPS = p;
@@ -70,6 +75,8 @@ bool NukeDiligent::Impl::BuildAOPipes()
 	if (!ok) { cout << "[NukeDiligent]\tAO pipelines failed to build; ambient occlusion stays off" << endl; return false; }
 	aoPipe = std::move(a); aoResolvePipe = std::move(r);
 	aoTlasVar = aoPipe.srb ? aoPipe.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_TLAS") : nullptr;
+	aoRTInstVar = aoPipe.srb ? aoPipe.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_RTInst") : nullptr;
+	aoDynPosVar = aoPipe.srb ? aoPipe.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_DynPos") : nullptr;
 	return true;
 }
 
@@ -147,6 +154,8 @@ void NukeDiligent::Impl::RunAO(int w, int h)
 	if (aoPipe.gbufVar)  aoPipe.gbufVar->Set(gbufSRV);
 	if (aoPipe.depthVar) aoPipe.depthVar->Set(gbufDepthSRV);
 	if (aoTlasVar) aoTlasVar->Set((rtSceneReady && tlas) ? (IDeviceObject*)tlas.RawPtr() : (IDeviceObject*)fallbackTLAS.RawPtr());
+	if (aoRTInstVar) aoRTInstVar->Set((IDeviceObject*)(rtInstSRV ? rtInstSRV : rtNrmSRV));
+	if (aoDynPosVar) aoDynPosVar->Set((IDeviceObject*)(rtDynPosSRV ? rtDynPosSRV : rtNrmSRV));
 	draw(aoPipe, st.raw, nullptr, lw, lh);
 
 	// 2) 5x5 bilateral denoise, still at the AO resolution

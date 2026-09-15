@@ -911,7 +911,7 @@ void NukeDiligent::invalidateMesh(Mesh* m)
 		m_impl->Trash(it->second.pos); m_impl->Trash(it->second.nrm); m_impl->Trash(it->second.uv);
 		m_impl->Trash(it->second.col); m_impl->Trash(it->second.idx);
 		m_impl->Trash(it->second.bendSrc); m_impl->Trash(it->second.bendData); m_impl->Trash(it->second.bendPivot);
-		m_impl->Trash(it->second.posBent); m_impl->Trash(it->second.blasScratch);
+		m_impl->Trash(it->second.posBent); m_impl->Trash(it->second.blasScratch); m_impl->Trash(it->second.aabb);
 		m_impl->Trash(it->second.skinPosPrev);
 		m_impl->Trash(it->second.skinSrcPos); m_impl->Trash(it->second.skinSrcNrm);
 		m_impl->Trash(it->second.skinIdxBuf); m_impl->Trash(it->second.skinWgtBuf); m_impl->Trash(it->second.skinMorph);

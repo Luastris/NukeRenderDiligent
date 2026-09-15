@@ -86,7 +86,7 @@ void NukeDiligent::Impl::CreatePostResources()
 	if (!postFrameCB)  { BufferDesc d; d.Name = "PostFrame";  d.Size = sizeof(float) * 8; d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &postFrameCB); }
 	if (!ssrCB) { BufferDesc d; d.Name = "SSRCB"; d.Size = sizeof(float) * (16 * 4 + 4); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &ssrCB); }   // view/proj/invProj/invView + res
 	// 2 float4x4 + 5 float4 (camera, params, water level/fade, water scatter, water absorb).
-	if (!rtRefCB) { BufferDesc d; d.Name = "RTRefCB"; d.Size = sizeof(float) * (32 + 4 * 6); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &rtRefCB); }
+	if (!rtRefCB) { BufferDesc d; d.Name = "RTRefCB"; d.Size = sizeof(float) * (32 + 4 * 9); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &rtRefCB); }
 	if (!taaCB) { BufferDesc d; d.Name = "TAACB"; d.Size = sizeof(float) * (16 * 4 + 4 * 2); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &taaCB); }
 	// G-buffer pipes (3 PSOs, ~0.5 s of driver work): built on the builder thread; the prepass
 	// stays off until they land (beginGBufferPass gates on gbufBuilding).

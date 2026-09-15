@@ -455,6 +455,7 @@ struct NukeDiligent::Impl
 	float    aoRadius = 0.6f, aoIntensity = 1.0f, aoPower = 1.5f;
 	PostPipe aoPipe, aoResolvePipe;
 	IShaderResourceVariable* aoTlasVar = nullptr;   // RT-AO: g_TLAS on the AO pipe (DXR devices only)
+	IShaderResourceVariable* aoRTInstVar = nullptr, *aoDynPosVar = nullptr;   // RT-AO: sprite occluders
 	RefCntAutoPtr<IBuffer> aoCB;
 	std::atomic<bool> aoBuilding{false};
 	bool     aoFailed = false;
@@ -761,8 +762,10 @@ struct NukeDiligent::Impl
 		uint32_t emTexIndex, specTexIndex; float specularFactor; uint32_t nrmFlipG;   // 1 = flip green (OpenGL)
 		float albedoMetal[4]; float emissiveRough[4];
 		// Particles: colOffset = byte offset into g_DynCol (0xFFFFFFFF = none),
-		// shadowShape = 0 quad / 1 disc / 2 strip.
-		uint32_t colOffset; uint32_t shadowShape; float shadowAlpha; uint32_t pad0;
+		// shadowShape = 0 quad / 1 disc / 2 strip, dynPosOffset = byte offset into g_DynPos
+		// for a sprite mesh (ray-facing procedural quads), else 0xFFFFFFFF.
+		uint32_t colOffset; uint32_t shadowShape; float shadowAlpha; uint32_t dynPosOffset;
+		uint32_t maskTexIndex; uint32_t pad1, pad2, pad3;   // bindless alpha mask (Material::mask), 0xFFFFFFFF = none
 	};
 	std::unordered_map<Mesh*, uint32_t> meshNrmByteOffset;     // mesh -> byte offset of its normals in rtNrmBuf
 	std::unordered_map<Mesh*, uint32_t> meshUVByteOffset;      // mesh -> byte offset of its uvs in rtUVBuf
@@ -778,6 +781,13 @@ struct NukeDiligent::Impl
 	std::vector<float>                  rtDynColCPU;
 	RefCntAutoPtr<IBuffer>              rtDynColBuf;  IBufferView* rtDynColSRV = nullptr;
 	Uint64                              rtDynColCap = 0;
+	// Per-frame position pool for sprite meshes (Mesh::rtSprite): the intersection shader and
+	// every RayQuery consumer read this frame's quads from it. RAW buffer, grows as needed.
+	std::vector<float>                  rtDynPosCPU;
+	RefCntAutoPtr<IBuffer>              rtDynPosBuf;  IBufferView* rtDynPosSRV = nullptr;
+	Uint64                              rtDynPosCap = 0;
+	IBottomLevelAS* GetSpriteBLAS(Mesh* mesh, MeshGPU* gp);                   // AABB BLAS over a sprite mesh's quads
+	void BuildSpriteBLAS(Mesh* mesh, MeshGPU* gp, IBottomLevelAS* blas);      // (re)fill the AABBs + build
 	std::vector<RTInstanceData>         rtInstData;            // parallel to rtInstances, rebuilt per frame
 	uint32_t                            rtInstCapacity = 0;
 	static const uint32_t               kMaxMatTex = 256;      // bindless material maps (albedo/normal/MR/AO/emissive/spec)
@@ -880,6 +890,7 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              probeVar  = nullptr;// PS "g_Probe" (reflection cubemap, dynamic)
 		IShaderResourceVariable*              tlasVar   = nullptr;// PS "g_TLAS" (ray-tracing accel struct, RT builds only)
 		IShaderResourceVariable*              rtInstVar = nullptr;// PS "g_RTInst" (per-instance RT data: shadow footprints)
+		IShaderResourceVariable*              rtDynPosVar = nullptr;// PS "g_DynPos" (sprite quads, turned toward the shadow ray)
 		// INSTANCED variants: built only when the shader source handles NUKE_INSTANCED. Same blend
 		// variants; the instanced SRB has its OWN variable set (a different compiled shader pair).
 		RefCntAutoPtr<IPipelineState>         psoInst, psoInstBlend, psoInstAdd, psoInstWire;
@@ -887,15 +898,15 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable *texVarI = nullptr, *normVarI = nullptr, *mrVarI = nullptr, *aoVarI = nullptr,
 		                        *emVarI = nullptr, *specVarI = nullptr, *wipeVarI = nullptr, *heightVarI = nullptr,
 		                        *shadowVarI = nullptr, *cubeVarI = nullptr, *probeVarI = nullptr, *tlasVarI = nullptr,
-		                        *rtInstVarI = nullptr;
+		                        *rtInstVarI = nullptr, *rtDynPosVarI = nullptr;
 		IShaderResourceVariable *ovVarI[kOvTexCount] = {};
 		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr, *mskVarI = nullptr, *saoVarI = nullptr, *giIrrVarI = nullptr, *giVisVarI = nullptr, *sgiVarI = nullptr, *cloudShVarI = nullptr, *atmoSkyVarI = nullptr, *atmoTransVarI = nullptr;
 		// Redundancy gates: object each DYNAMIC variable currently holds — Diligent rewrites the
 		// descriptor cache on EVERY Set() of a dynamic var, so only Set() on an actual change.
 		// [0..12] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst,wipe,height;
 		// [13..] = overlay-slot maps (OvTexNames() order), then flow, scene-refraction, mask stamp, screen AO, GI irradiance, GI visibility, screen GI, cloud shadow.
-		IDeviceObject* lastBind[13 + kOvTexCount + 10]  = {};
-		IDeviceObject* lastBindI[13 + kOvTexCount + 10] = {};
+		IDeviceObject* lastBind[13 + kOvTexCount + 11]  = {};
+		IDeviceObject* lastBindI[13 + kOvTexCount + 11] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
 		std::string hsSrc, dsSrc;        // CUSTOM tess stages (empty = shared world.hs/world.ds)
 		bool tessCustom = false;         // the shader SHIPPED hs/ds (builder copies resolve the shared pair into hsSrc)
@@ -1083,6 +1094,12 @@ struct NukeDiligent::Impl
 	float rtWaterOcc[4] = { 0, 0, 0.25f, 0 };   // level, on (this frame), 1/opacityDepth, 0
 	float rtWaterCol[3] = { 0.02f, 0.10f, 0.09f };
 	float rtWaterAbs[3] = { 0.45f, 0.09f, 0.06f };
+	// The water's wave maps for the ray shaders (SetRTWaterMaps): raw views the water module
+	// owns (re-published every frame it draws); zero textures bind while no water draws.
+	ITextureView* rtWaterNrm[3] = { nullptr, nullptr, nullptr };
+	ITextureView* rtWaterRipple = nullptr;
+	float rtWaterCasc[4] = { 252.0f, 41.3f, 6.7f, 1.0f };
+	float rtWaterRip[8] = { 0, 0, 96.0f, 1.0f / 96.0f, 1.0f, 0.0f, 96.0f / 512.0f, 1.0f };
 	// Generic ortho bottom-depth capture (begin/end/fetchWaterBottom, NukeDiligent_Native.cpp).
 	RefCntAutoPtr<ITexture> capDepth, capStaging;
 	int   capPending = -1;
@@ -1189,9 +1206,30 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IPipelineState>         spritePSO;
 	RefCntAutoPtr<IShaderResourceBinding> spriteSRB;
 	IShaderResourceVariable*              spriteTexVar = nullptr;   // PS g_Sprite (dynamic)
+	IShaderResourceVariable*              spriteMaskVar = nullptr;  // PS g_Mask (dynamic; white = none)
+	// Alpha mask for subsequent runs (setSpriteMask) and the mask each open batch was opened with.
+	Texture*                              spriteMask = nullptr;
+	Texture*                              spriteBatchMask = nullptr, *spriteLitMask = nullptr, *spriteSixMask = nullptr;
 	RefCntAutoPtr<IBuffer>                spriteCB;                 // view*proj
 	RefCntAutoPtr<IBuffer>                spriteVB;                 // dynamic (grows), 9 floats/vertex
 	int                                   spriteVBSize = 0;         // VB capacity in vertices
+	// Sprite coverage for the RT reflection composite (sprite_cover.ps): every quad the sprite
+	// flushes drew this camera pass is redrawn at endCamera into an R8 union mask (depth-tested
+	// against the G-buffer depth); the tracer keeps the base colour where sprites cover.
+	RefCntAutoPtr<IPipelineState>         coverPSO;
+	RefCntAutoPtr<IShaderResourceBinding> coverSRB;
+	IShaderResourceVariable*              coverTexVar = nullptr, *coverMaskVar = nullptr;
+	RefCntAutoPtr<IBuffer>                coverVB;  int coverVBSize = 0;
+	RefCntAutoPtr<ITexture>               coverZeroTex;             // 1x1 R8 zero: "no sprites" for the tracer
+	std::unordered_map<uint64_t, SizedTexSet> coverCache;
+	ITextureView*                         coverSRV = nullptr;       // this camera's mask (null = none)
+	struct CoverBatch { Texture* tex; Texture* mask; uint32_t first, count; };
+	std::vector<float>                    coverVerts;
+	std::vector<CoverBatch>               coverBatches;
+	bool                                  coverWanted = false;      // RT reflections run on this camera
+	bool RTReflectWanted() const;                                   // rtSupported + G-buffer + rtreflect in the post chain
+	void CoverAppend(Texture* tex, Texture* mask, const std::vector<float>& verts);
+	void DrawSpriteCoverage();
 	// Batching: drawSprite accumulates quads and flushes ONE draw per texture run (sprites arrive
 	// pre-sorted back-to-front). Flushed on texture change and at endCamera, before the MSAA resolve.
 	Texture*                              spriteBatchTex = nullptr;
@@ -1207,10 +1245,10 @@ struct NukeDiligent::Impl
 	// Quads a water surface left for AFTER itself (their centre is above the surface's rest
 	// level): the water writes depth, so drawing them later is what makes them stand in front of
 	// it; drawn at endCamera before the final flush. One entry per source texture (six-way: A,B).
-	struct DeferredSprites { Texture* tex = nullptr; Texture* texB = nullptr; bool six = false; std::vector<float> verts; };
+	struct DeferredSprites { Texture* tex = nullptr; Texture* texB = nullptr; Texture* mask = nullptr; bool six = false; std::vector<float> verts; };
 	std::vector<DeferredSprites>          spriteDeferred;
-	void FlushSpritesBelow(float y);      // draw the open batch's quads below y, defer the rest
-	void FlushSpritesSixBelow(float y);
+	void FlushSpritesBelow(float y, bool camBelow);   // draw the quads on the far side of the surface, defer the camera's side
+	void FlushSpritesSixBelow(float y, bool camBelow);
 	void FlushSpritesDeferred();          // endCamera: the quads the water left for later
 	void CreateSpriteResources();
 	void FlushSprites();
@@ -1338,6 +1376,7 @@ struct NukeDiligent::Impl
 	                 Uint64 IdxOfs() const { return arena ? (Uint64)iOff * 4  : 0; }
 	                 // RT wind bend: NukeBend compute inputs + the BENT position buffer the BLAS builds over.
 	                 RefCntAutoPtr<IBuffer> bendSrc, bendData, bendPivot, posBent, blasScratch;
+	                 RefCntAutoPtr<IBuffer> aabb;   // sprite meshes: one AABB per quad, the BLAS input
 	                 // GPU skinning: skinned INSTANCE = UAV-writable pos/nrm (pos doubles as the
 	                 // draw VB + BLAS input) + previous-frame positions (TAA velocity);
 	                 // SOURCE mesh = static compute inputs, built lazily on first setSkinPalette.

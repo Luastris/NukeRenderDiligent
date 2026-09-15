@@ -372,6 +372,7 @@ void NukeDiligent::updateGIVolumes()
 		set("g_Instances", d->rtInstSRV);
 		set("g_MatBytes",  d->rtMatSRV ? d->rtMatSRV : d->rtInstSRV);
 		set("g_DynCol",    d->rtDynColSRV ? d->rtDynColSRV : d->rtNrmSRV);
+		set("g_DynPos",    d->rtDynPosSRV ? d->rtDynPosSRV : d->rtNrmSRV);
 		set("g_GIIrr",     d->giIrrSRV);
 		set("g_GIVis",     d->giVisSRV);
 		set("g_RayData",   d->giRayBuf->GetDefaultView(BUFFER_VIEW_UNORDERED_ACCESS));

@@ -36,6 +36,9 @@ bool GetFrame(Frame& out)
 	out.passSerial = d->passSerial;
 	out.curTarget = d->curTarget;
 	out.camKey = d->curCamKey;
+	out.gbufRTV = d->gbufActive ? d->gbufRTV : nullptr;
+	out.gbufDSV = d->gbufActive ? d->gbufDSV : nullptr;
+	out.rtReflectActive = d->RTReflectWanted();
 	out.sceneDepthSRV = d->gbufDepthSRV;
 	out.gbufActive = d->gbufActive;
 	out.whiteSRV = d->whiteTex ? d->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
@@ -117,12 +120,12 @@ void FlushBatches()
 	NukeDiligent::nativeImpl->FlushSpritesSix();
 }
 
-void FlushBatchesBelow(float y)
+void FlushBatchesBelow(float y, bool camBelow)
 {
 	if (!NukeDiligent::nativeImpl) return;
-	NukeDiligent::nativeImpl->FlushSpritesBelow(y);
+	NukeDiligent::nativeImpl->FlushSpritesBelow(y, camBelow);
 	NukeDiligent::nativeImpl->FlushSpritesLit();
-	NukeDiligent::nativeImpl->FlushSpritesSixBelow(y);
+	NukeDiligent::nativeImpl->FlushSpritesSixBelow(y, camBelow);
 }
 
 void NoteDraw(int tris)
@@ -147,13 +150,24 @@ void SetWaterHooks(const WaterHooks* hooks)
 	else       g_hooks = WaterHooks();
 }
 
-void SetRTWaterState(float level, float on, float fade, const float scatter[3], const float absorb[3])
+void SetRTWaterState(float level, float on, float fade, const float scatter[3], const float absorb[3], float band)
 {
 	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;
 	if (!d) return;
-	d->rtWaterOcc[0] = level; d->rtWaterOcc[1] = on; d->rtWaterOcc[2] = fade; d->rtWaterOcc[3] = 0.0f;
+	d->rtWaterOcc[0] = level; d->rtWaterOcc[1] = on; d->rtWaterOcc[2] = fade; d->rtWaterOcc[3] = band;
 	if (scatter) memcpy(d->rtWaterCol, scatter, sizeof(float) * 3);
 	if (absorb)  memcpy(d->rtWaterAbs, absorb, sizeof(float) * 3);
+}
+
+void SetRTWaterMaps(ITextureView* n0, ITextureView* n1, ITextureView* n2, ITextureView* ripple,
+                    const float casc[4], const float rip0[4], const float rip1[4])
+{
+	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;
+	if (!d) return;
+	d->rtWaterNrm[0] = n0; d->rtWaterNrm[1] = n1; d->rtWaterNrm[2] = n2; d->rtWaterRipple = ripple;
+	if (casc) memcpy(d->rtWaterCasc, casc, sizeof(float) * 4);
+	if (rip0) memcpy(d->rtWaterRip, rip0, sizeof(float) * 4);
+	if (rip1) memcpy(d->rtWaterRip + 4, rip1, sizeof(float) * 4);
 }
 
 void DrawCostProxy(const float pos[3], const float quat[4], const float size[3], double tris)

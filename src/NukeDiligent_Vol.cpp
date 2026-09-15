@@ -330,6 +330,7 @@ void NukeDiligent::Impl::RunVolumetrics(int w, int h)
 		set(volInjectSRB, "g_TLAS",      (IDeviceObject*)tlas.RawPtr());
 		set(volInjectSRB, "g_Instances", rtInstSRV);
 		set(volInjectSRB, "g_DynCol",    rtDynColSRV ? rtDynColSRV : rtNrmSRV);
+		set(volInjectSRB, "g_DynPos",    rtDynPosSRV ? rtDynPosSRV : rtNrmSRV);   // sprites turned toward the shadow ray
 		set(volInjectSRB, "g_AllNrm",    rtNrmSRV);
 		set(volInjectSRB, "g_AllUV",     rtUVSRV ? rtUVSRV : rtNrmSRV);
 		set(volInjectSRB, "g_AllPos",    rtPosSRV ? rtPosSRV : rtNrmSRV);

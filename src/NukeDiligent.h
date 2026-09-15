@@ -98,6 +98,7 @@ public:
 	void setVolumetrics(const NukeVolumetricsDesc& desc) override;
 	void setFogVolumes(const NukeFogVolumeDesc* volumes, int count) override;
 	void setSpriteVolumeLight(float amount) override;
+	void setSpriteMask(Texture* mask) override;
 	void drawSpriteRunSixWay(Texture* lightA, Texture* lightB, const float* verts, int vertCount) override;
 	const char* backendName() override;
 	void setFogDisplacers(const NukeFogDisplacerDesc* displacers, int count) override;
@@ -153,6 +154,8 @@ public:
 	bool rtAvailable() override;
 	void beginRTScene() override;
 	void addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections = true, bool castShadows = true) override;
+	void addRTInstanceTinted(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
+	                         const float tint[4], bool inReflections = true, bool castShadows = true) override;
 	void setCameraTAA(bool enabled) override;
 	void requestClose() override;
 	void drawDebugLine(const float a[3], const float b[3], const float color[4]) override;
@@ -227,7 +230,8 @@ private:
 	                        uint32_t firstIndex, uint32_t indexCount);
 	// One TLAS entry over an IB range (indexed meshes: per-section BLAS; soup passes 0/numVerts).
 	void AddRTInstanceRange(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
-	                        bool inReflections, bool castShadows, uint32_t firstIndex, uint32_t indexCount);
+	                        bool inReflections, bool castShadows, uint32_t firstIndex, uint32_t indexCount,
+	                        const float* tint = nullptr);   // tint: rgb multiplies the albedo (null = none)
 
 	Impl*       m_impl   = nullptr;
 	GLFWwindow* m_window = nullptr;

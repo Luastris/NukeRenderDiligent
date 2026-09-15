@@ -52,13 +52,15 @@ void NukeDiligent::Impl::CreateSpriteResources()
 	ShaderResourceVariableDesc vars[] = { {SHADER_TYPE_PIXEL, "g_Sprite",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 	                                      {SHADER_TYPE_PIXEL, "g_SceneDepth", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},    // soft particles / fog depth (Load — no sampler)
 	                                      {SHADER_TYPE_PIXEL, "g_VolInteg",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-	                                      {SHADER_TYPE_PIXEL, "g_VolLight",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC} };
+	                                      {SHADER_TYPE_PIXEL, "g_VolLight",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+	                                      {SHADER_TYPE_PIXEL, "g_Mask",       SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC} };   // alpha mask (setSpriteMask)
 	SamplerDesc samp;
 	samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP; samp.AddressW = TEXTURE_ADDRESS_CLAMP;
-	ImmutableSamplerDesc imms[] = { {SHADER_TYPE_PIXEL, "g_Sprite", samp}, {SHADER_TYPE_PIXEL, "g_VolInteg", samp}, {SHADER_TYPE_PIXEL, "g_VolLight", samp} };
-	ci.PSODesc.ResourceLayout.Variables            = vars; ci.PSODesc.ResourceLayout.NumVariables         = 4;
-	ci.PSODesc.ResourceLayout.ImmutableSamplers    = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 3;
+	ImmutableSamplerDesc imms[] = { {SHADER_TYPE_PIXEL, "g_Sprite", samp}, {SHADER_TYPE_PIXEL, "g_VolInteg", samp}, {SHADER_TYPE_PIXEL, "g_VolLight", samp},
+	                                {SHADER_TYPE_PIXEL, "g_Mask", samp} };
+	ci.PSODesc.ResourceLayout.Variables            = vars; ci.PSODesc.ResourceLayout.NumVariables         = 5;
+	ci.PSODesc.ResourceLayout.ImmutableSamplers    = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 4;
 	ci.PSODesc.ResourceLayout.DefaultVariableType  = SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
 
 	if (!whiteTex3D)
@@ -72,6 +74,50 @@ void NukeDiligent::Impl::CreateSpriteResources()
 	}
 	ITextureView* white3 = whiteTex3D ? whiteTex3D->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
 
+	// Coverage mask PSO: the sprite VS with sprite_cover.ps into an R8 target, depth-tested
+	// against the single-sample G-buffer depth, union blend (ONE / INV_SRC_ALPHA).
+	{
+		coverPSO.Release(); coverSRB.Release(); coverTexVar = nullptr;
+		std::string cps = shaderSource("sprite_cover.ps");
+		RefCntAutoPtr<IShader> cp;
+		if (!cps.empty()) { sci.Desc = {"Sprite Cover PS", SHADER_TYPE_PIXEL, true}; sci.Source = cps.c_str(); CreateShaderCached(sci, &cp); }
+		if (cp)
+		{
+			GraphicsPipelineStateCreateInfo c2 = ci; c2.PSODesc.Name = "Sprite Cover PSO";
+			auto& g2 = c2.GraphicsPipeline;
+			g2.NumRenderTargets = 1; g2.RTVFormats[0] = TEX_FORMAT_R8_UNORM; g2.DSVFormat = TEX_FORMAT_D32_FLOAT;
+			g2.SmplDesc.Count = 1;
+			g2.DepthStencilDesc.DepthEnable = True; g2.DepthStencilDesc.DepthWriteEnable = False;
+			auto& r2 = g2.BlendDesc.RenderTargets[0];
+			r2.BlendEnable = True;
+			r2.SrcBlend = BLEND_FACTOR_ONE; r2.DestBlend = BLEND_FACTOR_INV_SRC_ALPHA; r2.BlendOp = BLEND_OPERATION_ADD;
+			r2.SrcBlendAlpha = BLEND_FACTOR_ONE; r2.DestBlendAlpha = BLEND_FACTOR_INV_SRC_ALPHA; r2.BlendOpAlpha = BLEND_OPERATION_ADD;
+			c2.pPS = cp;
+			ShaderResourceVariableDesc cvars[] = { {SHADER_TYPE_PIXEL, "g_Sprite", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+			                                       {SHADER_TYPE_PIXEL, "g_Mask",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC} };
+			ImmutableSamplerDesc cimms[] = { {SHADER_TYPE_PIXEL, "g_Sprite", samp}, {SHADER_TYPE_PIXEL, "g_Mask", samp} };
+			c2.PSODesc.ResourceLayout.Variables = cvars; c2.PSODesc.ResourceLayout.NumVariables = 2;
+			c2.PSODesc.ResourceLayout.ImmutableSamplers = cimms; c2.PSODesc.ResourceLayout.NumImmutableSamplers = 2;
+			CreateGraphicsPipelineStateCached(c2, &coverPSO);
+			if (coverPSO)
+			{
+				if (auto* sv = coverPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "SpriteCB")) sv->Set(spriteCB);
+				coverPSO->CreateShaderResourceBinding(&coverSRB, true);
+				coverTexVar = coverSRB ? coverSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Sprite") : nullptr;
+				coverMaskVar = coverSRB ? coverSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Mask") : nullptr;
+			}
+		}
+		if (!coverZeroTex)
+		{
+			TextureDesc td; td.Name = "Cover zero 1x1"; td.Type = RESOURCE_DIM_TEX_2D; td.Width = td.Height = 1;
+			td.MipLevels = 1; td.Format = TEX_FORMAT_R8_UNORM; td.BindFlags = BIND_SHADER_RESOURCE; td.Usage = USAGE_IMMUTABLE;
+			const uint8_t px[1] = {0};
+			TextureSubResData sub; sub.pData = px; sub.Stride = 1;
+			TextureData init; init.pSubResources = &sub; init.NumSubresources = 1;
+			device->CreateTexture(td, &init, &coverZeroTex);
+		}
+	}
+
 	CreateGraphicsPipelineStateCached(ci, &spritePSO);
 	if (spritePSO)
 	{
@@ -80,6 +126,7 @@ void NukeDiligent::Impl::CreateSpriteResources()
 		if (auto* sp = spritePSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "VolCB"))    sp->Set(volCB);
 		spritePSO->CreateShaderResourceBinding(&spriteSRB, true);
 		if (spriteSRB) spriteTexVar   = spriteSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Sprite");
+		if (spriteSRB) spriteMaskVar  = spriteSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Mask");
 		if (spriteSRB) spriteDepthVar = spriteSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneDepth");
 		if (spriteSRB) spriteVolIntegVar = spriteSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolInteg");
 		if (spriteSRB) spriteVolLightVar = spriteSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolLight");
@@ -102,8 +149,8 @@ void NukeDiligent::Impl::CreateSpriteResources()
 		b.SrcBlendAlpha = BLEND_FACTOR_ONE; b.DestBlendAlpha = BLEND_FACTOR_INV_SRC_ALPHA; b.BlendOpAlpha = BLEND_OPERATION_ADD;
 		g.InputLayout.LayoutElements = layout; g.InputLayout.NumElements = 3;
 		si.pVS = v; si.pPS = p;
-		si.PSODesc.ResourceLayout.Variables            = vars; si.PSODesc.ResourceLayout.NumVariables         = 4;
-		si.PSODesc.ResourceLayout.ImmutableSamplers    = imms; si.PSODesc.ResourceLayout.NumImmutableSamplers = 3;
+		si.PSODesc.ResourceLayout.Variables            = vars; si.PSODesc.ResourceLayout.NumVariables         = (Uint32)(sizeof(vars) / sizeof(vars[0]));
+		si.PSODesc.ResourceLayout.ImmutableSamplers    = imms; si.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)(sizeof(imms) / sizeof(imms[0]));
 		si.PSODesc.ResourceLayout.DefaultVariableType  = SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
 		CreateGraphicsPipelineStateCached(si, &pso);
 		if (pso)
@@ -117,6 +164,8 @@ void NukeDiligent::Impl::CreateSpriteResources()
 				dv->Set(whiteTex ? whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr);   // screen sprites: soft/fog always off
 			if (srb) if (auto* v = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolInteg")) v->Set(white3);
 			if (srb) if (auto* v = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolLight")) v->Set(white3);
+			if (srb) if (auto* v = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Mask"))     // screen sprites: never masked
+				v->Set(whiteTex ? whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr);
 		}
 	};
 	buildScreen(TEX_FORMAT_RGBA8_UNORM, "Sprite Screen PSO", spriteScreenPSO, spriteScreenSRB, spriteScreenTexVar);
@@ -144,11 +193,13 @@ void NukeDiligent::Impl::CreateSpriteResources()
 			li.pVS = lv; li.pPS = lp;
 			ShaderResourceVariableDesc lvars[] = {
 				{SHADER_TYPE_PIXEL, "g_Sprite", SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
-				{SHADER_TYPE_PIXEL, "g_Normal", SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE} };
+				{SHADER_TYPE_PIXEL, "g_Normal", SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
+				{SHADER_TYPE_PIXEL, "g_Mask",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC} };   // alpha mask, per flush
 			ImmutableSamplerDesc limms[] = { {SHADER_TYPE_PIXEL, "g_Sprite", samp},
-			                                 {SHADER_TYPE_PIXEL, "g_Normal", samp} };
-			li.PSODesc.ResourceLayout.Variables            = lvars; li.PSODesc.ResourceLayout.NumVariables         = 2;
-			li.PSODesc.ResourceLayout.ImmutableSamplers    = limms; li.PSODesc.ResourceLayout.NumImmutableSamplers = 2;
+			                                 {SHADER_TYPE_PIXEL, "g_Normal", samp},
+			                                 {SHADER_TYPE_PIXEL, "g_Mask",   samp} };
+			li.PSODesc.ResourceLayout.Variables            = lvars; li.PSODesc.ResourceLayout.NumVariables         = 3;
+			li.PSODesc.ResourceLayout.ImmutableSamplers    = limms; li.PSODesc.ResourceLayout.NumImmutableSamplers = 3;
 			li.PSODesc.ResourceLayout.DefaultVariableType  = SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
 			CreateGraphicsPipelineStateCached(li, &spriteLitPSO);
 			if (spriteLitPSO)
@@ -180,11 +231,13 @@ void NukeDiligent::Impl::CreateSpriteResources()
 				{SHADER_TYPE_PIXEL, "g_SpriteB",    SHADER_RESOURCE_VARIABLE_TYPE_MUTABLE},
 				{SHADER_TYPE_PIXEL, "g_SceneDepth", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 				{SHADER_TYPE_PIXEL, "g_VolInteg",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-				{SHADER_TYPE_PIXEL, "g_VolLight",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC} };
+				{SHADER_TYPE_PIXEL, "g_VolLight",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+				{SHADER_TYPE_PIXEL, "g_Mask",       SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC} };   // alpha mask, per flush
 			ImmutableSamplerDesc simms[] = { {SHADER_TYPE_PIXEL, "g_Sprite", samp}, {SHADER_TYPE_PIXEL, "g_SpriteB", samp},
-			                                 {SHADER_TYPE_PIXEL, "g_VolInteg", samp}, {SHADER_TYPE_PIXEL, "g_VolLight", samp} };
-			si.PSODesc.ResourceLayout.Variables            = svars; si.PSODesc.ResourceLayout.NumVariables         = 5;
-			si.PSODesc.ResourceLayout.ImmutableSamplers    = simms; si.PSODesc.ResourceLayout.NumImmutableSamplers = 4;
+			                                 {SHADER_TYPE_PIXEL, "g_VolInteg", samp}, {SHADER_TYPE_PIXEL, "g_VolLight", samp},
+			                                 {SHADER_TYPE_PIXEL, "g_Mask", samp} };
+			si.PSODesc.ResourceLayout.Variables            = svars; si.PSODesc.ResourceLayout.NumVariables         = 6;
+			si.PSODesc.ResourceLayout.ImmutableSamplers    = simms; si.PSODesc.ResourceLayout.NumImmutableSamplers = 5;
 			si.PSODesc.ResourceLayout.DefaultVariableType  = SHADER_RESOURCE_VARIABLE_TYPE_STATIC;
 			CreateGraphicsPipelineStateCached(si, &spriteSixPSO);
 			if (spriteSixPSO)
@@ -228,7 +281,7 @@ void NukeDiligent::drawSprite(Texture* tex, const float center[3], const float r
 	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();   // kind switch: keep paint order
 	if (m_impl->spriteSixA) m_impl->FlushSpritesSix();
 	if (m_impl->spriteBatchOpen && tex != m_impl->spriteBatchTex) m_impl->FlushSprites();   // texture changed -> new batch
-	m_impl->spriteBatchTex = tex;
+	m_impl->spriteBatchTex = tex; m_impl->spriteBatchMask = m_impl->spriteMask;
 	m_impl->spriteBatchOpen = true;
 
 	auto push = [&](float sx, float sy, float u, float vv)
@@ -266,6 +319,17 @@ void NukeDiligent::setSpriteVolumeLight(float amount)
 	m_impl->spriteVolLight = amount;
 }
 
+// Alpha mask for subsequent sprite runs (a particle's built-in Shape over its texture); a change
+// flushes the open batches so each keeps the mask it was opened with.
+void NukeDiligent::setSpriteMask(Texture* mask)
+{
+	if (m_impl->spriteMask == mask) return;
+	if (m_impl->spriteBatchOpen) m_impl->FlushSprites();
+	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();
+	if (m_impl->spriteSixA) m_impl->FlushSpritesSix();
+	m_impl->spriteMask = mask;
+}
+
 // Six-way lit smoke run (two lightmaps); falls back to the unlit run without the PSO or maps.
 void NukeDiligent::drawSpriteRunSixWay(Texture* lightA, Texture* lightB, const float* verts, int vertCount)
 {
@@ -275,7 +339,7 @@ void NukeDiligent::drawSpriteRunSixWay(Texture* lightA, Texture* lightB, const f
 	if (m_impl->spriteBatchOpen) m_impl->FlushSprites();    // kind switch: keep paint order
 	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();
 	if (m_impl->spriteSixA && (lightA != m_impl->spriteSixA || lightB != m_impl->spriteSixB)) m_impl->FlushSpritesSix();
-	m_impl->spriteSixA = lightA; m_impl->spriteSixB = lightB;
+	m_impl->spriteSixA = lightA; m_impl->spriteSixB = lightB; m_impl->spriteSixMask = m_impl->spriteMask;
 	std::vector<float>& b = m_impl->spriteSixVerts;
 	b.insert(b.end(), verts, verts + (size_t)vertCount * 9);
 }
@@ -290,7 +354,7 @@ void NukeDiligent::drawSpriteRun(Texture* tex, const float* verts, int vertCount
 	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();   // kind switch: keep paint order
 	if (m_impl->spriteSixA) m_impl->FlushSpritesSix();
 	if (m_impl->spriteBatchOpen && tex != m_impl->spriteBatchTex) m_impl->FlushSprites();
-	m_impl->spriteBatchTex = tex;
+	m_impl->spriteBatchTex = tex; m_impl->spriteBatchMask = m_impl->spriteMask;
 	m_impl->spriteBatchOpen = true;
 	std::vector<float>& b = m_impl->spriteBatchVerts;
 	b.insert(b.end(), verts, verts + (size_t)vertCount * 9);
@@ -309,43 +373,45 @@ void NukeDiligent::drawSpriteRunLit(Texture* tex, Texture* normal, const float* 
 	if (m_impl->spriteSixA) m_impl->FlushSpritesSix();
 	if (m_impl->spriteLitTex && (tex != m_impl->spriteLitTex || normal != m_impl->spriteLitNormal))
 		m_impl->FlushSpritesLit();
-	m_impl->spriteLitTex = tex; m_impl->spriteLitNormal = normal; m_impl->spriteLitFlipY = normalFlipY;
+	m_impl->spriteLitTex = tex; m_impl->spriteLitNormal = normal; m_impl->spriteLitFlipY = normalFlipY; m_impl->spriteLitMask = m_impl->spriteMask;
 	std::vector<float>& b = m_impl->spriteLitVerts;
 	b.insert(b.end(), verts, verts + (size_t)vertCount * 9);
 }
 
 // Draw the accumulated batch (one texture) in a single call. Must run while the camera targets
 // are still bound — i.e. before the MSAA resolve.
-// Split the open batch at a water surface: quads whose centre sits below `y` are drawn now (they
-// belong to the pre-water scene, refracted through it); the rest wait for FlushSpritesDeferred.
-// The paint order inside the batch is kept on both sides.
-static void SplitQuads(std::vector<float>& verts, float y, std::vector<float>& below, std::vector<float>& above)
+// Split the open batch at a water surface: quads on the FAR side of it from the camera are drawn
+// now (they belong to the pre-water scene the surface refracts); quads on the camera's side wait
+// for FlushSpritesDeferred and stand in front of the surface, which writes depth. From above the
+// far side is below the level; from under water it is above. Paint order is kept on both sides.
+static void SplitQuads(std::vector<float>& verts, float y, bool camBelow, std::vector<float>& farSide, std::vector<float>& nearSide)
 {
 	const size_t quad = 6 * 9;
 	for (size_t q = 0; q + quad <= verts.size(); q += quad)
 	{
 		const float cy = 0.5f * (verts[q + 1] + verts[q + 2 * 9 + 1]);   // TL.y + BR.y
-		std::vector<float>& dst = (cy < y) ? below : above;
+		const bool below = cy < y;
+		std::vector<float>& dst = (below != camBelow) ? farSide : nearSide;
 		dst.insert(dst.end(), verts.begin() + q, verts.begin() + q + quad);
 	}
 	verts.clear();
 }
-void NukeDiligent::Impl::FlushSpritesBelow(float y)
+void NukeDiligent::Impl::FlushSpritesBelow(float y, bool camBelow)
 {
 	if (!spriteBatchOpen || spriteBatchVerts.empty()) { FlushSprites(); return; }
 	std::vector<float> below, above;
-	SplitQuads(spriteBatchVerts, y, below, above);
+	SplitQuads(spriteBatchVerts, y, camBelow, below, above);
 	Texture* tex = spriteBatchTex;
-	if (!above.empty()) { DeferredSprites d; d.tex = tex; d.verts = std::move(above); spriteDeferred.push_back(std::move(d)); }
+	if (!above.empty()) { DeferredSprites d; d.tex = tex; d.mask = spriteBatchMask; d.verts = std::move(above); spriteDeferred.push_back(std::move(d)); }
 	spriteBatchVerts = std::move(below);
 	FlushSprites();   // draws what is left (or clears an empty batch)
 }
-void NukeDiligent::Impl::FlushSpritesSixBelow(float y)
+void NukeDiligent::Impl::FlushSpritesSixBelow(float y, bool camBelow)
 {
 	if (spriteSixVerts.empty() || !spriteSixA || !spriteSixB) { FlushSpritesSix(); return; }
 	std::vector<float> below, above;
-	SplitQuads(spriteSixVerts, y, below, above);
-	if (!above.empty()) { DeferredSprites d; d.tex = spriteSixA; d.texB = spriteSixB; d.six = true; d.verts = std::move(above); spriteDeferred.push_back(std::move(d)); }
+	SplitQuads(spriteSixVerts, y, camBelow, below, above);
+	if (!above.empty()) { DeferredSprites d; d.tex = spriteSixA; d.texB = spriteSixB; d.mask = spriteSixMask; d.six = true; d.verts = std::move(above); spriteDeferred.push_back(std::move(d)); }
 	spriteSixVerts = std::move(below);
 	FlushSpritesSix();
 }
@@ -357,8 +423,8 @@ void NukeDiligent::Impl::FlushSpritesDeferred()
 	spriteDeferred.clear();
 	for (DeferredSprites& d : list)
 	{
-		if (d.six) { spriteSixA = d.tex; spriteSixB = d.texB; spriteSixVerts = std::move(d.verts); FlushSpritesSix(); }
-		else       { spriteBatchTex = d.tex; spriteBatchOpen = true; spriteBatchVerts = std::move(d.verts); FlushSprites(); }
+		if (d.six) { spriteSixA = d.tex; spriteSixB = d.texB; spriteSixMask = d.mask; spriteSixVerts = std::move(d.verts); FlushSpritesSix(); }
+		else       { spriteBatchTex = d.tex; spriteBatchMask = d.mask; spriteBatchOpen = true; spriteBatchVerts = std::move(d.verts); FlushSprites(); }
 	}
 }
 
@@ -422,6 +488,11 @@ void NukeDiligent::Impl::FlushSprites()
 		}
 	}
 	if (spriteTexVar) spriteTexVar->Set(srv);
+	if (spriteMaskVar)
+	{
+		ITextureView* msrv = spriteBatchMask ? GetTexSRV(spriteBatchMask) : nullptr;
+		spriteMaskVar->Set(msrv ? msrv : whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	}
 
 	Uint64 offset = 0; IBuffer* vbs[] = { spriteVB };
 	context->SetVertexBuffers(0, 1, vbs, &offset, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
@@ -429,6 +500,7 @@ void NukeDiligent::Impl::FlushSprites()
 	context->CommitShaderResources(spriteSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da; da.NumVertices = (Uint32)vertCount; da.Flags = DRAW_FLAG_VERIFY_ALL;
 	context->Draw(da);
+	CoverAppend(spriteBatchTex, spriteBatchMask, spriteBatchVerts);
 
 	spriteBatchVerts.clear();
 	spriteBatchTex = nullptr;
@@ -496,10 +568,16 @@ void NukeDiligent::Impl::FlushSpritesLit()
 
 	Uint64 offset = 0; IBuffer* vbs[] = { spriteVB };
 	context->SetVertexBuffers(0, 1, vbs, &offset, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	if (auto* mv2 = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Mask"))
+	{
+		ITextureView* msrv = spriteLitMask ? GetTexSRV(spriteLitMask) : nullptr;
+		mv2->Set(msrv ? msrv : whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	}
 	context->SetPipelineState(spriteLitPSO);
 	context->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da; da.NumVertices = (Uint32)vertCount; da.Flags = DRAW_FLAG_VERIFY_ALL;
 	context->Draw(da);
+	CoverAppend(spriteLitTex, spriteLitMask, spriteLitVerts);
 	drop();
 }
 
@@ -569,11 +647,102 @@ void NukeDiligent::Impl::FlushSpritesSix()
 	}
 	Uint64 offset = 0; IBuffer* vbs[] = { spriteVB };
 	context->SetVertexBuffers(0, 1, vbs, &offset, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	if (auto* mv2 = srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Mask"))
+	{
+		ITextureView* msrv = spriteSixMask ? GetTexSRV(spriteSixMask) : nullptr;
+		mv2->Set(msrv ? msrv : whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));
+	}
 	context->SetPipelineState(spriteSixPSO);
 	context->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	DrawAttribs da; da.NumVertices = (Uint32)vertCount; da.Flags = DRAW_FLAG_VERIFY_ALL;
 	context->Draw(da);
+	CoverAppend(spriteSixA, spriteSixMask, spriteSixVerts);
 	drop();
+}
+
+// ---- sprite coverage for the RT reflection composite ------------------------------------------
+
+bool NukeDiligent::Impl::RTReflectWanted() const
+{
+	if (!rtSupported || !gbufActive) return false;
+	for (const auto& cs : postChain)
+	{
+		auto pit = postPipes.find(cs.pipeline);
+		if (pit != postPipes.end() && pit->second.isRTRef) return true;
+	}
+	return false;
+}
+
+// Remember a flushed batch (its quads + texture) for the coverage draw at endCamera.
+void NukeDiligent::Impl::CoverAppend(Texture* tex, Texture* mask, const std::vector<float>& verts)
+{
+	if (!coverWanted || !coverPSO || verts.empty()) return;
+	CoverBatch b; b.tex = tex; b.mask = mask; b.first = (uint32_t)(coverVerts.size() / 9); b.count = (uint32_t)(verts.size() / 9);
+	coverVerts.insert(coverVerts.end(), verts.begin(), verts.end());
+	coverBatches.push_back(b);
+}
+
+// endCamera, before the resolve: redraw this pass's sprite quads into the R8 union mask,
+// depth-tested against the G-buffer depth (opaque prepass + the water's G-pass), then rebind
+// the camera targets. coverSRV = the mask for the tracer (null when nothing covers).
+void NukeDiligent::Impl::DrawSpriteCoverage()
+{
+	coverSRV = nullptr;
+	auto done = [&]{ coverVerts.clear(); coverBatches.clear(); };
+	if (!coverWanted || coverBatches.empty() || !coverPSO || !coverSRB || !gbufActive || !gbufDSV || curRTW <= 0 || curRTH <= 0) { done(); return; }
+	const uint64_t key = ((uint64_t)(uint32_t)curRTW << 32) | (uint32_t)curRTH;
+	SizedTexSet& s = coverCache[key];
+	if (!s.a)
+	{
+		TextureDesc td; td.Name = "Sprite Coverage"; td.Type = RESOURCE_DIM_TEX_2D;
+		td.Width = (Uint32)curRTW; td.Height = (Uint32)curRTH; td.Format = TEX_FORMAT_R8_UNORM;
+		td.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+		device->CreateTexture(td, nullptr, &s.a);
+	}
+	s.lastUsed = ++sizedClock;
+	EvictSized(coverCache, key);
+	if (!s.a) { done(); return; }
+	const int vertCount = (int)(coverVerts.size() / 9);
+	if (!coverVB || coverVBSize < vertCount)
+	{
+		Trash(coverVB); coverVB.Release();
+		while (coverVBSize < vertCount) coverVBSize = coverVBSize ? coverVBSize * 2 : 384;
+		BufferDesc bd; bd.Name = "Sprite Cover VB"; bd.BindFlags = BIND_VERTEX_BUFFER;
+		bd.Usage = USAGE_DYNAMIC; bd.CPUAccessFlags = CPU_ACCESS_WRITE; bd.Size = (Uint64)coverVBSize * 9 * sizeof(float);
+		device->CreateBuffer(bd, nullptr, &coverVB);
+		if (!coverVB) { done(); return; }
+	}
+	{ MapHelper<float> mv(context, coverVB, MAP_WRITE, MAP_FLAG_DISCARD); std::memcpy(mv, coverVerts.data(), coverVerts.size() * sizeof(float)); }
+	{
+		struct SpriteCBData { float4x4 vp; float soft[4]; float soft2[4]; };
+		MapHelper<SpriteCBData> cb(context, spriteCB, MAP_WRITE, MAP_FLAG_DISCARD);
+		if (cb != nullptr) { cb->vp = curView * curProj; memset(cb->soft, 0, sizeof(cb->soft)); memset(cb->soft2, 0, sizeof(cb->soft2)); }
+	}
+	ITextureView* rtv = s.a->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+	context->SetRenderTargets(1, &rtv, gbufDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	const float zero[4] = { 0, 0, 0, 0 };
+	context->ClearRenderTarget(rtv, zero, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)curRTW; vp.Height = (float)curRTH; vp.MinDepth = 0; vp.MaxDepth = 1;
+	context->SetViewports(1, &vp, curRTW, curRTH);
+	Uint64 offset = 0; IBuffer* vbs[] = { coverVB };
+	context->SetVertexBuffers(0, 1, vbs, &offset, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
+	context->SetPipelineState(coverPSO);
+	ITextureView* white = whiteTex ? whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
+	for (const CoverBatch& b : coverBatches)
+	{
+		ITextureView* srv = b.tex ? GetTexSRV(b.tex) : white;
+		if (!srv) srv = white;
+		if (!srv) continue;
+		if (coverTexVar) coverTexVar->Set(srv);
+		if (coverMaskVar) { ITextureView* msrv = b.mask ? GetTexSRV(b.mask) : nullptr; coverMaskVar->Set(msrv ? msrv : white); }
+		context->CommitShaderResources(coverSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawAttribs da; da.NumVertices = b.count; da.StartVertexLocation = b.first; da.Flags = DRAW_FLAG_VERIFY_ALL;
+		context->Draw(da);
+	}
+	context->SetRenderTargets(1, &curRTV, curDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	context->SetViewports(1, &vp, curRTW, curRTH);
+	coverSRV = s.a->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+	done();
 }
 
 // ---- screen-space (Canvas HUD) sprites --------------------------------------------------------

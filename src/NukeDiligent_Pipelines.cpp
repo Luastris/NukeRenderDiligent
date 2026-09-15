@@ -478,10 +478,11 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		{SHADER_TYPE_PIXEL, "g_Probe",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // reflection probe cubemap
 		{SHADER_TYPE_PIXEL, "g_TLAS",       SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // RT scene (only present when rtSupported)
 		{SHADER_TYPE_PIXEL, "g_RTInst",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // per-instance RT data (shadow footprints)
+		{SHADER_TYPE_PIXEL, "g_DynPos",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},   // sprite quads (ray-facing shadow test)
 	};
-	// The last two base entries are RT-only — drop them when the device has no ray tracing.
+	// The last three base entries are RT-only — drop them when the device has no ray tracing.
 	const Uint32 kNumBase = (Uint32)(sizeof(varsBase) / sizeof(varsBase[0]));
-	std::vector<ShaderResourceVariableDesc> vars(varsBase, varsBase + (rtSupported ? kNumBase : kNumBase - 2));
+	std::vector<ShaderResourceVariableDesc> vars(varsBase, varsBase + (rtSupported ? kNumBase : kNumBase - 3));
 	// Overlay slots, OvTexNames() order; one shared sampler on g_Ov0Alb.
 	for (const std::string& n : OvTexNames())
 		vars.push_back({SHADER_TYPE_PIXEL, n.c_str(), SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
@@ -757,6 +758,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.probeVar  = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Probe");
 	wp.tlasVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_TLAS");
 	wp.rtInstVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_RTInst");
+	wp.rtDynPosVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_DynPos");
 	for (int k = 0; k < kOvTexCount; ++k)
 		wp.ovVar[k] = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, OvTexNames()[k].c_str());
 	wp.flowVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Flow");
@@ -866,6 +868,7 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				wp.probeVarI  = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Probe");
 				wp.tlasVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_TLAS");
 				wp.rtInstVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_RTInst");
+				wp.rtDynPosVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_DynPos");
 				for (int k = 0; k < kOvTexCount; ++k)
 					wp.ovVarI[k] = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, OvTexNames()[k].c_str());
 				wp.flowVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Flow");

@@ -1,6 +1,7 @@
 #include "NukeDiligentImpl.h"
 #include <sstream>
 #include <cctype>
+#include <limits>
 
 // HLSL scalar/vector type name -> component count (0 = unsupported).
 static int RTCompsOf(const std::string& t)
@@ -57,7 +58,7 @@ std::string NukeDiligent::Impl::GenChitSource(const std::string& name, const std
 		}
 	}
 	std::ostringstream s;
-	s << "#include \"rt_common.hlsl\"\n" << decls << "static uint __texIndex;\n"
+	s << "#include \"rt_common.hlsl\"\n#include \"rt_water_shade.hlsli\"\n" << decls << "static uint __texIndex;\n"
 	  << "void __LoadMat(uint o){\n" << loads << "}\n"
 	  << "#define MAT_BASE_TEX(uv) ((__texIndex!=0xFFFFFFFFu)? g_MatTex[NonUniformResourceIndex(__texIndex)].SampleLevel(g_MatTex_sampler,(uv),0) : float4(1,1,1,1))\n";
 	// Code-registered surface body (module-embedded shaders) beats the file include.
@@ -77,13 +78,13 @@ std::string NukeDiligent::Impl::GenChitSource(const std::string& name, const std
 	  << "  IN.worldPos = WorldRayOrigin()+wdir*RayTCurrent(); IN.viewDir=-wdir;\n"
 	  << "  SurfaceOut O=(SurfaceOut)0; O.albedo=float3(1,1,1); O.roughness=1.0; O.alpha=1.0; O.unlit=false;\n"
 	  << "  Surface(IN,O);\n"
-	  << "  if (O.unlit){ float wT0=RTWaterTrans(WorldRayOrigin(),IN.worldPos); p.color=O.emissive*wT0+RTWaterLook(wdir)*(1.0-wT0); return; }\n"
+	  << "  if (O.unlit){ p.color=RTWaterFinish(WorldRayOrigin(),wdir,IN.worldPos,O.emissive,p.depth); return; }\n"
 	  << "  float aoM=SampleAO(inst,IN.uv); float3 specM=SampleSpec(inst,IN.uv);\n"
 	  << "  float3 col = ShadeSurface(IN.worldPos,IN.worldNormal,IN.viewDir,O.albedo,O.metallic,O.roughness,O.emissive,aoM,specM);\n"
 	  << "  float3 R=reflect(wdir,IN.worldNormal); float3 env=ReflEnv(R,O.roughness), traced=env;\n"
 	  << "  if (p.depth<(uint)g_RTParams.z){ RayDesc ray; ray.Origin=IN.worldPos+IN.worldNormal*0.08+R*0.05; ray.Direction=R; ray.TMin=0.02; ray.TMax=(g_RTParams.y>0.5)?g_RTParams.y:1000.0; RTPayload p2; p2.color=0.0; p2.depth=p.depth+1; TraceRay(g_TLAS,RAY_FLAG_NONE,RT_REFLECT_MASK,0,1,0,ray,p2); traced=p2.color; }\n"
 	  << "  col += SpecFr(IN.worldNormal,IN.viewDir,O.roughness,O.albedo,O.metallic,specM)*lerp(traced,env,O.roughness);\n"
-	  << "  float wT=RTWaterTrans(WorldRayOrigin(),IN.worldPos); p.color=col*wT+RTWaterLook(wdir)*(1.0-wT);\n}\n";
+	  << "  p.color=RTWaterFinish(WorldRayOrigin(),wdir,IN.worldPos,col,p.depth);\n}\n";
 	return s.str();
 }
 
@@ -110,6 +111,7 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
 	if (it != blasCache.end()) return it->second;
 	MeshGPU* gp = GetMeshGPU(mesh);
 	if (!gp || !gp->PosBuf() || gp->numVerts < 3) { blasCache[mesh] = {}; return nullptr; }
+	if (mesh->rtSprite) return GetSpriteBLAS(mesh, gp);
 
 	BLASTriangleDesc tri;
 	tri.GeometryName        = "geo";
@@ -166,6 +168,63 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
 
 	blasCache[mesh] = blas;
 	return blas;
+}
+
+// Sprite meshes (particle quads, trail ribbons): one AABB per quad, around the sphere that holds
+// the quad at any facing; the ray-facing quad itself is the intersection shader's (rt_sprite.hlsli).
+// An unused slot (all zeros) is an inactive box (NaN min).
+static void FillSpriteBoxes(const Mesh* mesh, std::vector<float>& boxes)
+{
+	const int quads = mesh->numVerts / 6;
+	boxes.resize((size_t)quads * 6);
+	auto dist = [](const float* p, const float* q) { const float dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2]; return std::sqrt(dx * dx + dy * dy + dz * dz); };
+	for (int q = 0; q < quads; ++q)
+	{
+		const float* v = mesh->vertexArray + (size_t)q * 18;   // v0 v1 v2 v0 v2 v3
+		float* b = boxes.data() + (size_t)q * 6;
+		float a[3], e[3], c[3];
+		for (int k = 0; k < 3; ++k) { a[k] = 0.5f * (v[k] + v[3 + k]); e[k] = 0.5f * (v[6 + k] + v[15 + k]); c[k] = 0.5f * (a[k] + e[k]); }
+		const float r = 0.5f * dist(a, e) + 0.5f * std::max(dist(v, v + 3), dist(v + 6, v + 15));
+		if (r < 1e-6f) { for (int k = 0; k < 6; ++k) b[k] = std::numeric_limits<float>::quiet_NaN(); continue; }
+		for (int k = 0; k < 3; ++k) { b[k] = c[k] - r; b[3 + k] = c[k] + r; }
+	}
+}
+IBottomLevelAS* NukeDiligent::Impl::GetSpriteBLAS(Mesh* mesh, MeshGPU* gp)
+{
+	const Uint32 quads = (Uint32)(mesh->numVerts / 6);
+	if (quads == 0) { blasCache[mesh] = {}; return nullptr; }
+	BLASBoundingBoxDesc box; box.GeometryName = "geo"; box.MaxBoxCount = quads;
+	BottomLevelASDesc desc;
+	desc.Name = "Sprite BLAS"; desc.pBoxes = &box; desc.BoxCount = 1;
+	desc.Flags = RAYTRACING_BUILD_AS_PREFER_FAST_TRACE;
+	RefCntAutoPtr<IBottomLevelAS> blas;
+	device->CreateBLAS(desc, &blas);
+	if (!blas) { blasCache[mesh] = {}; return nullptr; }
+	BufferDesc sbd; sbd.Name = "BLAS scratch"; sbd.Usage = USAGE_DEFAULT; sbd.BindFlags = BIND_RAY_TRACING;
+	sbd.Size = blas->GetScratchBufferSizes().Build;
+	RefCntAutoPtr<IBuffer> scratch; device->CreateBuffer(sbd, nullptr, &scratch); gp->blasScratch = scratch;
+	BufferDesc abd; abd.Name = "Sprite AABBs"; abd.Usage = USAGE_DEFAULT; abd.BindFlags = BIND_RAY_TRACING;
+	abd.Size = (Uint64)quads * 6 * sizeof(float);
+	device->CreateBuffer(abd, nullptr, &gp->aabb);
+	if (!scratch || !gp->aabb) { blasCache[mesh] = {}; return nullptr; }
+	blasCache[mesh] = blas;
+	BuildSpriteBLAS(mesh, gp, blas);
+	return blas;
+}
+void NukeDiligent::Impl::BuildSpriteBLAS(Mesh* mesh, MeshGPU* gp, IBottomLevelAS* blas)
+{
+	if (!gp->aabb || !gp->blasScratch || !blas) return;
+	std::vector<float> boxes; FillSpriteBoxes(mesh, boxes);
+	if (boxes.empty()) return;
+	context->UpdateBuffer(gp->aabb, 0, (Uint64)boxes.size() * sizeof(float), boxes.data(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	BLASBuildBoundingBoxData bd;
+	bd.GeometryName = "geo"; bd.pBoxBuffer = gp->aabb; bd.BoxOffset = 0; bd.BoxStride = 6 * sizeof(float);
+	bd.BoxCount = (Uint32)(boxes.size() / 6);
+	bd.Flags = RAYTRACING_GEOMETRY_FLAG_NONE;   // non-opaque: the any-hit alpha test runs
+	BuildBLASAttribs ba;
+	ba.pBLAS = blas; ba.pBoxData = &bd; ba.BoxDataCount = 1; ba.pScratchBuffer = gp->blasScratch;
+	ba.BLASTransitionMode = ba.GeometryTransitionMode = ba.ScratchBufferTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+	context->BuildBLAS(ba);
 }
 
 // Get-or-build a BLAS over an INDEX-BUFFER RANGE of a v4 indexed mesh (a material section, or
@@ -265,6 +324,7 @@ void NukeDiligent::beginRTScene()
 	m_impl->rtBendMeshes.clear();
 	m_impl->rtDynMeshes.clear();
 	m_impl->rtDynColCPU.clear();
+	m_impl->rtDynPosCPU.clear();
 	// rtInstanceNames is a grow-only pool ("i0","i1",...) — instance i always maps to "i<i>",
 	// so re-accumulating never needs fresh strings.
 	m_impl->rtInstData.clear();
@@ -281,6 +341,14 @@ void NukeDiligent::addRTInstance(Mesh* mesh, Material* mat, const float pos[3], 
 	uint32_t first = 0, count = 0;
 	m_impl->LodRange(mesh, 0, first, count);
 	AddRTInstanceRange(mesh, mat, pos, quat, scale, inReflections, castShadows, first, count);
+}
+void NukeDiligent::addRTInstanceTinted(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
+                                       const float tint[4], bool inReflections, bool castShadows)
+{
+	if (!m_impl->rtSupported || !mesh) return;
+	uint32_t first = 0, count = 0;
+	m_impl->LodRange(mesh, 0, first, count);
+	AddRTInstanceRange(mesh, mat, pos, quat, scale, inReflections, castShadows, first, count, tint);
 }
 
 void NukeDiligent::addRTInstanceMulti(Mesh* mesh, Material* const* mats, int matCount,
@@ -309,7 +377,7 @@ void NukeDiligent::addRTInstanceMulti(Mesh* mesh, Material* const* mats, int mat
 void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
                                       const float pos[3], const float quat[4], const float scale[3],
                                       bool inReflections, bool castShadows,
-                                      uint32_t firstIndex, uint32_t indexCount)
+                                      uint32_t firstIndex, uint32_t indexCount, const float* tint)
 {
 	const bool indexed = mesh->numIndices > 0 && mesh->indexArray != nullptr;
 	IBottomLevelAS* blas = indexed ? m_impl->GetMeshBLASRange(mesh, firstIndex, indexCount)
@@ -388,6 +456,7 @@ void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
 	uint32_t aoIdx   = mat ? slotFor(mat->ao)   : 0xFFFFFFFFu;
 	uint32_t emIdx   = mat ? slotFor(mat->em)   : 0xFFFFFFFFu;
 	uint32_t specIdx = mat ? slotFor(mat->spec) : 0xFFFFFFFFu;
+	uint32_t maskIdx = mat ? slotFor(mat->mask) : 0xFFFFFFFFu;   // alpha mask (sprite Shape x texture)
 
 	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
 	               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
@@ -414,6 +483,7 @@ void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
 		metal = mat->metallic; rough = mat->roughness; specF = mat->specular;
 		em[0] = (float)mat->emissive.r; em[1] = (float)mat->emissive.g; em[2] = (float)mat->emissive.b; emI = mat->emissiveIntensity;
 	}
+	if (tint) { alb[0] *= tint[0]; alb[1] *= tint[1]; alb[2] *= tint[2]; alb[3] *= tint[3]; }   // per-instance colour (particles)
 	d.specularFactor = specF;
 	d.albedoMetal[0] = alb[0]; d.albedoMetal[1] = alb[1]; d.albedoMetal[2] = alb[2]; d.albedoMetal[3] = metal;
 	d.emissiveRough[0] = em[0] * emI; d.emissiveRough[1] = em[1] * emI; d.emissiveRough[2] = em[2] * emI; d.emissiveRough[3] = rough;
@@ -426,7 +496,14 @@ void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
 	}
 	d.shadowShape = (uint32_t)mesh->rtShadowShape;
 	d.shadowAlpha = alb[3];
-	d.pad0 = 0;
+	d.maskTexIndex = maskIdx; d.pad1 = d.pad2 = d.pad3 = 0;
+	d.dynPosOffset = 0xFFFFFFFFu;
+	if (mesh->rtSprite && mesh->rtDynamic)   // this frame's quads: the ray-facing intersection reads them
+	{
+		d.dynPosOffset = (uint32_t)(m_impl->rtDynPosCPU.size() * sizeof(float));
+		m_impl->rtDynPosCPU.insert(m_impl->rtDynPosCPU.end(), mesh->vertexArray,
+		                           mesh->vertexArray + (size_t)mesh->numVerts * 3);
+	}
 
 	// MatCB block: must match the raster MatCB packing (NukeDiligent_Scene.cpp). The block is
 	// a pure function of the Material — repeats within one accumulation just copy the first
@@ -474,7 +551,8 @@ void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
 	if (mat) m_impl->rtMatBlockCache[mat] = d.matByteOffset;
 	}
 
-	m_impl->rtInstShaderGuid.push_back(mat ? mat->shaderGuid : std::string());
+	// Sprites take the procedural hit group; everything else its material shader's (or the default).
+	m_impl->rtInstShaderGuid.push_back(mesh->rtSprite ? std::string("@sprite") : (mat ? mat->shaderGuid : std::string()));
 	m_impl->rtInstData.push_back(d);
 	// InstanceMatrix is 3x4 row-major; our world matrix is row-vector (v*M), hence the transpose.
 	for (int r = 0; r < 3; ++r)
@@ -551,6 +629,7 @@ void NukeDiligent::Impl::RebuildDynamicBLAS()
 		MeshGPU* gp = GetMeshGPU(m);
 		auto bit = blasCache.find(m);
 		if (!gp || !gp->pos || bit == blasCache.end() || !bit->second || !gp->blasScratch) continue;
+		if (m->rtSprite) { BuildSpriteBLAS(m, gp, bit->second); blasBentThisFrame = true; continue; }
 		BLASBuildTriangleData td;
 		td.GeometryName         = "geo";
 		td.pVertexBuffer        = gp->pos;
@@ -733,6 +812,21 @@ void NukeDiligent::buildRTScene()
 		if (d->rtDynColBuf)
 			d->context->UpdateBuffer(d->rtDynColBuf, 0, need, d->rtDynColCPU.data(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	}
+	if (!d->rtDynPosCPU.empty())
+	{
+		const Uint64 need = (Uint64)d->rtDynPosCPU.size() * sizeof(float);
+		if (!d->rtDynPosBuf || d->rtDynPosCap < need)
+		{
+			d->Trash(d->rtDynPosBuf);
+			d->rtDynPosBuf.Release(); d->rtDynPosSRV = nullptr; d->rtDynPosCap = need;
+			BufferDesc bd; bd.Name = "RT DynPos"; bd.Usage = USAGE_DEFAULT; bd.BindFlags = BIND_SHADER_RESOURCE;
+			bd.Mode = BUFFER_MODE_RAW; bd.Size = need;
+			d->device->CreateBuffer(bd, nullptr, &d->rtDynPosBuf);
+			if (d->rtDynPosBuf) d->rtDynPosSRV = d->rtDynPosBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE);
+		}
+		if (d->rtDynPosBuf)
+			d->context->UpdateBuffer(d->rtDynPosBuf, 0, need, d->rtDynPosCPU.data(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	}
 
 	d->rtSceneReady = true;
 }
@@ -763,6 +857,11 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 	if (!mk("rt_rchit.hlsl", SHADER_TYPE_RAY_CLOSEST_HIT, "RT ClosestHit", rch)) return false;
 	// Any-hit alpha test, shared by every hit group; only runs for non-opaque geometry.
 	if (!mk("rt_ahit.hlsl",  SHADER_TYPE_RAY_ANY_HIT,     "RT AnyHit",     rah)) return false;
+	// Sprites (procedural AABBs): the quad turns toward each ray in the intersection shader.
+	RefCntAutoPtr<IShader> spInt, spChit, spAhit;
+	if (!mk("rt_sprite_int.hlsl",  SHADER_TYPE_RAY_INTERSECTION, "RT Sprite Intersection", spInt))  return false;
+	if (!mk("rt_sprite_chit.hlsl", SHADER_TYPE_RAY_CLOSEST_HIT,  "RT Sprite ClosestHit",   spChit)) return false;
+	if (!mk("rt_sprite_ahit.hlsl", SHADER_TYPE_RAY_ANY_HIT,      "RT Sprite AnyHit",       spAhit)) return false;
 
 	// Auto-generate a closest-hit per material shader that ships a "<name>.surf.hlsl" (codegen from its schema).
 	auto mkSrc = [&](const std::string& src, const char* dbg, RefCntAutoPtr<IShader>& out)
@@ -795,20 +894,28 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 	std::vector<RayTracingTriangleHitShaderGroup> hit;
 	hit.push_back({hitNames[0].c_str(), rch, rah});                              // default: standard PBR + alpha any-hit
 	for (size_t i = 0; i < customChits.size(); ++i) hit.push_back({hitNames[i + 1].c_str(), customChits[i], rah});
+	RayTracingProceduralHitShaderGroup proc[1] = { {"HitGroupSprite", spInt, spChit, spAhit} };
+	shaderHitGroup["@sprite"] = "HitGroupSprite";   // sprite instances are tagged "@sprite" in rtInstShaderGuid
 	ci.pGeneralShaders = gen; ci.GeneralShaderCount = 2;
 	ci.pTriangleHitShaders = hit.data(); ci.TriangleHitShaderCount = (Uint32)hit.size();
+	ci.pProceduralHitShaders = proc; ci.ProceduralHitShaderCount = 1;
 	ci.RayTracingPipeline.MaxRecursionDepth = 8;       // primary + bounces; the configured depth caps actual recursion
 	ci.RayTracingPipeline.ShaderRecordSize  = 0;
-	ci.MaxAttributeSize = sizeof(float) * 2;           // BuiltInTriangleIntersectionAttributes (barycentrics)
+	ci.MaxAttributeSize = sizeof(float) * 3;           // max(barycentrics, SpriteAttr {uv, along})
 	ci.MaxPayloadSize   = sizeof(float) * 5;           // RTPayload { float3 color; uint depth; float hitT; }
 
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP; samp.AddressW = TEXTURE_ADDRESS_CLAMP;
+	SamplerDesc wrapS = samp; wrapS.AddressU = TEXTURE_ADDRESS_WRAP; wrapS.AddressV = TEXTURE_ADDRESS_WRAP; wrapS.AddressW = TEXTURE_ADDRESS_WRAP;
 	ImmutableSamplerDesc imms[] = {
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_Probe",  samp},
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_MatTex", samp},
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_GIIrr",  samp},   // DDGI atlases (hit ambient)
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_VolFogScat", samp},   // froxel scatter grid (the reflected leg's fog)
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterNrm0", wrapS},   // the water's wave maps (a crossed surface shades with them)
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterNrm1", wrapS},
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterNrm2", wrapS},
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterRipple", samp},
 	};
 	ShaderResourceVariableDesc vars[] = {
 		{SHADER_TYPE_ALL_RAY_TRACING, "RTRefCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
@@ -816,14 +923,24 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 		{SHADER_TYPE_ALL_RAY_TRACING, "GICB",    SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 		{SHADER_TYPE_ALL_RAY_TRACING, "VolCB",   SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
 		{SHADER_TYPE_ALL_RAY_TRACING, "FogVolCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
+		// The geometry / instance pools: ONE resource shared by every stage. Left implicit, each
+		// stage that reads them gets its own dynamic storage-buffer descriptor and Vulkan's limit
+		// of 16 per pipeline is exceeded once the miss shader shades a crossed water surface.
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_AllNrm",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_AllUV",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_AllPos",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_Instances", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_MatBytes",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_DynCol",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_DynPos",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
 	};
 	ci.PSODesc.ResourceLayout.DefaultVariableType = SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC;   // TLAS/gbuffer/bindless/output
-	ci.PSODesc.ResourceLayout.Variables           = vars; ci.PSODesc.ResourceLayout.NumVariables = 5;
-	ci.PSODesc.ResourceLayout.ImmutableSamplers   = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 4;
+	ci.PSODesc.ResourceLayout.Variables           = vars; ci.PSODesc.ResourceLayout.NumVariables = (Uint32)(sizeof(vars) / sizeof(vars[0]));
+	ci.PSODesc.ResourceLayout.ImmutableSamplers   = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 8;
 
 	device->CreateRayTracingPipelineState(ci, &rtPSO);
 	if (!rtPSO) { cout << "[NukeDiligent]\tRT pipeline PSO build failed" << endl; return false; }
-	for (SHADER_TYPE t : {SHADER_TYPE_RAY_GEN, SHADER_TYPE_RAY_MISS, SHADER_TYPE_RAY_CLOSEST_HIT, SHADER_TYPE_RAY_ANY_HIT})
+	for (SHADER_TYPE t : {SHADER_TYPE_RAY_GEN, SHADER_TYPE_RAY_MISS, SHADER_TYPE_RAY_CLOSEST_HIT, SHADER_TYPE_RAY_ANY_HIT, SHADER_TYPE_RAY_INTERSECTION})
 	{
 		if (auto* v = rtPSO->GetStaticVariableByName(t, "RTRefCB")) v->Set(rtRefCB);
 		if (auto* v = rtPSO->GetStaticVariableByName(t, "FrameCB")) v->Set(worldFrameCB);
@@ -882,7 +999,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	if (!rtOutTex) return;
 
 	{   // RTRefCB: clip->view + view->world + camera + (intensity, maxDist, maxDepth) + water
-		struct CB { float4x4 ip, iv; float4 cam; float4 prm; float4 waterOcc; float4 waterCol; float4 waterAbs; };
+		struct CB { float4x4 ip, iv; float4 cam; float4 prm; float4 waterOcc; float4 waterCol; float4 waterAbs; float4 waterCasc; float4 waterRip0; float4 waterRip1; };
 		MapHelper<CB> cb(context, rtRefCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		cb->ip  = curProjNoJitter.Inverse(); cb->iv = curView.Inverse();   // unjittered: must match the gbuffer depth
 		cb->cam = float4(curCamPos[0], curCamPos[1], curCamPos[2], 1.0f);
@@ -894,9 +1011,12 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		if (roughCut < 0.05f) roughCut = 0.05f;
 		cb->prm = float4(intensity, maxDist, maxDepth, roughCut);
 		// Water occlusion state, published by the water module via SetRTWaterState.
-		cb->waterOcc = float4(rtWaterOcc[0], rtWaterOcc[1], rtWaterOcc[2], 0.0f);
+		cb->waterOcc = float4(rtWaterOcc[0], rtWaterOcc[1], rtWaterOcc[2], rtWaterOcc[3]);   // w = the surface's wave band
 		cb->waterCol = float4(rtWaterCol[0], rtWaterCol[1], rtWaterCol[2], 0.0f);
 		cb->waterAbs = float4(rtWaterAbs[0], rtWaterAbs[1], rtWaterAbs[2], rtWaterOcc[2]);
+		cb->waterCasc = float4(rtWaterCasc[0], rtWaterCasc[1], rtWaterCasc[2], rtWaterCasc[3]);   // the wave maps (SetRTWaterMaps)
+		cb->waterRip0 = float4(rtWaterRip[0], rtWaterRip[1], rtWaterRip[2], rtWaterRip[3]);
+		cb->waterRip1 = float4(rtWaterRip[4], rtWaterRip[5], rtWaterRip[6], rtWaterRip[7]);
 	}
 
 	// Bind dynamic resources for every RT stage that references them (null lookups are harmless).
@@ -906,6 +1026,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_MISS, n))        v->Set(o);
 		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_CLOSEST_HIT, n)) v->Set(o);
 		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_ANY_HIT, n))     v->Set(o);   // alpha-test any-hit
+		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_INTERSECTION, n)) v->Set(o);  // sprite intersection
 	};
 	setv("g_TLAS",     (IDeviceObject*)tlas.RawPtr());
 	setv("g_Output",   rtOutTex->GetDefaultView(TEXTURE_VIEW_UNORDERED_ACCESS));
@@ -925,6 +1046,16 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	setv("g_Instances",rtInstSRV);
 	setv("g_MatBytes", rtMatSRV ? rtMatSRV : rtInstSRV);   // fallback must be a valid non-null SRV
 	setv("g_DynCol",   rtDynColSRV ? rtDynColSRV : rtNrmSRV);   // fallback must be a valid RAW SRV
+	setv("g_DynPos",   rtDynPosSRV ? rtDynPosSRV : rtNrmSRV);   // sprite quads (ray-facing intersection)
+	setv("g_Cover",    coverSRV ? coverSRV : (coverZeroTex ? coverZeroTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr));   // sprites over the reflector keep the base
+	{   // the water's wave maps for a crossed surface; zero textures (flat) while no water drew this frame
+		ITextureView* zero = coverZeroTex ? coverZeroTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
+		const bool on = rtWaterOcc[1] > 0.5f;
+		setv("g_WaterNrm0",   (on && rtWaterNrm[0]) ? rtWaterNrm[0] : zero);
+		setv("g_WaterNrm1",   (on && rtWaterNrm[1]) ? rtWaterNrm[1] : zero);
+		setv("g_WaterNrm2",   (on && rtWaterNrm[2]) ? rtWaterNrm[2] : zero);
+		setv("g_WaterRipple", (on && rtWaterRipple) ? rtWaterRipple : zero);
+	}
 	{   // bindless albedo array (re-resolve each frame -> animated textures update)
 		ITextureView* white = whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 		IDeviceObject* arr[Impl::kMaxMatTex];
@@ -935,6 +1066,8 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		}
 		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_CLOSEST_HIT, "g_MatTex")) v->SetArray(arr, 0, kMaxMatTex);
 		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_ANY_HIT,     "g_MatTex")) v->SetArray(arr, 0, kMaxMatTex);
+		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_MISS,        "g_MatTex")) v->SetArray(arr, 0, kMaxMatTex);   // a crossed water surface shades (shadow rays) in the miss stage too
+		if (auto* v = rtSRB->GetVariableByName(SHADER_TYPE_RAY_INTERSECTION, "g_MatTex")) v->SetArray(arr, 0, kMaxMatTex);
 	}
 
 	// The SBT accumulates hit-group bindings by instance name, so it must be reset before

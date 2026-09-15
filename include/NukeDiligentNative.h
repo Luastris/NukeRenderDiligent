@@ -58,6 +58,12 @@ struct Frame
 	uint64_t curTarget = 0;      // render-target id bound by beginCamera (per-target ownership)
 	uint64_t camKey = 0;         // per-camera state key (target + camera id): what TAA / AO history is keyed by.
 	                             // Two cameras on one target are two keys - per-camera masks must use this, never curTarget.
+	// The single-sample G-buffer targets (normal/rough/metal colour + depth) the post chain's
+	// screen-space and ray-traced reflections read. A module surface that wants those reflections
+	// writes itself into them after its colour draw (see NukeWater's G-pass).
+	Diligent::ITextureView* gbufRTV = nullptr;
+	Diligent::ITextureView* gbufDSV = nullptr;
+	bool rtReflectActive = false;    // this camera's post chain runs the ray-traced reflections
 
 	// Engine-owned resources (may be null — always fall back).
 	Diligent::ITextureView* sceneDepthSRV = nullptr;    // single-sample prepass depth (gbuf)
@@ -132,9 +138,10 @@ NUKEDLG_API void Trash(Diligent::IDeviceObject* obj);
 // Flush pending sprite batches. Call before unbinding the camera targets for raw
 // compute/offscreen work mid-pass.
 NUKEDLG_API void FlushBatches();
-// A water surface at rest level y is about to draw: flush the sprite quads below it (they are
-// the scene it refracts), keep the ones above it for after the water (it writes depth).
-NUKEDLG_API void FlushBatchesBelow(float y);
+// A water surface at rest level y is about to draw: flush the sprite quads on the far side of it
+// from the camera (the scene it refracts), keep the camera's side for after the water (it writes
+// depth). camBelow = the eye is under the surface.
+NUKEDLG_API void FlushBatchesBelow(float y, bool camBelow);
 
 // Report `tris` drawn by a module pass and invalidate the instancing bind cache; call after
 // raw SetPipelineState/Draw work.
@@ -156,8 +163,15 @@ NUKEDLG_API void SetWaterHooks(const WaterHooks* hooks);
 
 // RT volume attenuation input consumed by the ray shaders: level = world Y, on = 0/1 this
 // frame, fade = 1/opacityDepth, scatter/absorb per channel.
+// band = the surface's wave half-height: points within it are ON the water, not under it.
 NUKEDLG_API void SetRTWaterState(float level, float on, float fade,
-                                 const float scatter[3], const float absorb[3]);
+                                 const float scatter[3], const float absorb[3], float band = 0.0f);
+// The water's wave maps for the ray shaders (this frame's views): the three cascade slope maps
+// + the ripple heightfield, casc = (cascade sizes 0..2, waveScale), rip0/rip1 = the ripple window
+// (origin xz, extent, 1/extent) / (height scale, valid, texel size, detail). A reflection ray that
+// crosses the water from above is shaded as the real surface with these.
+NUKEDLG_API void SetRTWaterMaps(Diligent::ITextureView* n0, Diligent::ITextureView* n1, Diligent::ITextureView* n2,
+                                Diligent::ITextureView* ripple, const float casc[4], const float rip0[4], const float rip1[4]);
 
 // Mesh-cost debug view (Frame.debugView == 1): draw a translucent box at pos/quat/size,
 // colored by `tris` on the cost ramp — the stand-in for a module pass's own geometry.
