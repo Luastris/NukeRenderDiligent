@@ -791,7 +791,8 @@ ITextureView* NukeDiligent::Impl::RunSunShafts(ITextureView* sceneSRV, int w, in
 	// is narrower than a long tap, and the rays came out dashed).
 	pass(1, reach / 32.0f, sceneSRV, m0, ssMask[1], hw, hh);
 	pass(1, reach, sceneSRV, m1, ssMask[0], hw, hh);
-	pass(2, reach, sceneSRV, m0, ssOut, w, h);                                // composite
+	pass(3, reach, sceneSRV, m0, ssMask[1], hw, hh);                          // the dither averaged out
+	pass(2, reach, sceneSRV, m1, ssOut, w, h);                                // composite
 	context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 	return ssOut->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 }

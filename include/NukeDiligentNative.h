@@ -97,6 +97,9 @@ struct Frame
 	Diligent::IBuffer* volCB = nullptr;
 	Diligent::ITextureView* volScatSRV = nullptr;
 	Diligent::IBuffer* fogVolCB = nullptr;   // the local volumes (VOL_REFLECT_VOLUMES). ABI: appended.
+	// The sky map (skymap.hlsli): the whole sky with the clouds as an equirect panorama with mips,
+	// refreshed once a frame; null while none (sky off / pipeline pending). ABI: appended.
+	Diligent::ITextureView* skyMapSRV = nullptr;
 };
 
 // Fill `out` with the current state. Returns false before init / after shutdown.
@@ -164,14 +167,25 @@ NUKEDLG_API void SetWaterHooks(const WaterHooks* hooks);
 // RT volume attenuation input consumed by the ray shaders: level = world Y, on = 0/1 this
 // frame, fade = 1/opacityDepth, scatter/absorb per channel.
 // band = the surface's wave half-height: points within it are ON the water, not under it.
+// infinite = a boundless ocean: below the horizon the sky passes draw the sea (the sky mirrored),
+// not the planet - the mesh's far edge never quite reaches the horizon and the sliver showed.
 NUKEDLG_API void SetRTWaterState(float level, float on, float fade,
-                                 const float scatter[3], const float absorb[3], float band = 0.0f);
+                                 const float scatter[3], const float absorb[3], float band = 0.0f, float infinite = 0.0f);
 // The water's wave maps for the ray shaders (this frame's views): the three cascade slope maps
 // + the ripple heightfield, casc = (cascade sizes 0..2, waveScale), rip0/rip1 = the ripple window
 // (origin xz, extent, 1/extent) / (height scale, valid, texel size, detail). A reflection ray that
 // crosses the water from above is shaded as the real surface with these.
 NUKEDLG_API void SetRTWaterMaps(Diligent::ITextureView* n0, Diligent::ITextureView* n1, Diligent::ITextureView* n2,
                                 Diligent::ITextureView* ripple, const float casc[4], const float rip0[4], const float rip1[4]);
+// The water's photon tile for the ray shaders: a reflection ray from UNDER the water lights what
+// it hits with the same caustics the underwater post paints. cau0 = (tile centre xz, uv scale,
+// strength), cau1 = (sharpness, underwater fog on, tint = Scatter Color alpha, 0). Null tile = no caustics in the trace.
+NUKEDLG_API void SetRTWaterCaustic(Diligent::ITextureView* tile, const float cau0[4], const float cau1[4]);
+
+// Wet the CURRENT camera pass's lens (call from onCameraPost): soakSRV = per-pixel soak per
+// second (R16F, screen-sized), amount = the film's composite strength, drain = seconds the film
+// takes to run off. The renderer owns the film itself (mask, run-off, droplets, composite).
+NUKEDLG_API void LensFilmInject(Diligent::ITextureView* soakSRV, float amount, float drainSeconds);
 
 // Mesh-cost debug view (Frame.debugView == 1): draw a translucent box at pos/quat/size,
 // colored by `tris` on the cost ramp — the stand-in for a module pass's own geometry.

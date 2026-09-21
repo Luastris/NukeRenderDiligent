@@ -317,8 +317,8 @@ void NukeDiligent::setClipboardText(const char* text)
 
 NukeDiligent::Impl* NukeDiligent::nativeImpl = nullptr;
 
-NukeDiligent::NukeDiligent() : m_impl(new Impl()) { nativeImpl = m_impl; }
-NukeDiligent::~NukeDiligent() { if (nativeImpl == m_impl) nativeImpl = nullptr; delete m_impl; }
+NukeDiligent::NukeDiligent() : m_impl(new Impl()) { nativeImpl = m_impl; nukediligent::RegisterSkyOccHook(); }
+NukeDiligent::~NukeDiligent() { nukediligent::UnregisterSkyOccHook(); if (nativeImpl == m_impl) nativeImpl = nullptr; delete m_impl; }
 
 void NukeDiligent::setShaderSource(const char* name, const char* source)
 {
@@ -660,6 +660,11 @@ int NukeDiligent::init(const WindowDesc& desc)
 		// Editor-class dynamic budgets, mirroring the D3D12 branch.
 		EngineCI.DynamicHeapSize = 32u << 20;
 		EngineCI.Features.AsyncShaderCompilation = DEVICE_FEATURE_STATE_OPTIONAL;
+		// GPU pass timings (NukeDiligent_Profile.cpp): a ring of kGpuRing frames x up to 64 passes,
+		// two timestamps each. The default pool is far smaller; once it ran dry (the editor's
+		// selected-camera preview doubles the camera passes) the discarded query asserted at read.
+		EngineCI.QueryPoolSizes[QUERY_TYPE_DURATION]  = (Uint32)(Impl::kGpuRing * 64 * 2 + 64);
+		EngineCI.QueryPoolSizes[QUERY_TYPE_TIMESTAMP] = (Uint32)(Impl::kGpuRing * 64 * 2 + 64);
 		// Unlike D3D12, Vulkan device features must be opted into at device creation.
 		EngineCI.Features.RayTracing = DEVICE_FEATURE_STATE_OPTIONAL;
 		EngineCI.Features.Tessellation = DEVICE_FEATURE_STATE_OPTIONAL;

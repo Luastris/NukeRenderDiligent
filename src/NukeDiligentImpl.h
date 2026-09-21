@@ -107,6 +107,7 @@ extern "C" void  NukeCocoaSetHiddenFromCapture(GLFWwindow* wnd, bool hide);
 #include <memory>
 #include <atomic>
 #include <boost/thread.hpp>                      // background pipeline builder
+#include <boost/function.hpp>                    // world render hook submitter (sky occlusion)
 #include <boost/thread/condition_variable.hpp>
 #include "API/Model/Log.h"   // Log::Uptime — startup-time accounting (PSO/shader creation stamps)
 #include <string>
@@ -416,7 +417,7 @@ struct NukeDiligent::Impl
 	// skips the albedos (normals/roughness only): kOvSlots x (normal, MR, mask2D) + the mask.
 	static const int kOvSlots    = 8;                   // must match Material::kOverlaySlots
 	static const int kOvTexCount = kOvSlots * 4 + 3;    // world SRVs: slots + mask3D + detail + detailNrm
-	static const int kOvGbufCount = kOvSlots * 3 + 2;   // g-buffer SRVs: slots + mask3D + detailNrm
+	static const int kOvGbufCount = kOvSlots * 3 + 4;   // g-buffer SRVs: slots + mask3D + detailNrm + sky occlusion + trails
 	static const std::vector<std::string>& OvTexNames();
 	static const std::vector<std::string>& OvGbufNames();
 
@@ -597,6 +598,29 @@ struct NukeDiligent::Impl
 	ITextureView* cloudCurSRV = nullptr;      // this camera pass's resolved clouds (rgb in-scatter, a transmittance)
 	ITextureView* cloudShadowSRV = nullptr;   // this frame's shadow map (null = none)
 	float cloudShadowOrigin[4] = { 0, 0, 1, 0 };
+	// W4 sky occlusion (NukeDiligent_SkyOcc.cpp): a top-down ortho depth of the opaque world around
+	// the camera, drawn through the shadow path from a world render hook before the camera passes.
+	// world.ps / gbuffer.ps gate from-sky conditions (rain wet, snow, dust) by it. SkyOccCB is
+	// USAGE_DEFAULT (persists across frames: auxiliary worlds draw without the hook).
+	RefCntAutoPtr<ITexture> skyOccDepth;
+	RefCntAutoPtr<IBuffer>  skyOccCB;          // 2 float4: (origin x, z, 1/size, active), (eye Y, near, far - near, bias)
+	ITextureView* skyOccSRV = nullptr;         // null = no capture this frame
+	bool skyOccCBZero = false;                 // the CB already says "off"
+	void RunSkyOcclusion(const boost::function<void()>& submitOpaques);
+	// W5 ground trails (NukeDiligent_Trails.cpp): a camera-following carve map (R8, ping-pong),
+	// realigned by texel shift as the window moves; grounded movers stamp discs (MAX), fresh
+	// fall fills. TrailsCB (consumers) is USAGE_DEFAULT like SkyOccCB.
+	RefCntAutoPtr<ITexture> trailTex[2];
+	int   trailCur = 0; bool trailValid = false; float trailOrigin[2] = { 0, 0 };
+	RefCntAutoPtr<IBuffer>  trailsCB, trailSimCB;
+	RefCntAutoPtr<IPipelineState> trailShiftPSO, trailStampPSO;
+	RefCntAutoPtr<IShaderResourceBinding> trailShiftSRB, trailStampSRB;
+	std::atomic<bool> trailBuilding{false}; bool trailFailed = false, trailsCBZero = false;
+	ITextureView* trailSRV = nullptr;      // null = no map this frame
+	std::vector<float> trailImprints; float trailFill = 0.0f;
+	uint64_t trailClockFrame = ~0ull;
+	void EnsureTrailPipes();
+	void RunTrails();
 	struct CloudState { RefCntAutoPtr<ITexture> march, dist, hist[2], distFull, out; int mw = 0, mh = 0, w = 0, h = 0, cur = 0; bool valid = false; float4x4 prevVP, prevView; uint64_t lastUsed = 0; };
 	std::map<uint64_t, CloudState> cloudStates;   // keyed by curCamKey
 	// the reflection-probe path: the face's march + an in-place blend PSO (sample count / format stamped like the sky)
@@ -624,7 +648,21 @@ struct NukeDiligent::Impl
 	struct AtmoRing { RefCntAutoPtr<IBuffer> staging; int pending = -1; };
 	AtmoRing atmoRing[3]; int atmoRingHead = 0;
 	float atmoSummary[3][4] = {}; bool atmoSummaryValid = false;
-	float skyTopEff[3] = {0, 0, 0}, skyHorEff[3] = {0, 0, 0}, skyGndEff[3] = {0, 0, 0};   // the sky colours the FrameCB / clouds use (the summary when physical)
+	float skyTopEff[3] = {0, 0, 0}, skyHorEff[3] = {0, 0, 0}, skyGndEff[3] = {0, 0, 0};   // the CLEAR sky colours (the physical summary / authored): the clouds are lit by these
+	// The sky map (NukeDiligent_SkyMap.cpp / skymap.hlsli): the whole sky with the clouds as an
+	// equirect panorama with mips, refreshed once a frame after the atmosphere. Its own summary
+	// (readback ring, as the atmosphere's) feeds the FrameCB sky colours (skyTopIbl): an overcast
+	// sky lights the world bright and grey. Reflections / IBL / the water sample the map itself.
+	RefCntAutoPtr<ITexture> skyMapTex, skyCloudTex; ITextureView* skyMapSRV = nullptr; bool skyCloudValid = false;
+	RefCntAutoPtr<IBuffer> skyMapCB, skySumBuf;
+	RefCntAutoPtr<IPipelineState> skyMapPSO; RefCntAutoPtr<IShaderResourceBinding> skyMapSRB;
+	std::atomic<bool> skyMapBuilding{false}; bool skyMapFailed = false;
+	uint64_t skyMapFrame = ~0ull;
+	AtmoRing skyRing[3]; int skyRingHead = 0;
+	float skySummary[3][4] = {}; bool skySummaryValid = false;
+	float skyTopIbl[3] = {0, 0, 0}, skyHorIbl[3] = {0, 0, 0}, skyGndIbl[3] = {0, 0, 0};
+	void EnsureSkyMapPipe();
+	void RunSkyMap();
 	uint64_t atmoMediumHash = 0;
 	int atmoW = 0, atmoH = 0;
 	bool atmoFailed = false; std::atomic<bool> atmoBuilding{false};
@@ -659,6 +697,7 @@ struct NukeDiligent::Impl
 		// Per-draw overlay context snapshot (Surface::PushDrawContext): the material is shared, so
 		// the values set for THIS draw must be restored before the replay.
 		bool      liveSet = false; float liveVal[8], liveChan[8], liveXf[12], liveRes = 0.0f; Texture* liveMask = nullptr;
+		unsigned char liveNoSky = 0;
 	};
 	struct OcclHist { bool visible = true; uint64_t frame = 0; };
 	struct OcclView
@@ -883,6 +922,9 @@ struct NukeDiligent::Impl
 		IShaderResourceVariable*              giIrrVar = nullptr, *giVisVar = nullptr;   // PS DDGI atlases
 		IShaderResourceVariable*              sgiVar = nullptr;    // PS "g_ScreenGI" (screen-space bounce)
 		IShaderResourceVariable*              cloudShVar = nullptr;   // PS "g_CloudShadowMap" (VL3 cloud shadow map)
+		IShaderResourceVariable*              skyOccVar = nullptr;    // PS "g_SkyOccMap" (W4 sky-occlusion capture)
+		IShaderResourceVariable*              trailVar = nullptr;     // PS "g_TrailMap" (W5 ground trails)
+		IShaderResourceVariable*              skyMapVar = nullptr;    // PS "g_SkyMap" (the sky map: IBL / reflection env)
 		IShaderResourceVariable*              atmoSkyVar = nullptr, *atmoTransVar = nullptr;   // PS "g_AtmoSkyView" / "g_AtmoTrans" (physical atmosphere LUTs)
 		IShaderResourceVariable*              mskVar  = nullptr;   // PS "g_MskStamp" (LiveMask stamp)
 		IShaderResourceVariable*              shadowVar = nullptr;// PS "g_Shadow"      (dynamic)
@@ -900,13 +942,13 @@ struct NukeDiligent::Impl
 		                        *shadowVarI = nullptr, *cubeVarI = nullptr, *probeVarI = nullptr, *tlasVarI = nullptr,
 		                        *rtInstVarI = nullptr, *rtDynPosVarI = nullptr;
 		IShaderResourceVariable *ovVarI[kOvTexCount] = {};
-		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr, *mskVarI = nullptr, *saoVarI = nullptr, *giIrrVarI = nullptr, *giVisVarI = nullptr, *sgiVarI = nullptr, *cloudShVarI = nullptr, *atmoSkyVarI = nullptr, *atmoTransVarI = nullptr;
+		IShaderResourceVariable *flowVarI = nullptr, *refrVarI = nullptr, *mskVarI = nullptr, *saoVarI = nullptr, *giIrrVarI = nullptr, *giVisVarI = nullptr, *sgiVarI = nullptr, *cloudShVarI = nullptr, *atmoSkyVarI = nullptr, *atmoTransVarI = nullptr, *skyOccVarI = nullptr, *trailVarI = nullptr, *skyMapVarI = nullptr;
 		// Redundancy gates: object each DYNAMIC variable currently holds — Diligent rewrites the
 		// descriptor cache on EVERY Set() of a dynamic var, so only Set() on an actual change.
 		// [0..12] = tex,norm,mr,ao,em,spec,shadow,cube,probe,tlas,rtinst,wipe,height;
-		// [13..] = overlay-slot maps (OvTexNames() order), then flow, scene-refraction, mask stamp, screen AO, GI irradiance, GI visibility, screen GI, cloud shadow.
-		IDeviceObject* lastBind[13 + kOvTexCount + 11]  = {};
-		IDeviceObject* lastBindI[13 + kOvTexCount + 11] = {};
+		// [13..] = overlay-slot maps (OvTexNames() order), then flow, scene-refraction, mask stamp, screen AO, GI irradiance, GI visibility, screen GI, cloud shadow, atmo LUTs, dyn pos, sky occlusion.
+		IDeviceObject* lastBind[13 + kOvTexCount + 14]  = {};
+		IDeviceObject* lastBindI[13 + kOvTexCount + 14] = {};
 		std::string vsSrc, psSrc, dbg;   // kept so the pipeline can be rebuilt (e.g. on MSAA change)
 		std::string hsSrc, dsSrc;        // CUSTOM tess stages (empty = shared world.hs/world.ds)
 		bool tessCustom = false;         // the shader SHIPPED hs/ds (builder copies resolve the shared pair into hsSrc)
@@ -1092,6 +1134,7 @@ struct NukeDiligent::Impl
 	// RT water attenuation, fed by the native water hooks (NukeDiligent_Native.cpp), consumed by
 	// the ray shaders' CB fill (RT.cpp).
 	float rtWaterOcc[4] = { 0, 0, 0.25f, 0 };   // level, on (this frame), 1/opacityDepth, 0
+	bool  rtWaterInfinite = false;              // a boundless ocean: the sky passes draw the sea below the horizon
 	float rtWaterCol[3] = { 0.02f, 0.10f, 0.09f };
 	float rtWaterAbs[3] = { 0.45f, 0.09f, 0.06f };
 	// The water's wave maps for the ray shaders (SetRTWaterMaps): raw views the water module
@@ -1100,6 +1143,31 @@ struct NukeDiligent::Impl
 	ITextureView* rtWaterRipple = nullptr;
 	float rtWaterCasc[4] = { 252.0f, 41.3f, 6.7f, 1.0f };
 	float rtWaterRip[8] = { 0, 0, 96.0f, 1.0f / 96.0f, 1.0f, 0.0f, 96.0f / 512.0f, 1.0f };
+	ITextureView* rtWaterCaustic = nullptr;     // the photon tile (SetRTWaterCaustic): a submerged ray's caustics
+	float rtWaterCau[8] = { 0, 0, 2.0f / 96.0f, 0.0f, 1.6f, 0, 0, 0 };   // centre xz, uv scale, strength | sharpness
+
+	// --- Lens film (NukeDiligent_Lens.cpp): the wet camera lens, per camera, two sources ---
+	struct LensCam
+	{
+		RefCntAutoPtr<ITexture> tex[2], out;   // mask ping-pong (R16F) + the composite target
+		int      cur = 0;
+		float    alive = 0.0f;                 // seconds of pass life left once the sources stop
+		float    amount = 0.0f, drain = 3.0f;  // the last source's composite strength / run-off time
+		double   lastTime = -1.0;
+		uint64_t lastUsed = 0;
+	};
+	std::unordered_map<uint64_t, LensCam> lensCams;
+	RefCntAutoPtr<IPipelineState>         lensFilmPSO, lensDropsPSO;
+	RefCntAutoPtr<IShaderResourceBinding> lensFilmSRB, lensDropsSRB;
+	RefCntAutoPtr<IBuffer>                lensCB;
+	std::atomic<bool>                     lensBuilding{false};
+	bool                                  lensFailed = false;
+	double   lensClock = 0.0; uint64_t lensClockFrame = ~0ull;   // game clock, accumulated once per frame
+	ITextureView* lensInjectSRV = nullptr; float lensInjectAmount = 0.f, lensInjectDrain = 3.f; bool lensInjectOn = false;   // this camera pass's soak map (a module's)
+	float    lensRainRate = 0.f, lensRainAmount = 0.f, lensRainDrain = 3.f; uint64_t lensRainStamp = ~0ull;   // iRender::setLensRain, per frame
+	void EnsureLensPipes();
+	void LensInject(ITextureView* soakSRV, float amount, float drainSeconds);
+	ITextureView* RunLensFilm(ITextureView* sceneSRV);   // null = nothing to do this pass
 	// Generic ortho bottom-depth capture (begin/end/fetchWaterBottom, NukeDiligent_Native.cpp).
 	RefCntAutoPtr<ITexture> capDepth, capStaging;
 	int   capPending = -1;
@@ -1548,3 +1616,10 @@ struct NukeDiligent::Impl
 	void CreateWorldPipeline();
 	RT   MakeRT(int w, int h);
 };
+
+namespace nukediligent {
+// The sky-occlusion capture rides a world render hook (registered with the engine for the
+// renderer's lifetime): the World submits every opaque mesh into the capture's depth target.
+void RegisterSkyOccHook();
+void UnregisterSkyOccHook();
+}

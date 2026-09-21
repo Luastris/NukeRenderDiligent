@@ -916,6 +916,8 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterNrm1", wrapS},
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterNrm2", wrapS},
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterRipple", samp},
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterCaustic", samp},   // the water's photon tile (a submerged ray's caustics)
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_SkyMap", wrapS},   // the sky map (escaped rays, the roughest env)
 	};
 	ShaderResourceVariableDesc vars[] = {
 		{SHADER_TYPE_ALL_RAY_TRACING, "RTRefCB", SHADER_RESOURCE_VARIABLE_TYPE_STATIC},
@@ -936,7 +938,7 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 	};
 	ci.PSODesc.ResourceLayout.DefaultVariableType = SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC;   // TLAS/gbuffer/bindless/output
 	ci.PSODesc.ResourceLayout.Variables           = vars; ci.PSODesc.ResourceLayout.NumVariables = (Uint32)(sizeof(vars) / sizeof(vars[0]));
-	ci.PSODesc.ResourceLayout.ImmutableSamplers   = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = 8;
+	ci.PSODesc.ResourceLayout.ImmutableSamplers   = imms; ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)(sizeof(imms) / sizeof(imms[0]));
 
 	device->CreateRayTracingPipelineState(ci, &rtPSO);
 	if (!rtPSO) { cout << "[NukeDiligent]\tRT pipeline PSO build failed" << endl; return false; }
@@ -999,10 +1001,10 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	if (!rtOutTex) return;
 
 	{   // RTRefCB: clip->view + view->world + camera + (intensity, maxDist, maxDepth) + water
-		struct CB { float4x4 ip, iv; float4 cam; float4 prm; float4 waterOcc; float4 waterCol; float4 waterAbs; float4 waterCasc; float4 waterRip0; float4 waterRip1; };
+		struct CB { float4x4 ip, iv; float4 cam; float4 prm; float4 waterOcc; float4 waterCol; float4 waterAbs; float4 waterCasc; float4 waterRip0; float4 waterRip1; float4 waterCau0; float4 waterCau1; };
 		MapHelper<CB> cb(context, rtRefCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		cb->ip  = curProjNoJitter.Inverse(); cb->iv = curView.Inverse();   // unjittered: must match the gbuffer depth
-		cb->cam = float4(curCamPos[0], curCamPos[1], curCamPos[2], 1.0f);
+		cb->cam = float4(curCamPos[0], curCamPos[1], curCamPos[2], (float)std::fmod(lensClock, 4096.0));   // w = the game clock (the water's capillary scroll)
 		float intensity = rtCfgIntensity;
 		float maxDist   = rtCfgMaxDist;
 		float maxDepth  = (float)rtCfgBounces;
@@ -1017,6 +1019,9 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		cb->waterCasc = float4(rtWaterCasc[0], rtWaterCasc[1], rtWaterCasc[2], rtWaterCasc[3]);   // the wave maps (SetRTWaterMaps)
 		cb->waterRip0 = float4(rtWaterRip[0], rtWaterRip[1], rtWaterRip[2], rtWaterRip[3]);
 		cb->waterRip1 = float4(rtWaterRip[4], rtWaterRip[5], rtWaterRip[6], rtWaterRip[7]);
+		const bool cauOn = rtWaterOcc[1] > 0.5f && rtWaterCaustic != nullptr;   // the photon tile (SetRTWaterCaustic)
+		cb->waterCau0 = float4(rtWaterCau[0], rtWaterCau[1], rtWaterCau[2], cauOn ? rtWaterCau[3] : 0.0f);
+		cb->waterCau1 = float4(rtWaterCau[4], rtWaterCau[5], rtWaterCau[6], rtWaterCau[7]);
 	}
 
 	// Bind dynamic resources for every RT stage that references them (null lookups are harmless).
@@ -1040,6 +1045,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		setv("g_GIVis", giVisSRV ? giVisSRV : white);
 	}
 	setv("g_VolFogScat", VolScatSRV());   // this pass's froxel grid (the reflected leg's fog), or the clear stand-in
+	setv("g_SkyMap",   skyMapSRV ? skyMapSRV : whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE));   // g_Misc.z says whether it is live
 	setv("g_AllNrm",   rtNrmSRV);
 	setv("g_AllUV",    rtUVSRV ? rtUVSRV : rtNrmSRV);
 	setv("g_AllPos",   rtPosSRV ? rtPosSRV : rtNrmSRV);
@@ -1055,6 +1061,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		setv("g_WaterNrm1",   (on && rtWaterNrm[1]) ? rtWaterNrm[1] : zero);
 		setv("g_WaterNrm2",   (on && rtWaterNrm[2]) ? rtWaterNrm[2] : zero);
 		setv("g_WaterRipple", (on && rtWaterRipple) ? rtWaterRipple : zero);
+		setv("g_WaterCaustic", (on && rtWaterCaustic) ? rtWaterCaustic : zero);
 	}
 	{   // bindless albedo array (re-resolve each frame -> animated textures update)
 		ITextureView* white = whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);

@@ -27,6 +27,8 @@ const std::vector<std::string>& NukeDiligent::Impl::OvGbufNames()
 			for (int k = 0; k < 3; ++k) v.push_back("g_Ov" + std::to_string(s) + kind[k]);
 		v.push_back("g_Mask3D");
 		v.push_back("g_DetailNrm");
+		v.push_back("g_SkyOccMap");   // W4 sky-occlusion capture (Load-only)
+		v.push_back("g_TrailMap");    // W5 ground trails (Load-only)
 		return v;
 	}();
 	return names;
@@ -133,6 +135,18 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 	fcbd.Name = "World FrameCB"; fcbd.Size = sizeof(FrameCBData); fcbd.Usage = USAGE_DYNAMIC;
 	fcbd.BindFlags = BIND_UNIFORM_BUFFER; fcbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(fcbd, nullptr, &worldFrameCB);
+
+	// Sky-occlusion params (skyocc.hlsli SkyOccCB): USAGE_DEFAULT, starts "off".
+	{
+		BufferDesc sd; sd.Name = "SkyOccCB"; sd.Size = 32; sd.Usage = USAGE_DEFAULT; sd.BindFlags = BIND_UNIFORM_BUFFER;
+		const float zero[8] = {}; BufferData bd; bd.pData = zero; bd.DataSize = 32;
+		device->CreateBuffer(sd, &bd, &skyOccCB);
+		skyOccCBZero = true;
+		BufferDesc tdsc; tdsc.Name = "TrailsCB"; tdsc.Size = 16; tdsc.Usage = USAGE_DEFAULT; tdsc.BindFlags = BIND_UNIFORM_BUFFER;
+		BufferData tbd; tbd.pData = zero; tbd.DataSize = 16;
+		device->CreateBuffer(tdsc, &tbd, &trailsCB);
+		trailsCBZero = true;
+	}
 
 	// Bend CB for the instanced vertex shaders: 59 float4s (g_WindV, g_WindT, g_WindP, g_Push[8], g_Vol[48]).
 	BufferDesc bcbd;
@@ -495,6 +509,9 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	vars.push_back({SHADER_TYPE_PIXEL, "g_GIVis",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	vars.push_back({SHADER_TYPE_PIXEL, "g_ScreenGI",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // Load-only: no sampler
 	vars.push_back({SHADER_TYPE_PIXEL, "g_CloudShadowMap", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // VL3 cloud shadow map, Load-only
+	vars.push_back({SHADER_TYPE_PIXEL, "g_SkyOccMap",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // W4 sky-occlusion capture, Load-only
+	vars.push_back({SHADER_TYPE_PIXEL, "g_TrailMap",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // W5 ground trails, Load-only
+	vars.push_back({SHADER_TYPE_PIXEL, "g_SkyMap",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // the sky map (sampled with g_GIIrr_sampler)
 	vars.push_back({SHADER_TYPE_PIXEL, "g_AtmoSkyView", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});   // physical atmosphere LUTs (sampled with g_GIIrr_sampler)
 	vars.push_back({SHADER_TYPE_PIXEL, "g_AtmoTrans",   SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC});
 	// Generic per-layer maps: any PS SRV named g_LayerN*/g_LayerMR*/g_LayerH* becomes a DYNAMIC
@@ -545,6 +562,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 		if (auto* b = pso->GetStaticVariableByName(SHADER_TYPE_VERTEX, "BendCB"))  b->Set(bendCB);   // instanced variants only (7.4)
 		if (auto* d = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "DrawFlagsCB")) d->Set(drawFlagsCB);   // receiveShadows etc.
 		if (auto* g = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "GICB"))    g->Set(giCB);          // DDGI volumes
+		if (auto* k = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "SkyOccCB")) k->Set(skyOccCB);    // W4 sky occlusion
+		if (auto* k = pso->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "TrailsCB")) k->Set(trailsCB);    // W5 ground trails
 	};
 
 	// Rebuild path: release first — Diligent asserts on Create over a non-null ref.
@@ -727,9 +746,15 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 					if (auto* f = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_HULL,   "FrameCB")) f->Set(worldFrameCB);
 					if (auto* m = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_DOMAIN, "MatCB"))   m->Set(worldMatCB);
 					if (auto* c = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_DOMAIN, "CB"))      c->Set(worldCB);
+					if (auto* k = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_DOMAIN, "SkyOccCB")) k->Set(skyOccCB);   // W5 accumulation (DS)
+					if (auto* k = wp.psoTess->GetStaticVariableByName(SHADER_TYPE_DOMAIN, "TrailsCB")) k->Set(trailsCB);
 					wp.psoTess->CreateShaderResourceBinding(&wp.srbTess, true);
 					// Vulkan: cbuffers may reflect MUTABLE — bind through the SRB as well.
 					if (auto* d = wp.srbTess->GetVariableByName(SHADER_TYPE_PIXEL,  "DrawFlagsCB")) d->Set(drawFlagsCB);
+					if (auto* k = wp.srbTess->GetVariableByName(SHADER_TYPE_PIXEL,  "SkyOccCB")) k->Set(skyOccCB);
+					if (auto* k = wp.srbTess->GetVariableByName(SHADER_TYPE_PIXEL,  "TrailsCB")) k->Set(trailsCB);
+					if (auto* k = wp.srbTess->GetVariableByName(SHADER_TYPE_DOMAIN, "SkyOccCB")) k->Set(skyOccCB);
+					if (auto* k = wp.srbTess->GetVariableByName(SHADER_TYPE_DOMAIN, "TrailsCB")) k->Set(trailsCB);
 					if (auto* m = wp.srbTess->GetVariableByName(SHADER_TYPE_HULL,   "MatCB"))   m->Set(worldMatCB);
 					if (auto* c = wp.srbTess->GetVariableByName(SHADER_TYPE_HULL,   "CB"))      c->Set(worldCB);
 					if (auto* f = wp.srbTess->GetVariableByName(SHADER_TYPE_HULL,   "FrameCB")) f->Set(worldFrameCB);
@@ -745,6 +770,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.pso->CreateShaderResourceBinding(&wp.srb, true);
 	// Vulkan: cbuffers may reflect as MUTABLE, so bind through the SRB as well as the statics.
 	if (auto* d = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "DrawFlagsCB")) d->Set(drawFlagsCB);
+	if (auto* k = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "SkyOccCB")) k->Set(skyOccCB);
+	if (auto* k = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "TrailsCB")) k->Set(trailsCB);
 	wp.texVar  = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 	wp.normVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
 	wp.mrVar   = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
@@ -769,6 +796,9 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 	wp.giVisVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_GIVis");
 	wp.sgiVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ScreenGI");
 	wp.cloudShVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_CloudShadowMap");
+	wp.skyOccVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_SkyOccMap");
+	wp.trailVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_TrailMap");
+	wp.skyMapVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_SkyMap");
 	wp.atmoSkyVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_AtmoSkyView");
 	wp.atmoTransVar = wp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_AtmoTrans");
 	wp.extraVars.clear();
@@ -855,6 +885,8 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				// the whole set — bind BendCB through the SRB as well as the statics.
 				if (auto* b = wp.srbInst->GetVariableByName(SHADER_TYPE_VERTEX, "BendCB")) b->Set(bendCB);
 				if (auto* d = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "DrawFlagsCB")) d->Set(drawFlagsCB);
+				if (auto* k = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "SkyOccCB")) k->Set(skyOccCB);
+				if (auto* k = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "TrailsCB")) k->Set(trailsCB);
 				wp.texVarI  = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
 				wp.normVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
 				wp.mrVarI   = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
@@ -879,6 +911,9 @@ bool NukeDiligent::Impl::BuildWorldPipe(WorldPipe& wp, const std::string& vsSrc,
 				wp.giVisVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_GIVis");
 				wp.sgiVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_ScreenGI");
 				wp.cloudShVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_CloudShadowMap");
+				wp.skyOccVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_SkyOccMap");
+				wp.trailVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_TrailMap");
+				wp.skyMapVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_SkyMap");
 				wp.atmoSkyVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_AtmoSkyView");
 				wp.atmoTransVarI = wp.srbInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_AtmoTrans");
 				}

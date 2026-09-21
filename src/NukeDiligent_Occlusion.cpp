@@ -389,6 +389,7 @@ void NukeDiligent::endOpaque()
 				d.mat->liveDrawSet = true;
 				memcpy(d.mat->liveDrawValue, d.liveVal, sizeof(d.liveVal)); memcpy(d.mat->liveDrawMaskChan, d.liveChan, sizeof(d.liveChan));
 				memcpy(d.mat->liveDrawMaskXform, d.liveXf, sizeof(d.liveXf)); d.mat->liveDrawMaskRes = d.liveRes; d.mat->liveDrawMask3D = d.liveMask;
+				d.mat->liveDrawNoSky = d.liveNoSky;
 			}
 			im.occlReplay = mode == 1 ? (int)i : -1;
 			if (d.instanced) renderObjectInstanced(d.mesh, d.mat, d.instBuf, d.first, d.count);

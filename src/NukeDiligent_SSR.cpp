@@ -98,7 +98,11 @@ static void FillGBufOverlays(Diligent::Uint8* p, nuke::Material* mat)
 		for (int sl = 0; sl < Impl::kOvSlots; ++sl)
 		{
 			if (sp.name == kOvV[sl] && mat->liveDrawValue[sl] >= 0.0f) d[0] = mat->liveDrawValue[sl];
-			if (sp.name == kOvP[sl]) d[2] = mat->liveDrawMaskChan[sl];
+			if (sp.name == kOvP[sl])
+			{
+				d[2] = mat->liveDrawMaskChan[sl];
+				if (mat->liveDrawNoSky & (1u << sl)) d[3] = (float)((unsigned)(d[3] + 0.5f) & ~32u);   // explicit override: no sky gate
+			}
 		}
 		if (mat->liveDrawMask3D)
 		{
@@ -165,7 +169,11 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 	if (!gbufPSO) { cout << "[NukeDiligent]\tgbuffer PSO build failed" << endl; return false; }
 	if (auto* c = gbufPSO->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))    c->Set(worldCB);
 	if (auto* m = gbufPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB")) m->Set(worldMatCB);
+	if (auto* k = gbufPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "SkyOccCB")) k->Set(skyOccCB);
+	if (auto* k = gbufPSO->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "TrailsCB")) k->Set(trailsCB);
 	gbufPSO->CreateShaderResourceBinding(&gbufSRB, true);
+	if (auto* k = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "SkyOccCB")) k->Set(skyOccCB);   // Vulkan: cbuffers may reflect MUTABLE
+	if (auto* k = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "TrailsCB")) k->Set(trailsCB);
 	gbufMRVar  = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
 	gbufNrmVar = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
 	gbufTexVar  = gbufSRB->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
@@ -202,8 +210,12 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 			{
 				if (auto* c = gbufPSOInst->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))    c->Set(worldCB);
 				if (auto* m = gbufPSOInst->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB")) m->Set(worldMatCB);
+				if (auto* k = gbufPSOInst->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "SkyOccCB")) k->Set(skyOccCB);
+				if (auto* k = gbufPSOInst->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "TrailsCB")) k->Set(trailsCB);
 				if (auto* b = gbufPSOInst->GetStaticVariableByName(SHADER_TYPE_VERTEX, "BendCB")) b->Set(bendCB);   // depth/velocity must bend like the lit pass (7.4)
 				gbufPSOInst->CreateShaderResourceBinding(&gbufSRBInst, true);
+				if (auto* k = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "SkyOccCB")) k->Set(skyOccCB);   // Vulkan: cbuffers may reflect MUTABLE
+				if (auto* k = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "TrailsCB")) k->Set(trailsCB);
 				// Vulkan: cbuffers may reflect MUTABLE — bind BendCB via the SRB too.
 				if (auto* b = gbufSRBInst->GetVariableByName(SHADER_TYPE_VERTEX, "BendCB")) b->Set(bendCB);
 				gbufMRVarInst  = gbufSRBInst->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
@@ -240,7 +252,11 @@ bool NukeDiligent::Impl::BuildGBufferPipe()
 			{
 				if (auto* c = gbufPSOSkin->GetStaticVariableByName(SHADER_TYPE_VERTEX, "CB"))    c->Set(worldCB);
 				if (auto* m = gbufPSOSkin->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "MatCB")) m->Set(worldMatCB);
+				if (auto* k = gbufPSOSkin->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "SkyOccCB")) k->Set(skyOccCB);
+				if (auto* k = gbufPSOSkin->GetStaticVariableByName(SHADER_TYPE_PIXEL,  "TrailsCB")) k->Set(trailsCB);
 				gbufPSOSkin->CreateShaderResourceBinding(&gbufSRBSkin, true);
+				if (auto* k = gbufSRBSkin->GetVariableByName(SHADER_TYPE_PIXEL, "SkyOccCB")) k->Set(skyOccCB);   // Vulkan: cbuffers may reflect MUTABLE
+				if (auto* k = gbufSRBSkin->GetVariableByName(SHADER_TYPE_PIXEL, "TrailsCB")) k->Set(trailsCB);
 				gbufMRVarSkin  = gbufSRBSkin->GetVariableByName(SHADER_TYPE_PIXEL, "g_MetalRough");
 				gbufNrmVarSkin = gbufSRBSkin->GetVariableByName(SHADER_TYPE_PIXEL, "g_Normal");
 				gbufTexVarSkin  = gbufSRBSkin->GetVariableByName(SHADER_TYPE_PIXEL, "g_Tex");
@@ -496,6 +512,8 @@ void NukeDiligent::RenderGBufferRange(Mesh* mesh, Material* mat, const float pos
 			}
 			if (mat->liveDrawSet && mat->liveDrawMask3D) ovsrv[Impl::kOvSlots * 3] = m_impl->GetTexSRV(mat->liveDrawMask3D);
 			if (mat->detailNrm) ovsrv[Impl::kOvSlots * 3 + 1] = m_impl->GetTexSRV(mat->detailNrm);
+			ovsrv[Impl::kOvSlots * 3 + 2] = m_impl->skyOccSRV;   // W4 sky occlusion (white = none)
+			ovsrv[Impl::kOvSlots * 3 + 3] = m_impl->trailSRV;    // W5 ground trails (white = none; g_Trail.w gates)
 		}
 		for (int k = 0; k < Impl::kOvGbufCount; ++k)
 		{
@@ -611,6 +629,8 @@ void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t in
 			}
 			if (mat->liveDrawSet && mat->liveDrawMask3D) ovsrv[Impl::kOvSlots * 3] = m_impl->GetTexSRV(mat->liveDrawMask3D);
 			if (mat->detailNrm) ovsrv[Impl::kOvSlots * 3 + 1] = m_impl->GetTexSRV(mat->detailNrm);
+			ovsrv[Impl::kOvSlots * 3 + 2] = m_impl->skyOccSRV;   // W4 sky occlusion (white = none)
+			ovsrv[Impl::kOvSlots * 3 + 3] = m_impl->trailSRV;    // W5 ground trails (white = none; g_Trail.w gates)
 		}
 		for (int k = 0; k < Impl::kOvGbufCount; ++k)
 		{

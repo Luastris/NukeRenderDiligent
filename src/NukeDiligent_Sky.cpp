@@ -82,7 +82,9 @@ void NukeDiligent::Impl::DrawSky()
 		cb->invVP = invVP;
 		cb->camPos[0] = curCamPos[0]; cb->camPos[1] = curCamPos[1]; cb->camPos[2] = curCamPos[2]; cb->camPos[3] = physical ? 2.0f : 1.0f;
 		for (int k = 0; k < 3; ++k) { cb->top[k] = sky.top[k]; cb->horizon[k] = sky.horizon[k]; cb->ground[k] = sky.ground[k]; cb->sunDir[k] = sky.sunDir[k]; cb->sunCol[k] = sky.sunColor[k]; cb->moonDir[k] = sky.moonDir[k]; }
-		cb->horizon[3] = cb->ground[3] = cb->moonDir[3] = 1;
+		cb->horizon[3] = (rtWaterOcc[1] > 0.5f && rtWaterInfinite) ? 1.0f : 0.0f;   // a boundless ocean is live
+		cb->moonDir[3] = rtWaterOcc[0];                                             // its level
+		cb->ground[3] = (sky.whitePoint > 1e-3f) ? sky.whitePoint : 1.0f;   // the LDR tonemap white point (physical sky)
 		cb->top[3] = sky.eclipse;   // the eclipsing moon's offset (sun radii; >= 1000 = none)
 		cb->sunDir[3] = std::max(sky.sunSize, 0.0005f); cb->sunCol[3] = std::max(sky.sunGlow, 0.0f);   // disc radius (radians), glow strength
 		cb->params[0] = sky.skyIntensity; cb->params[1] = sky.sunIntensity;

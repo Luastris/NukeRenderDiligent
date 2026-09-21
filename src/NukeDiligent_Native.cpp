@@ -53,6 +53,7 @@ bool GetFrame(Frame& out)
 	out.debugView = d->debugView;
 	out.giCB = d->giCB; out.giIrrSRV = d->giIrrSRV; out.giVisSRV = d->giVisSRV;
 	out.volCB = d->volCB; out.volScatSRV = d->VolScatSRV(); out.fogVolCB = d->fogVolCB;
+	out.skyMapSRV = d->skyMapSRV;
 	return true;
 }
 
@@ -150,11 +151,12 @@ void SetWaterHooks(const WaterHooks* hooks)
 	else       g_hooks = WaterHooks();
 }
 
-void SetRTWaterState(float level, float on, float fade, const float scatter[3], const float absorb[3], float band)
+void SetRTWaterState(float level, float on, float fade, const float scatter[3], const float absorb[3], float band, float infinite)
 {
 	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;
 	if (!d) return;
 	d->rtWaterOcc[0] = level; d->rtWaterOcc[1] = on; d->rtWaterOcc[2] = fade; d->rtWaterOcc[3] = band;
+	d->rtWaterInfinite = on > 0.5f && infinite > 0.5f;
 	if (scatter) memcpy(d->rtWaterCol, scatter, sizeof(float) * 3);
 	if (absorb)  memcpy(d->rtWaterAbs, absorb, sizeof(float) * 3);
 }
@@ -168,6 +170,20 @@ void SetRTWaterMaps(ITextureView* n0, ITextureView* n1, ITextureView* n2, ITextu
 	if (casc) memcpy(d->rtWaterCasc, casc, sizeof(float) * 4);
 	if (rip0) memcpy(d->rtWaterRip, rip0, sizeof(float) * 4);
 	if (rip1) memcpy(d->rtWaterRip + 4, rip1, sizeof(float) * 4);
+}
+
+void SetRTWaterCaustic(ITextureView* tile, const float cau0[4], const float cau1[4])
+{
+	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;
+	if (!d) return;
+	d->rtWaterCaustic = tile;
+	if (cau0) memcpy(d->rtWaterCau, cau0, sizeof(float) * 4);
+	if (cau1) memcpy(d->rtWaterCau + 4, cau1, sizeof(float) * 4);
+}
+
+void LensFilmInject(ITextureView* soakSRV, float amount, float drainSeconds)
+{
+	if (NukeDiligent::Impl* d = NukeDiligent::nativeImpl) d->LensInject(soakSRV, amount, drainSeconds);
 }
 
 void DrawCostProxy(const float pos[3], const float quat[4], const float size[3], double tris)

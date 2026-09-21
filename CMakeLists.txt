@@ -171,6 +171,10 @@ add_library(NukeRenderDiligent SHARED
     src/NukeDiligent_SSGI.cpp
     src/NukeDiligent_Vol.cpp
     src/NukeDiligent_Clouds.cpp
+    src/NukeDiligent_Lens.cpp
+    src/NukeDiligent_SkyOcc.cpp
+    src/NukeDiligent_Trails.cpp
+    src/NukeDiligent_SkyMap.cpp
     src/NukeDiligent_Atmo.cpp
     src/NukeDiligent_Post.cpp
     src/NukeDiligent_UI.cpp

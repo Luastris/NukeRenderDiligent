@@ -23,9 +23,11 @@ bool NukeDiligent::Impl::BuildAOPipes()
 	// RT-AO traces inline (RayQuery): DXC at SM6.5 + RT_ENABLED like the world PS; the other
 	// methods compile the same way on those devices, FXC/SM5 elsewhere (method 5 -> GTAO).
 	ShaderMacro rtMacro[] = {{"RT_ENABLED", "1"}};
+	auto sf = ShaderFactory();   // ao.ps includes rt_inst.hlsli / rt_sprite.hlsli under RT_ENABLED (held for the compiles below)
 	auto build = [&](const char* name, const string& ps, const vector<pair<const char*, bool>>& texs, bool tlas, int nrt, PostPipe& out) -> bool
 	{
 		ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+		sci.pShaderSourceStreamFactory = sf;
 		if (rtSupported)
 		{
 			sci.ShaderCompiler = SHADER_COMPILER_DXC;

@@ -187,6 +187,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 				d.liveSet = true;
 				memcpy(d.liveVal, mat->liveDrawValue, sizeof(d.liveVal)); memcpy(d.liveChan, mat->liveDrawMaskChan, sizeof(d.liveChan));
 				memcpy(d.liveXf, mat->liveDrawMaskXform, sizeof(d.liveXf)); d.liveRes = mat->liveDrawMaskRes; d.liveMask = mat->liveDrawMask3D;
+				d.liveNoSky = mat->liveDrawNoSky;
 				mat->liveDrawSet = false;   // consumed by the record, as a real draw would
 			}
 			m_impl->occlDeferred.push_back(d);
@@ -271,7 +272,8 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	// enough that the distance-faded factor exceeds 1 (far away the plain PSO takes over and
 	// the DS displacement fades to zero, so the handover is seam-free).
 	float tessF = 0.0f;
-	if (wp.psoTess && wp.srbTess && mat && mat->liveSurface.height && mat->liveSurface.dispScale > 0.0f
+	if (wp.psoTess && wp.srbTess && mat
+	    && ((mat->liveSurface.height && mat->liveSurface.dispScale > 0.0f) || mat->liveStateDisp > 0.0f)   // W5: an accumulating state is real depth
 	    && (mat->blendMode == 0 || mat->blendMode == 3) && !m_impl->wireframe)
 	{
 		const float4x4 inv = m_impl->curView.Inverse();
@@ -398,6 +400,9 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	bindIf(wp.giVisVar, m_impl->giVisSRV ? m_impl->giVisSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 5]);
 	bindIf(wp.sgiVar, m_impl->screenGISRV ? m_impl->screenGISRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 6]);
 	bindIf(wp.cloudShVar, m_impl->cloudShadowSRV ? m_impl->cloudShadowSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 7]);
+	bindIf(wp.skyOccVar, m_impl->skyOccSRV ? m_impl->skyOccSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 11]);
+	bindIf(wp.trailVar, m_impl->trailSRV ? m_impl->trailSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 12]);
+	bindIf(wp.skyMapVar, m_impl->skyMapSRV ? m_impl->skyMapSRV : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 13]);
 	{
 		ITextureView* asv = m_impl->AtmoSkyViewSRV(); ITextureView* atr = m_impl->AtmoTransSRV();
 		bindIf(wp.atmoSkyVar, asv ? asv : whiteSRV, wp.lastBind[13 + Impl::kOvTexCount + 8]);
@@ -489,6 +494,12 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		TP(SHADER_TYPE_PIXEL, "g_SceneRefr", m_impl->refrSRV ? (IDeviceObject*)m_impl->refrSRV : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_ScreenAO",  m_impl->screenAOSRV ? (IDeviceObject*)m_impl->screenAOSRV : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_CloudShadowMap", m_impl->cloudShadowSRV ? (IDeviceObject*)m_impl->cloudShadowSRV : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_SkyOccMap", m_impl->skyOccSRV ? (IDeviceObject*)m_impl->skyOccSRV : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_TrailMap",  m_impl->trailSRV ? (IDeviceObject*)m_impl->trailSRV : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_PIXEL, "g_SkyMap",    m_impl->skyMapSRV ? (IDeviceObject*)m_impl->skyMapSRV : (IDeviceObject*)whiteSRV);
+		// The domain stage's W5 maps (accumulation depth under the sky gate, trail carve).
+		TP(SHADER_TYPE_DOMAIN, "g_SkyOccMap", m_impl->skyOccSRV ? (IDeviceObject*)m_impl->skyOccSRV : (IDeviceObject*)whiteSRV);
+		TP(SHADER_TYPE_DOMAIN, "g_TrailMap",  m_impl->trailSRV ? (IDeviceObject*)m_impl->trailSRV : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_AtmoSkyView", m_impl->AtmoSkyViewSRV() ? (IDeviceObject*)m_impl->AtmoSkyViewSRV() : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_AtmoTrans",   m_impl->AtmoTransSRV() ? (IDeviceObject*)m_impl->AtmoTransSRV() : (IDeviceObject*)whiteSRV);
 		TP(SHADER_TYPE_PIXEL, "g_GIIrr",     m_impl->giIrrSRV ? (IDeviceObject*)m_impl->giIrrSRV : (IDeviceObject*)whiteSRV);
@@ -736,8 +747,8 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 		fb->shadowParams[1] = (shadowNormalBias > nof) ? shadowNormalBias : nof;
 	}
 	fb->shadowParams[2] = (1.0f / (float)shadowRes) * shadowSoftness;
-	for (int k = 0; k < 3; ++k) { fb->skyTop[k] = skyTopEff[k]; fb->skyHorizon[k] = skyHorEff[k]; fb->skyGround[k] = skyGndEff[k]; }   // the physical sky's summary when on
-	fb->skyParams[0] = (sky.mode == 2 && atmoSummaryValid) ? 1.0f : sky.skyIntensity; fb->skyParams[1] = (sky.mode >= 1) ? 1.0f : 0.0f;   // the summary already carries the intensity
+	for (int k = 0; k < 3; ++k) { fb->skyTop[k] = skyTopIbl[k]; fb->skyHorizon[k] = skyHorIbl[k]; fb->skyGround[k] = skyGndIbl[k]; }   // the sky map's summary (clouds included) when live, else the clear sky
+	fb->skyParams[0] = ((sky.mode == 2 && atmoSummaryValid) || skySummaryValid) ? 1.0f : sky.skyIntensity; fb->skyParams[1] = (sky.mode >= 1) ? 1.0f : 0.0f;   // a summary already carries the intensity
 	{
 		const bool on = AtmoActive();
 		fb->atmoA[0] = on ? 2.0f : 0.0f; fb->atmoA[1] = std::max(sky.planetRadius, 1.0f); fb->atmoA[2] = fb->atmoA[1] + std::max(sky.atmosphereHeight, 1.0f); fb->atmoA[3] = 192.0f;
@@ -753,7 +764,7 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 	fb->probeBox[0] = probeBoxHalf[0]; fb->probeBox[1] = probeBoxHalf[1]; fb->probeBox[2] = probeBoxHalf[2]; fb->probeBox[3] = box ? 1.0f : 0.0f;
 	memcpy(fb->wind,  windDirStrength, sizeof(fb->wind));    // 7.2: g_Wind (dir.xyz, gusted strength)
 	memcpy(fb->wind2, windParams,      sizeof(fb->wind2));   //      g_Wind2 (turbAmount, 1/turbScale, time, gustFreq)
-	fb->misc[0] = giCaptureMaxD > 0.0f ? 1.0f : 0.0f; fb->misc[1] = giCaptureMaxD; fb->misc[2] = fb->misc[3] = 0.0f;
+	fb->misc[0] = giCaptureMaxD > 0.0f ? 1.0f : 0.0f; fb->misc[1] = giCaptureMaxD; fb->misc[2] = skyMapSRV ? 1.0f : 0.0f; fb->misc[3] = 0.0f;   // z = the sky map is live
 	memcpy(fb->cloudShadow, cloudShadowOrigin, sizeof(fb->cloudShadow));   // VL3: cloud shadow map origin x,z, 1/size, strength
 }
 
@@ -856,14 +867,15 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	}
 
 	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
-	if (m_impl->cloudShadowFrame != m_impl->frameId) { m_impl->cloudShadowFrame = m_impl->frameId; m_impl->RunCloudShadow(); }   // VL3, once a frame
-	if (m_impl->sky.mode == 2)   // the physical sky's LUTs for this camera (compute: the targets rebind after)
-	{
-		m_impl->RunAtmosphere(false);
-		ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-		ctx->SetViewports(1, &vp, w, h);
-	}
-	else m_impl->RunAtmosphere(false);
+	// Compute work before the sky: the cloud shadow map (VL3, once a frame) and the physical
+	// sky's LUTs. Each unbinds the targets; the camera targets rebind ONCE after both, whatever
+	// ran (the cloud shadow alone, on a procedural sky without a fog grid, left the sky draw
+	// with no render pass the first frame its pipelines landed).
+	if (m_impl->cloudShadowFrame != m_impl->frameId) { m_impl->cloudShadowFrame = m_impl->frameId; m_impl->RunCloudShadow(); }
+	m_impl->RunAtmosphere(false);
+	if (m_impl->skyMapFrame != m_impl->frameId) { m_impl->skyMapFrame = m_impl->frameId; m_impl->RunSkyMap(); }   // the sky with its clouds, once a frame
+	ctx->SetRenderTargets(1, &rtv, dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	ctx->SetViewports(1, &vp, w, h);
 	m_impl->WriteFrameCB(P);
 
 	// Volumetric fog grid off this camera's prepass + lights (compute: the targets rebind after).
@@ -1594,17 +1606,48 @@ void NukeDiligent::endCamera()
 		m_impl->KeepSSGILitHistory(m_impl->curPostSrc, m_impl->curRTW, m_impl->curRTH);
 	// 1.5) Module post hook — after the resolve, BEFORE the user chain: its output is scene content.
 	ITextureView* chainSrc = m_impl->curPostSrc;
-	bool preDone = false;   // fog composite + sun shafts: once per camera pass, before the first non-reflection effect
+	bool preDone = false;   // the media block: once per camera pass, before the first non-reflection effect
+	// The media between the eye and the scene, composited in depth order: the air (aerial
+	// perspective, clouds, froxel fog, sun shafts), then the water column (module post hook:
+	// underwater compose / wetness), then the lens film. Reflections composite before all of it
+	// (surface shading); the rest of the user chain (bloom, TAA, grades) after.
+	auto applyMedia = [&](ITextureView* src) -> ITextureView*
 	{
+		const int w = m_impl->curRTW, h = m_impl->curRTH;
+		if (!src || w <= 0 || h <= 0) return src;
+		// A submerged eye sees no air: aerial perspective, clouds and sun shafts over that view
+		// painted a white haze and a horizon line under water, so they are skipped there. The
+		// froxel fog is different: fog volumes (silt, sand, a murk cloud) lie in the water too,
+		// so under water they composite AFTER the water's own fog - over it, never dyed by the
+		// water's absorption. (The water state is published by this pass's surface draws.)
+		const bool eyeUnderWater = m_impl->rtWaterOcc[1] > 0.5f
+		                        && m_impl->curCamPos[1] < m_impl->rtWaterOcc[0] + m_impl->rtWaterOcc[3];
+		if (!eyeUnderWater)
+		{
+			m_impl->GpuPass("atmosphere");
+			src = m_impl->ApplyAtmosphere(src, w, h);
+			m_impl->GpuPass("clouds");
+			src = m_impl->RunClouds(src, w, h);
+			m_impl->GpuPass("volumetrics");
+			if (m_impl->volCur) src = m_impl->ApplyVolumetrics(src, w, h);
+			src = m_impl->RunSunShafts(src, w, h);
+		}
 		const nukediligent::WaterHooks& wh = nukediligent::ActiveWaterHooks();
-		if (wh.onCameraPost && chainSrc)
+		if (wh.onCameraPost)
 		{
 			m_impl->GpuPass("water.post");   // water surface/underwater compose times separately
-			if (ITextureView* replaced = wh.onCameraPost(wh.user, chainSrc))
-				chainSrc = replaced;
-			m_impl->GpuPass("post");
+			if (ITextureView* replaced = wh.onCameraPost(wh.user, src)) src = replaced;
 		}
-	}
+		if (eyeUnderWater && m_impl->volCur)
+		{
+			m_impl->GpuPass("volumetrics");
+			src = m_impl->ApplyVolumetrics(src, w, h);
+		}
+		m_impl->GpuPass("lens");   // the film: water soak injected by the hook, rain from setLensRain
+		if (ITextureView* wet = m_impl->RunLensFilm(src)) src = wet;
+		m_impl->GpuPass("post");
+		return src;
+	};
 	if (!m_impl->postChain.empty() && chainSrc && m_impl->curRTW > 0 && m_impl->curRTH > 0)
 	{
 		m_impl->EnsureScratch(m_impl->curRTW, m_impl->curRTH);
@@ -1616,19 +1659,12 @@ void NukeDiligent::endCamera()
 			auto pit = m_impl->postPipes.find(cs.pipeline);
 			if (pit == m_impl->postPipes.end()) continue;
 			if (!pit->second.pso && !pit->second.isRTRef) continue;   // RT reflections run a ray-tracing pipeline, not a graphics PSO
-			// Volumetric fog + sun shafts go in after the reflection composites (surface shading;
-			// the reflections fog their own leg) and before everything else (bloom, TAA, grades).
+			// The media go in after the reflection composites (the reflections fog their own leg)
+			// and before everything else (bloom, TAA, grades).
 			if (!preDone && !(pit->second.isSSR || pit->second.isRTRef))
 			{
 				preDone = true;
-				m_impl->GpuPass("atmosphere");
-				srcSRV = m_impl->ApplyAtmosphere(srcSRV, w, h);
-				m_impl->GpuPass("clouds");
-				srcSRV = m_impl->RunClouds(srcSRV, w, h);
-				m_impl->GpuPass("volumetrics");
-				if (m_impl->volCur) srcSRV = m_impl->ApplyVolumetrics(srcSRV, w, h);
-				srcSRV = m_impl->RunSunShafts(srcSRV, w, h);
-				m_impl->GpuPass("post");
+				srcSRV = applyMedia(srcSRV);
 			}
 			Diligent::ITexture* dstTex = m_impl->scratch[idx % 2];
 			if (!dstTex) break;
@@ -1691,17 +1727,8 @@ void NukeDiligent::endCamera()
 		}
 		chainSrc = srcSRV;
 	}
-	if (!preDone && chainSrc && m_impl->curRTW > 0 && m_impl->curRTH > 0)   // no chain, or reflections only
-	{
-		m_impl->GpuPass("atmosphere");
-		chainSrc = m_impl->ApplyAtmosphere(chainSrc, m_impl->curRTW, m_impl->curRTH);
-		m_impl->GpuPass("clouds");
-		chainSrc = m_impl->RunClouds(chainSrc, m_impl->curRTW, m_impl->curRTH);
-		m_impl->GpuPass("volumetrics");
-		if (m_impl->volCur) chainSrc = m_impl->ApplyVolumetrics(chainSrc, m_impl->curRTW, m_impl->curRTH);
-		chainSrc = m_impl->RunSunShafts(chainSrc, m_impl->curRTW, m_impl->curRTH);
-		m_impl->GpuPass("post");
-	}
+	if (!preDone)   // no chain, or reflections only
+		chainSrc = applyMedia(chainSrc);
 	m_impl->volCur = nullptr;
 	// 3) Final tonemap/encode into the output (RT's post texture, or the backbuffer for target 0).
 	m_impl->GpuPass("tonemap");
@@ -1854,6 +1881,7 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 				d.liveSet = true;
 				memcpy(d.liveVal, mat->liveDrawValue, sizeof(d.liveVal)); memcpy(d.liveChan, mat->liveDrawMaskChan, sizeof(d.liveChan));
 				memcpy(d.liveXf, mat->liveDrawMaskXform, sizeof(d.liveXf)); d.liveRes = mat->liveDrawMaskRes; d.liveMask = mat->liveDrawMask3D;
+				d.liveNoSky = mat->liveDrawNoSky;
 			}
 			m_impl->occlDeferred.push_back(d);
 			return;
@@ -2029,6 +2057,9 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 		bindIf(wp.giVisVarI, m_impl->giVisSRV ? m_impl->giVisSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 5]);
 		bindIf(wp.sgiVarI, m_impl->screenGISRV ? m_impl->screenGISRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 6]);
 		bindIf(wp.cloudShVarI, m_impl->cloudShadowSRV ? m_impl->cloudShadowSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 7]);
+		bindIf(wp.skyOccVarI, m_impl->skyOccSRV ? m_impl->skyOccSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 11]);
+		bindIf(wp.trailVarI, m_impl->trailSRV ? m_impl->trailSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 12]);
+		bindIf(wp.skyMapVarI, m_impl->skyMapSRV ? m_impl->skyMapSRV : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 13]);
 		{
 			ITextureView* asv = m_impl->AtmoSkyViewSRV(); ITextureView* atr = m_impl->AtmoTransSRV();
 			bindIf(wp.atmoSkyVarI, asv ? asv : whiteSRV, wp.lastBindI[13 + Impl::kOvTexCount + 8]);

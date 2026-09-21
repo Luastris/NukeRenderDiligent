@@ -99,6 +99,8 @@ public:
 	void setFogVolumes(const NukeFogVolumeDesc* volumes, int count) override;
 	void setSpriteVolumeLight(float amount) override;
 	void setSpriteMask(Texture* mask) override;
+	void setLensRain(float rate, float amount, float drainSeconds) override;
+	void setGroundTrails(const float* xzrw, int count, float fillPerSec) override;   // W5 ground trails
 	void drawSpriteRunSixWay(Texture* lightA, Texture* lightB, const float* verts, int vertCount) override;
 	const char* backendName() override;
 	void setFogDisplacers(const NukeFogDisplacerDesc* displacers, int count) override;

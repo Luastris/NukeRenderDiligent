@@ -245,7 +245,7 @@ bool NukeDiligent::Impl::BuildGIPipes()
 	if (rtSupported)
 	{
 		if (!compile("ddgi_trace.cs", "DDGI trace CS", true, csT)) return false;
-		if (!build("DDGI trace PSO", csT, {"g_Probe", "g_MatTex", "g_GIIrr"}, {}, pT, sT)) return false;
+		if (!build("DDGI trace PSO", csT, {"g_Probe", "g_MatTex", "g_GIIrr", "g_SkyMap"}, {}, pT, sT)) return false;   // g_SkyMap: rt_common EnvSample (a probe ray that escapes sees the sky with its clouds)
 	}
 	giUpdatePSO = pU; giUpdateSRB = sU; giCubePSO = pC; giCubeSRB = sC; giTracePSO = pT; giTraceSRB = sT;
 	return true;
@@ -366,6 +366,7 @@ void NukeDiligent::updateGIVolumes()
 		ITextureView* white = d->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
 		set("g_TLAS",      (IDeviceObject*)d->tlas.RawPtr());
 		set("g_Probe",     (d->probeActive && d->probeCubeSRV) ? d->probeCubeSRV : d->fallbackCubeSRV);
+		set("g_SkyMap",    d->skyMapSRV ? d->skyMapSRV : white);   // FrameCB g_Misc.z says whether it is live
 		set("g_AllNrm",    d->rtNrmSRV);
 		set("g_AllUV",     d->rtUVSRV ? d->rtUVSRV : d->rtNrmSRV);
 		set("g_AllPos",    d->rtPosSRV ? d->rtPosSRV : d->rtNrmSRV);
