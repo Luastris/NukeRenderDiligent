@@ -1686,6 +1686,26 @@ void NukeDiligent::endCamera()
 				m_impl->RunRTReflectPipeline(srcSRV, dstTex, w, h, cs.params);
 				m_impl->GpuPass("post");
 			}
+			else if (pit->second.isDOF)   // built-in depth of field (needs the depth prepass)
+			{
+				if (!m_impl->gbufActive) continue;
+				m_impl->GpuPass("dof");
+				m_impl->RunDOF(srcSRV, dstRTV, w, h, cs.params);
+				m_impl->GpuPass("post");
+			}
+			else if (pit->second.isMotion)   // built-in motion blur (needs the prepass velocity)
+			{
+				if (!m_impl->gbufActive) continue;
+				m_impl->GpuPass("motionblur");
+				m_impl->RunMotionBlur(srcSRV, dstRTV, w, h, cs.params);
+				m_impl->GpuPass("post");
+			}
+			else if (pit->second.isExposure)   // built-in auto-exposure (histogram + adaptation)
+			{
+				m_impl->GpuPass("exposure");
+				m_impl->RunExposure(srcSRV, dstRTV, w, h, cs.params);
+				m_impl->GpuPass("post");
+			}
 			else if (pit->second.isTAA)   // built-in temporal AA (jittered accumulation; needs the depth prepass)
 			{
 				if (!m_impl->gbufActive) continue;   // no depth prepass -> skip (src passes through)

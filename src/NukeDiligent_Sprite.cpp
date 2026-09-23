@@ -851,3 +851,16 @@ void NukeDiligent::Impl::FlushScreenPost(bool toBackbuffer)
 	if (toBackbuffer) FlushScreen(spriteScrPostVerts, spriteScrPostRuns, spriteScreenPSOBB, spriteScreenSRBBB, spriteScreenTexVarBB);
 	else              FlushScreen(spriteScrPostVerts, spriteScrPostRuns, spriteScreenPSO,   spriteScreenSRB,   spriteScreenTexVar);
 }
+
+// A depth-based post stage (DOF, motion blur) reads the G-buffer depth: module surfaces (the
+// water) must write themselves into it, or the effect sees the geometry BEHIND them.
+bool NukeDiligent::Impl::PostWantsDepth() const
+{
+	if (!gbufActive) return false;
+	for (const auto& cs : postChain)
+	{
+		auto pit = postPipes.find(cs.pipeline);
+		if (pit != postPipes.end() && (pit->second.isDOF || pit->second.isMotion)) return true;
+	}
+	return false;
+}

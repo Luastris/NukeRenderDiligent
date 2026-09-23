@@ -177,6 +177,7 @@ add_library(NukeRenderDiligent SHARED
     src/NukeDiligent_SkyMap.cpp
     src/NukeDiligent_Atmo.cpp
     src/NukeDiligent_Post.cpp
+    src/NukeDiligent_PostFX.cpp
     src/NukeDiligent_UI.cpp
     src/NukeDiligent_RT.cpp
     src/NukeDiligent_Sprite.cpp

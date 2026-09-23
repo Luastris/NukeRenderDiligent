@@ -64,6 +64,7 @@ struct Frame
 	Diligent::ITextureView* gbufRTV = nullptr;
 	Diligent::ITextureView* gbufDSV = nullptr;
 	bool rtReflectActive = false;    // this camera's post chain runs the ray-traced reflections
+	bool gbufDepthWanted = false;    // a depth-based post (dof / motionblur) runs: module surfaces (water) must write the G-buffer depth too
 
 	// Engine-owned resources (may be null — always fall back).
 	Diligent::ITextureView* sceneDepthSRV = nullptr;    // single-sample prepass depth (gbuf)

@@ -160,6 +160,7 @@ void NukeDiligent::Impl::CreatePostResources()
 	bloomPSO("bloom_bright.ps", "Bloom Bright", false, bloomBrightPSO, bloomBrightSRB, bbSrc, nullptr);
 	bloomPSO("bloom_blur.ps",   "Bloom Blur",   false, bloomBlurPSO,   bloomBlurSRB,   blSrc, nullptr);
 	bloomPSO("bloom_comp.ps",   "Bloom Comp",   true,  bloomCompPSO,   bloomCompSRB,   bcSrc, &bcBloom);
+	CreatePostFXPipelines();   // R3 built-ins: DOF / motion blur / auto-exposure (same warm-up moment)
 }
 
 // Tonemap HDR -> output into dstRTV. toBackbuffer picks the backbuffer PSO + (when HDR10 is live) PQ encoding.
@@ -277,6 +278,7 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	if (mvis) pp.objIdVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_ObjId");
 	if (taa) { pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.histVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_History"); pp.velVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Velocity"); pp.isTAA = true; }
 	pp.isBloom = (name == "bloom");   // multi-pass: the renderer drives the passes itself
+	pp.isDOF = (name == "dof"); pp.isMotion = (name == "motionblur"); pp.isExposure = (name == "exposure");   // R3 built-ins, same rule
 	uint64_t h = nextShaderHandle++;
 	postPipes[h] = std::move(pp);
 	return h;

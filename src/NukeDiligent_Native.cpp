@@ -39,6 +39,7 @@ bool GetFrame(Frame& out)
 	out.gbufRTV = d->gbufActive ? d->gbufRTV : nullptr;
 	out.gbufDSV = d->gbufActive ? d->gbufDSV : nullptr;
 	out.rtReflectActive = d->RTReflectWanted();
+	out.gbufDepthWanted = d->PostWantsDepth();
 	out.sceneDepthSRV = d->gbufDepthSRV;
 	out.gbufActive = d->gbufActive;
 	out.whiteSRV = d->whiteTex ? d->whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;

@@ -340,6 +340,7 @@ struct NukeDiligent::Impl
 	                  IShaderResourceVariable* objIdVar = nullptr;   // musicvis: generic per-OBJECT id (gbuffer RT2)
 	                  IShaderResourceVariable* histVar = nullptr; IShaderResourceVariable* velVar = nullptr; bool isTAA = false;   // temporal AA (history + depth + velocity)
 	                  bool isRTRef = false;   // built-in ray-traced reflections (D3D12)
+	                  bool isDOF = false, isMotion = false, isExposure = false;   // R3 built-ins (NukeDiligent_PostFX.cpp)
 	                  IShaderResourceVariable* tlasVar = nullptr; IShaderResourceVariable* instVar = nullptr;
 	                  IShaderResourceVariable* nrmVar = nullptr;  IShaderResourceVariable* rtProbeVar = nullptr;
 	                  IShaderResourceVariable* uvVar = nullptr;   IShaderResourceVariable* matTexVar = nullptr; };
@@ -370,6 +371,20 @@ struct NukeDiligent::Impl
 	int                                   bloomW = 0, bloomH = 0;
 	void EnsureBloom(int w, int h);
 	void RunBloom(ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, float threshold, float intensity);
+	// R3 post tails (NukeDiligent_PostFX.cpp): depth of field, motion blur, auto-exposure — built-in
+	// multi-pass chain stages keyed by their *.post.hlsl names (dof / motionblur / exposure).
+	RefCntAutoPtr<IPipelineState> dofCocPSO, dofGatherPSO, dofCompPSO, mbTilePSO, mbNeighborPSO, mbReconPSO, expLumPSO, expAdaptPSO, expApplyPSO;
+	RefCntAutoPtr<IShaderResourceBinding> dofCocSRB, dofGatherSRB, dofCompSRB, mbTileSRB, mbNeighborSRB, mbReconSRB, expLumSRB, expAdaptSRB, expApplySRB;
+	RefCntAutoPtr<IBuffer> dofCB, mbCB, expCB;
+	std::unordered_map<uint64_t, SizedTexSet> dofCache, dofNearCache, mbCache, expCache;
+	struct ExposureState { RefCntAutoPtr<ITexture> ev[2]; int cur = 0; bool valid = false; uint64_t lastUsed = 0, frame = ~0ull; };   // per camera: the adapted EV ping-pong
+	std::map<uint64_t, ExposureState> expStates;
+	void CreatePostFXPipelines();
+	ITexture* SizedTex(std::unordered_map<uint64_t, SizedTexSet>& cache, int w, int h, TEXTURE_FORMAT fmt, const char* name, bool second, Diligent::BIND_FLAGS bind = Diligent::BIND_RENDER_TARGET | Diligent::BIND_SHADER_RESOURCE);
+	void RunDOF(ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, const std::vector<float>& params);
+	void RunMotionBlur(ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, const std::vector<float>& params);
+	void RunExposure(ITextureView* srcSRV, ITextureView* dstRTV, int w, int h, const std::vector<float>& params);
+	void PruneExposureStates();
 
 	// --- Reflection probe: scene-captured HDR cubemaps ----------------------------------------------
 	struct CubeRT
@@ -1296,6 +1311,7 @@ struct NukeDiligent::Impl
 	std::vector<CoverBatch>               coverBatches;
 	bool                                  coverWanted = false;      // RT reflections run on this camera
 	bool RTReflectWanted() const;                                   // rtSupported + G-buffer + rtreflect in the post chain
+	bool PostWantsDepth() const;                                    // G-buffer + dof / motionblur in the post chain (module surfaces join the depth)
 	void CoverAppend(Texture* tex, Texture* mask, const std::vector<float>& verts);
 	void DrawSpriteCoverage();
 	// Batching: drawSprite accumulates quads and flushes ONE draw per texture run (sprites arrive

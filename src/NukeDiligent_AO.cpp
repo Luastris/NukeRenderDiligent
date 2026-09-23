@@ -191,6 +191,7 @@ void NukeDiligent::Impl::RunAO(int w, int h)
 void NukeDiligent::Impl::PruneCameraStates()
 {
 	const uint64_t kStale = 120;
+	PruneExposureStates();   // the auto-exposure's per-camera EV states (NukeDiligent_PostFX.cpp)
 	for (auto it = taaStates.begin(); it != taaStates.end();)
 	{
 		if (frameId - it->second.lastUsed > kStale) { Trash(it->second.hist); it = taaStates.erase(it); }
