@@ -81,6 +81,11 @@ void EnqueueBuild(const boost::function<void()>& build, const boost::function<vo
 	else { if (build) build(); if (adopt) adopt(); }   // no renderer: run inline, same contract
 }
 
+void WaitBuilds(const char* name)
+{
+	if (NukeDiligent::nativeImpl) NukeDiligent::nativeImpl->WaitBuilds(name);
+}
+
 void AddPipelineWarmup(const char* name, WarmupFn fn, void* user)
 {
 	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;

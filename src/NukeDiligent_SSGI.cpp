@@ -34,7 +34,7 @@ bool NukeDiligent::Impl::BuildSSGIPipes()
 		if (!v || !p) return false;
 		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = name;
 		auto& gp = ci.GraphicsPipeline;
-		gp.NumRenderTargets = (Uint8)nrt; gp.RTVFormats[0] = HDR_FMT; gp.RTVFormats[1] = HDR_FMT; gp.RTVFormats[2] = TEX_FORMAT_R16_FLOAT; gp.DSVFormat = TEX_FORMAT_UNKNOWN;
+		gp.NumRenderTargets = (Uint8)nrt; gp.RTVFormats[0] = HDR_FMT; if (nrt > 1) gp.RTVFormats[1] = HDR_FMT; if (nrt > 2) gp.RTVFormats[2] = TEX_FORMAT_R16_FLOAT; gp.DSVFormat = TEX_FORMAT_UNKNOWN;   // formats only for the slots in use
 		gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
 		gp.DepthStencilDesc.DepthEnable = False; gp.InputLayout.NumElements = 0;
 		vector<ShaderResourceVariableDesc> vars; vector<ImmutableSamplerDesc> imms;

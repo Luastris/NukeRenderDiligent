@@ -1,0 +1,234 @@
+diff --git a/Graphics/GraphicsEngineVulkan/src/VulkanUtilities/Instance.cpp b/Graphics/GraphicsEngineVulkan/src/VulkanUtilities/Instance.cpp
+--- a/Graphics/GraphicsEngineVulkan/src/VulkanUtilities/Instance.cpp
++++ b/Graphics/GraphicsEngineVulkan/src/VulkanUtilities/Instance.cpp
+@@ -51,6 +51,10 @@
+ 
+ #include "PlatformDefinitions.h"
+ 
++// NUKE PATCH: the host may route instance creation through a vendor proxy (NVIDIA Streamline's
++// vkCreateInstance adds the extensions its features need). Null = the loader's own.
++extern "C" PFN_vkCreateInstance g_NukeVkCreateInstance = nullptr;
++
+ namespace VulkanUtilities
+ {
+ 
+@@ -614,7 +618,7 @@
+     else
+ #endif
+     {
+-        res = vkCreateInstance(&InstanceCreateInfo, m_pvkAllocator, &m_vkInstance);
++        res = (g_NukeVkCreateInstance ? g_NukeVkCreateInstance : vkCreateInstance)(&InstanceCreateInfo, m_pvkAllocator, &m_vkInstance);
+     }
+     CHECK_VK_ERROR_AND_THROW(res, "Failed to create Vulkan instance");
+ 
+diff --git a/Graphics/GraphicsEngineVulkan/src/EngineFactoryVk.cpp b/Graphics/GraphicsEngineVulkan/src/EngineFactoryVk.cpp
+--- a/Graphics/GraphicsEngineVulkan/src/EngineFactoryVk.cpp
++++ b/Graphics/GraphicsEngineVulkan/src/EngineFactoryVk.cpp
+@@ -51,6 +51,9 @@
+ #    include <openxr/openxr_platform.h>
+ #endif
+ 
++// NUKE PATCH: device creation through a host hook (see g_NukeVkCreateInstance in Instance.cpp).
++extern "C" PFN_vkCreateDevice g_NukeVkCreateDevice = nullptr;
++
+ namespace Diligent
+ {
+ namespace
+@@ -1359,7 +1362,7 @@
+         else
+ #endif
+         {
+-            vkRes = vkCreateDevice(PhysicalDevice->GetVkDeviceHandle(), &vkDeviceCreateInfo, vkAllocator, &vkDevice);
++            vkRes = (g_NukeVkCreateDevice ? g_NukeVkCreateDevice : vkCreateDevice)(PhysicalDevice->GetVkDeviceHandle(), &vkDeviceCreateInfo, vkAllocator, &vkDevice);
+         }
+         CHECK_VK_ERROR_AND_THROW(vkRes, "Failed to create logical device");
+ 
+diff --git a/Graphics/GraphicsEngineVulkan/interface/SwapChainVk.h b/Graphics/GraphicsEngineVulkan/interface/SwapChainVk.h
+--- a/Graphics/GraphicsEngineVulkan/interface/SwapChainVk.h
++++ b/Graphics/GraphicsEngineVulkan/interface/SwapChainVk.h
+@@ -54,6 +54,20 @@
+ 
+     /// Returns a Vulkan handle to the internal swap chain object.
+     VIRTUAL VkSwapchainKHR METHOD(GetVkSwapChain)(THIS) PURE;
++
++    /// NUKE PATCH: frame-generation proxies (FSR FG, DLSS-G) replace the Vulkan swap chain under a
++    /// live Diligent swap chain. Releases the back-buffer views and sync objects (GPU idle) and
++    /// hands the VkSwapchainKHR to the caller WITHOUT destroying it; the object holds none until
++    /// AttachVkSwapChain.
++    VIRTUAL VkSwapchainKHR METHOD(DetachVkSwapChain)(THIS) PURE;
++
++    /// NUKE PATCH: adopts `vkSwapChain` (its images become the back buffers, the views and sync
++    /// objects are rebuilt, an image is acquired); VK_NULL_HANDLE recreates the swap chain's own.
++    VIRTUAL void METHOD(AttachVkSwapChain)(THIS_ VkSwapchainKHR vkSwapChain) PURE;
++
++    /// NUKE PATCH: the VkSwapchainCreateInfoKHR of the last swap chain this object created (its
++    /// oldSwapchain cleared), so a vendor can create an equivalent proxy for the same surface.
++    VIRTUAL void METHOD(GetVkSwapChainCreateInfo)(THIS_ VkSwapchainCreateInfoKHR* pCreateInfo) PURE;
+ };
+ DILIGENT_END_INTERFACE
+ 
+@@ -63,7 +77,10 @@
+ 
+ // clang-format off
+ 
+-#    define ISwapChainVk_GetVkSwapChain(This)  CALL_IFACE_METHOD(SwapChainVk, GetVkSwapChain, This)
++#    define ISwapChainVk_GetVkSwapChain(This)            CALL_IFACE_METHOD(SwapChainVk, GetVkSwapChain, This)
++#    define ISwapChainVk_DetachVkSwapChain(This)         CALL_IFACE_METHOD(SwapChainVk, DetachVkSwapChain, This)
++#    define ISwapChainVk_AttachVkSwapChain(This, ...)    CALL_IFACE_METHOD(SwapChainVk, AttachVkSwapChain, This, __VA_ARGS__)
++#    define ISwapChainVk_GetVkSwapChainCreateInfo(This, ...) CALL_IFACE_METHOD(SwapChainVk, GetVkSwapChainCreateInfo, This, __VA_ARGS__)
+ 
+ // clang-format on
+ 
+diff --git a/Graphics/GraphicsEngineVulkan/include/SwapChainVkImpl.hpp b/Graphics/GraphicsEngineVulkan/include/SwapChainVkImpl.hpp
+--- a/Graphics/GraphicsEngineVulkan/include/SwapChainVkImpl.hpp
++++ b/Graphics/GraphicsEngineVulkan/include/SwapChainVkImpl.hpp
+@@ -73,6 +73,15 @@
+     /// Implementation of ISwapChainVk::GetVkSwapChain().
+     virtual VkSwapchainKHR DILIGENT_CALL_TYPE GetVkSwapChain() override final { return m_VkSwapChain; }
+ 
++    /// NUKE PATCH: implementation of ISwapChainVk::DetachVkSwapChain() / AttachVkSwapChain() / GetVkSwapChainCreateInfo().
++    virtual VkSwapchainKHR DILIGENT_CALL_TYPE DetachVkSwapChain() override final;
++    virtual void DILIGENT_CALL_TYPE AttachVkSwapChain(VkSwapchainKHR vkSwapChain) override final;
++    virtual void DILIGENT_CALL_TYPE GetVkSwapChainCreateInfo(VkSwapchainCreateInfoKHR* pCreateInfo) override final
++    {
++        if (pCreateInfo != nullptr)
++            *pCreateInfo = m_NukeCreateInfo;
++    }
++
+     /// Implementation of ISwapChain::GetCurrentBackBufferRTV() in Vulkan backend.
+     virtual ITextureViewVk* DILIGENT_CALL_TYPE GetCurrentBackBufferRTV() override final
+     {
+@@ -102,6 +111,9 @@
+     VkSwapchainKHR m_VkSwapChain   = VK_NULL_HANDLE;
+     VkFormat       m_VkColorFormat = VK_FORMAT_UNDEFINED;
+ 
++    VkSwapchainCreateInfoKHR m_NukeCreateInfo = {}; // NUKE PATCH: the last create info (oldSwapchain cleared)
++    void                     NukeCreateSyncObjects(uint32_t swapchainImageCount); // NUKE PATCH: the per-image semaphores
++
+ #if PLATFORM_ANDROID
+     // Surface extent corresponding to identity transform. We have to store this value,
+     // because on Android vkGetPhysicalDeviceSurfaceCapabilitiesKHR is not reliable and
+diff --git a/Graphics/GraphicsEngineVulkan/src/SwapChainVkImpl.cpp b/Graphics/GraphicsEngineVulkan/src/SwapChainVkImpl.cpp
+--- a/Graphics/GraphicsEngineVulkan/src/SwapChainVkImpl.cpp
++++ b/Graphics/GraphicsEngineVulkan/src/SwapChainVkImpl.cpp
+@@ -521,6 +521,8 @@
+ 
+     err = vkCreateSwapchainKHR(vkDevice, &swapchain_ci, NULL, &m_VkSwapChain);
+     CHECK_VK_ERROR_AND_THROW(err, "Failed to create Vulkan swapchain");
++    m_NukeCreateInfo              = swapchain_ci; // NUKE PATCH
++    m_NukeCreateInfo.oldSwapchain = VK_NULL_HANDLE;
+ 
+     if (oldSwapchain != VK_NULL_HANDLE)
+     {
+@@ -540,6 +542,15 @@
+         m_SwapChainDesc.BufferCount = swapchainImageCount;
+     }
+ 
++    NukeCreateSyncObjects(swapchainImageCount); // NUKE PATCH: shared with AttachVkSwapChain
++}
++
++// NUKE PATCH: the per-image semaphores of CreateVulkanSwapChain, reused by AttachVkSwapChain.
++void SwapChainVkImpl::NukeCreateSyncObjects(uint32_t swapchainImageCount)
++{
++    RenderDeviceVkImpl*                   pRenderDeviceVk = m_pRenderDevice.RawPtr<RenderDeviceVkImpl>();
++    const VulkanUtilities::LogicalDevice& LogicalDevice   = pRenderDeviceVk->GetLogicalDevice();
++
+     m_ImageAcquiredSemaphores.resize(swapchainImageCount);
+     m_DrawCompleteSemaphores.resize(swapchainImageCount);
+     for (uint32_t i = 0; i < swapchainImageCount; ++i)
+@@ -568,6 +579,62 @@
+     }
+ }
+ 
++// NUKE PATCH: hand the VkSwapchainKHR to a vendor (frame generation) without destroying it.
++VkSwapchainKHR SwapChainVkImpl::DetachVkSwapChain()
++{
++    RefCntAutoPtr<IDeviceContext> pDeviceContext  = m_wpDeviceContext.Lock();
++    DeviceContextVkImpl*          pImmediateCtxVk = pDeviceContext ? pDeviceContext.RawPtr<DeviceContextVkImpl>() : nullptr;
++    ReleaseSwapChainResources(pImmediateCtxVk, /*DestroyVkSwapChain=*/false);
++    VkSwapchainKHR vkSwapChain = m_VkSwapChain;
++    m_VkSwapChain              = VK_NULL_HANDLE;
++    m_ImageAcquired            = false;
++    return vkSwapChain;
++}
++
++// NUKE PATCH: adopt a vendor's swap chain (its images are read back through vkGetSwapchainImagesKHR,
++// which the host may have routed through the vendor), or recreate this object's own.
++void SwapChainVkImpl::AttachVkSwapChain(VkSwapchainKHR vkSwapChain)
++{
++    RefCntAutoPtr<IDeviceContext> pDeviceContext = m_wpDeviceContext.Lock();
++    if (!pDeviceContext)
++    {
++        LOG_ERROR_MESSAGE("Immediate context has been released");
++        return;
++    }
++    DeviceContextVkImpl* pImmediateCtxVk = pDeviceContext.RawPtr<DeviceContextVkImpl>();
++    if (m_VkSwapChain != VK_NULL_HANDLE)
++        ReleaseSwapChainResources(pImmediateCtxVk, /*DestroyVkSwapChain=*/true);
++    try
++    {
++        if (vkSwapChain != VK_NULL_HANDLE)
++        {
++            RenderDeviceVkImpl* pRenderDeviceVk = m_pRenderDevice.RawPtr<RenderDeviceVkImpl>();
++            m_VkSwapChain                       = vkSwapChain;
++            uint32_t swapchainImageCount        = 0;
++            VkResult err                        = vkGetSwapchainImagesKHR(pRenderDeviceVk->GetVkDevice(), m_VkSwapChain, &swapchainImageCount, NULL);
++            CHECK_VK_ERROR_AND_THROW(err, "Failed to request the attached swap chain image count");
++            VERIFY_EXPR(swapchainImageCount > 0);
++            if (swapchainImageCount != m_SwapChainDesc.BufferCount)
++            {
++                LOG_INFO_MESSAGE("Attached swap chain with ", swapchainImageCount, " images vs ", m_SwapChainDesc.BufferCount, " before.");
++                m_SwapChainDesc.BufferCount = swapchainImageCount;
++            }
++            NukeCreateSyncObjects(swapchainImageCount);
++        }
++        else
++        {
++            CreateVulkanSwapChain();
++        }
++        InitBuffersAndViews();
++        m_SemaphoreIndex = 0;
++        AcquireNextImage(pImmediateCtxVk);
++    }
++    catch (const std::runtime_error&)
++    {
++        LOG_ERROR("Failed to attach the Vulkan swap chain");
++    }
++}
++
+ SwapChainVkImpl::~SwapChainVkImpl()
+ {
+     if (m_VkSwapChain != VK_NULL_HANDLE)
+@@ -748,7 +815,10 @@
+ 
+     if (!m_IsMinimized)
+     {
+-        VkResult Result = VK_ERROR_OUT_OF_DATE_KHR;
++        // NUKE PATCH: a vendor's proxied vkQueuePresentKHR (frame generation) reports through the
++        // return value and leaves pResults untouched; the old OUT_OF_DATE preset then recreated
++        // the swap chain every frame. Start clean and take the call's own result too.
++        VkResult Result = VK_SUCCESS;
+         // Only present if the image was acquired successfully
+         if (m_ImageAcquired)
+         {
+@@ -765,12 +835,18 @@
+             PresentInfo.pResults        = &Result;
+             pDeviceVk->LockCmdQueueAndRun(
+                 pImmediateCtxVk->GetCommandQueueId(),
+-                [&PresentInfo](ICommandQueueVk* pCmdQueueVk) //
++                [&PresentInfo, &Result](ICommandQueueVk* pCmdQueueVk) //
+                 {
+-                    pCmdQueueVk->Present(PresentInfo);
++                    const VkResult QueueResult = pCmdQueueVk->Present(PresentInfo);
++                    if (QueueResult != VK_SUCCESS) // NUKE PATCH
++                        Result = QueueResult;
+                 } //
+             );
+         }
++        else
++        {
++            Result = VK_ERROR_OUT_OF_DATE_KHR; // NUKE PATCH: no image this frame - recreate as before
++        }
+ 
+         if (Result == VK_SUBOPTIMAL_KHR || Result == VK_ERROR_OUT_OF_DATE_KHR)
+         {

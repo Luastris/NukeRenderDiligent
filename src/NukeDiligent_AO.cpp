@@ -40,7 +40,7 @@ bool NukeDiligent::Impl::BuildAOPipes()
 		if (!v || !p) return false;
 		GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = name;
 		auto& gp = ci.GraphicsPipeline;
-		gp.NumRenderTargets = (Uint8)nrt; gp.RTVFormats[0] = HDR_FMT; gp.RTVFormats[1] = HDR_FMT; gp.DSVFormat = TEX_FORMAT_UNKNOWN;
+		gp.NumRenderTargets = (Uint8)nrt; gp.RTVFormats[0] = HDR_FMT; if (nrt > 1) gp.RTVFormats[1] = HDR_FMT; gp.DSVFormat = TEX_FORMAT_UNKNOWN;   // formats only for the slots in use
 		gp.PrimitiveTopology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; gp.RasterizerDesc.CullMode = CULL_MODE_NONE;
 		gp.DepthStencilDesc.DepthEnable = False; gp.InputLayout.NumElements = 0;
 		vector<ShaderResourceVariableDesc> vars; vector<ImmutableSamplerDesc> imms;
@@ -192,6 +192,7 @@ void NukeDiligent::Impl::PruneCameraStates()
 {
 	const uint64_t kStale = 120;
 	PruneExposureStates();   // the auto-exposure's per-camera EV states (NukeDiligent_PostFX.cpp)
+	PruneUpscaleStates();    // the per-camera upscalers (NukeDiligent_Upscale.cpp)
 	for (auto it = taaStates.begin(); it != taaStates.end();)
 	{
 		if (frameId - it->second.lastUsed > kStale) { Trash(it->second.hist); it = taaStates.erase(it); }

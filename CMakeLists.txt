@@ -33,12 +33,55 @@ if(WIN32)
         message(STATUS "ATL include: ${_nuke_atl}")
     endif()
 endif()
+# ---- 4.2 vendor technologies built in: NUKE_TECH ------------------------------------------------
+# NUKE_TECH = All (default), None, or a list of DLSS;FSR;XeSS (comma or semicolon, any case): which
+# vendor upscaling / frame-generation SDKs are fetched, compiled against and deployed. The same
+# switch as Package Project's "Vendor Tech" and stage_release's -Tech; a technology left out is
+# not offered by the renderer (FSR 1 always is). Superbuild: -DNUKE_TECH=DLSS,FSR
+set(NUKE_TECH "All" CACHE STRING "Vendor upscaling / frame-generation SDKs to build in: All, None, or a list of DLSS;FSR;XeSS")
+set(NUKE_TECH_DLSS OFF)
+set(NUKE_TECH_FSR  OFF)
+set(NUKE_TECH_XESS OFF)
+string(REPLACE "," ";" _nuke_tech_list "${NUKE_TECH}")
+foreach(_t IN LISTS _nuke_tech_list)
+    string(STRIP "${_t}" _t)
+    string(TOLOWER "${_t}" _t)
+    if(_t STREQUAL "all")
+        set(NUKE_TECH_DLSS ON)
+        set(NUKE_TECH_FSR  ON)
+        set(NUKE_TECH_XESS ON)
+    elseif(_t STREQUAL "none")
+        set(NUKE_TECH_DLSS OFF)
+        set(NUKE_TECH_FSR  OFF)
+        set(NUKE_TECH_XESS OFF)
+    elseif(_t STREQUAL "dlss")
+        set(NUKE_TECH_DLSS ON)
+    elseif(_t STREQUAL "fsr")
+        set(NUKE_TECH_FSR ON)
+    elseif(_t STREQUAL "xess")
+        set(NUKE_TECH_XESS ON)
+    elseif(NOT _t STREQUAL "")
+        message(FATAL_ERROR "NUKE_TECH: unknown technology '${_t}' (All, None, DLSS, FSR, XeSS)")
+    endif()
+endforeach()
+message(STATUS "NukeRenderDiligent: vendor tech DLSS=${NUKE_TECH_DLSS} FSR=${NUKE_TECH_FSR} XeSS=${NUKE_TECH_XESS} (NUKE_TECH=${NUKE_TECH})")
+# DLSS super resolution rides Diligent's SuperResolution (NGX): off = no DLSS-Headers fetch, no NGX.
+if(NUKE_TECH_DLSS)
+    set(DILIGENT_NO_DLSS OFF CACHE BOOL "" FORCE)
+else()
+    set(DILIGENT_NO_DLSS ON  CACHE BOOL "" FORCE)
+endif()
+
 set(DILIGENT_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(DILIGENT_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
 set(DILIGENT_NO_VULKAN     OFF CACHE BOOL "" FORCE)   # Vulkan backend (task #138): editor default; DX stays for the runtime
 set(DILIGENT_NO_OPENGL     ON  CACHE BOOL "" FORCE)
 set(DILIGENT_NO_WEBGPU     ON  CACHE BOOL "" FORCE)
 set(DILIGENT_NO_ARCHIVER   ON  CACHE BOOL "" FORCE)
+# 4.2 super resolution: Diligent's SuperResolution (DLSS via NGX + FSR 1) links statically; the
+# vendor runtime (nvngx_dlss.dll) is a separate DLL next to the host. DirectSR stays off: it lives
+# only in PREVIEW Agility SDKs (developer mode on the player's PC) - not shippable.
+set(DILIGENT_NO_DSR        ON  CACHE BOOL "" FORCE)
 if(APPLE)
     # Vulkan-on-Metal via MoltenVK; the native Metal backend sources are not in the public
     # DiligentCore checkout, so keep that backend off explicitly.
@@ -127,6 +170,49 @@ if(EXISTS "${_nuke_dc_patch3}" AND Git_FOUND)
     endif()
 endif()
 
+# ---- addendum patch: D3D12 swap chain attach / detach (4.2 frame generation) ------------------
+# ISwapChainD3D12::AttachDXGISwapChain / DetachDXGISwapChain: a vendor frame-generation proxy
+# (FSR FG, DLSS-G, XeSS-FG) replaces the DXGI swap chain under the live Diligent one.
+set(_nuke_dc_patch4 "${CMAKE_CURRENT_SOURCE_DIR}/patches/DiligentCore-fg-swapchain.patch")
+if(EXISTS "${_nuke_dc_patch4}" AND Git_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_nuke_dc_dir}" apply --check "${_nuke_dc_patch4}"
+                    RESULT_VARIABLE _nuke_dc4_applies OUTPUT_QUIET ERROR_QUIET)
+    if(_nuke_dc4_applies EQUAL 0)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_nuke_dc_dir}" apply "${_nuke_dc_patch4}")
+        message(STATUS "DiligentCore: NUKE fg-swapchain patch applied")
+    else()
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_nuke_dc_dir}" apply --check --reverse "${_nuke_dc_patch4}"
+                        RESULT_VARIABLE _nuke_dc4_applied OUTPUT_QUIET ERROR_QUIET)
+        if(_nuke_dc4_applied EQUAL 0)
+            message(STATUS "DiligentCore: NUKE fg-swapchain patch already applied")
+        else()
+            message(FATAL_ERROR "DiligentCore: patches/DiligentCore-fg-swapchain.patch neither applies nor is applied — rebase it")
+        endif()
+    endif()
+endif()
+
+# ---- addendum patch: Vulkan creation hooks + swap chain attach / detach (4.2 frame generation) --
+# g_NukeVkCreateInstance / g_NukeVkCreateDevice route instance and device creation through the
+# host (Streamline's proxies, the extra queues AMD's frame-interpolation swap chain wants);
+# ISwapChainVk::DetachVkSwapChain / AttachVkSwapChain / GetVkSwapChainCreateInfo mirror the D3D12 ones.
+set(_nuke_dc_patch5 "${CMAKE_CURRENT_SOURCE_DIR}/patches/DiligentCore-vk-hooks.patch")
+if(EXISTS "${_nuke_dc_patch5}" AND Git_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_nuke_dc_dir}" apply --check "${_nuke_dc_patch5}"
+                    RESULT_VARIABLE _nuke_dc5_applies OUTPUT_QUIET ERROR_QUIET)
+    if(_nuke_dc5_applies EQUAL 0)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_nuke_dc_dir}" apply "${_nuke_dc_patch5}")
+        message(STATUS "DiligentCore: NUKE vk-hooks patch applied")
+    else()
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${_nuke_dc_dir}" apply --check --reverse "${_nuke_dc_patch5}"
+                        RESULT_VARIABLE _nuke_dc5_applied OUTPUT_QUIET ERROR_QUIET)
+        if(_nuke_dc5_applied EQUAL 0)
+            message(STATUS "DiligentCore: NUKE vk-hooks patch already applied")
+        else()
+            message(FATAL_ERROR "DiligentCore: patches/DiligentCore-vk-hooks.patch neither applies nor is applied — rebase it")
+        endif()
+    endif()
+endif()
+
 # Third-party code is OPTIMIZED even in the Debug configuration. Diligent's Vulkan backend
 # re-patches every shader's SPIR-V (SPIRV-Tools) and validates resources at EACH pipeline
 # creation; unoptimized that was 0.4-1 s per pipeline = ~20 s of frozen startup. The debug
@@ -178,6 +264,9 @@ add_library(NukeRenderDiligent SHARED
     src/NukeDiligent_Atmo.cpp
     src/NukeDiligent_Post.cpp
     src/NukeDiligent_PostFX.cpp
+    src/NukeDiligent_Upscale.cpp
+    src/NukeDiligent_FrameGen.cpp
+    src/NukeDiligent_FrameGenVk.cpp
     src/NukeDiligent_UI.cpp
     src/NukeDiligent_RT.cpp
     src/NukeDiligent_Sprite.cpp
@@ -205,6 +294,7 @@ if(WIN32)
         GLFW_EXPOSE_NATIVE_WIN32
         _CRT_SECURE_NO_WARNINGS
         NUKEDILIGENT_BUILD          # dllexport side of NukeDiligentNative.h
+        $<$<TARGET_EXISTS:DLSS-Headers>:NUKE_DLSS_NGX=1>   # NGX SDK present in this tree
     )
 
     target_include_directories(NukeRenderDiligent PRIVATE ${VCPKG_INSTALLED}/include)
@@ -222,6 +312,9 @@ if(WIN32)
         Diligent-GraphicsEngineD3D11-static
         Diligent-GraphicsEngineD3D12-static
         Diligent-GraphicsEngineVk-static
+        Diligent-SuperResolution-static   # 4.2: DLSS (NGX loader lib inside) + FSR 1
+        $<$<TARGET_EXISTS:DLSS-Headers>:DLSS-Headers>   # NGX headers: the Vulkan device asks NGX for its extensions
+        $<$<TARGET_EXISTS:Vulkan::Headers>:Vulkan::Headers>   # (their Vulkan types)
         Diligent-GraphicsTools
         Diligent-Common
         Diligent-GraphicsAccessories
@@ -337,9 +430,192 @@ if(UNIX AND NOT APPLE)
     endif()
 endif()
 
+# ---- 4.2 vendor upscalers: AMD FidelityFX (FSR 3.1 / FSR 4) and Intel XeSS -----------------------
+# Fetched once at configure time from the vendors' GitHub releases, pinned by hash, like the Linux
+# DXC. Only the API headers, the licence and the signed runtime DLLs come down; the runtimes deploy
+# next to the renderer DLL (modules/) and are loaded by name at run time - absent = the variant is
+# not offered. Package Project decides which of them ship.
+if(WIN32)
+    set(_nuke_ffx_dir  "${CMAKE_CURRENT_SOURCE_DIR}/deps/ffx")
+    set(_nuke_ffx_base "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.3.0")
+    set(_nuke_ffx_files
+        "Kits/FidelityFX/api/include/ffx_api.h|api/include/ffx_api.h|e1a9d1b559eaf75f4cb401f1c43a66e2f3dc9621abfeb58b9c6fac56443177fd"
+        "Kits/FidelityFX/api/include/ffx_api_loader.h|api/include/ffx_api_loader.h|18d1901dbbc881e8131b91c65ad44bb3b4a1de6c31435d5b75236f16727ba80e"
+        "Kits/FidelityFX/api/include/ffx_api_types.h|api/include/ffx_api_types.h|cc0adc0ffc804dd7cd03c39c15581b575e416383177ffe95060201d52cc0fc49"
+        "Kits/FidelityFX/api/include/dx12/ffx_api_dx12.h|api/include/dx12/ffx_api_dx12.h|c9afbc3c4c673723e9e5369a666f0ff54560543b5a93537f8ff453bf1c3bf530"
+        "Kits/FidelityFX/upscalers/include/ffx_upscale.h|upscalers/include/ffx_upscale.h|65be36d5653eb71c10379e0204f7bb7cd6a8aeec96e6f8cffc5f59ffeb1f89bf"
+        "Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll|bin/amd_fidelityfx_upscaler_dx12.dll|d0dcccc74a43c44ba435b7a369b456e0970d8a4464e4bd683119b374f2c9fb46"
+        # frame generation (FSR 3.1 FG): the effect + its frame-interpolation swap chain, one runtime
+        "Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h|framegeneration/include/ffx_framegeneration.h|e6c42f8a38aab2c7c4fc6931545a8e5463fdf87349902ec9687d9fe4949a0566"
+        "Kits/FidelityFX/framegeneration/include/ffx_framegeneration_api_types.h|framegeneration/include/ffx_framegeneration_api_types.h|396596af3df63310674e8036abd2ad0fcd061e61334e7a2c76653a2be3c686b4"
+        "Kits/FidelityFX/framegeneration/include/dx12/ffx_api_framegeneration_dx12.h|framegeneration/include/dx12/ffx_api_framegeneration_dx12.h|d533810bbd6fd4f87dfa2c1657c1457c7b1597b66345827d375b081d67127f66"
+        "Kits/FidelityFX/signedbin/amd_fidelityfx_framegeneration_dx12.dll|bin/amd_fidelityfx_framegeneration_dx12.dll|02297beedd285e822d3a64f314cf00faf378dcec0edc47ff0c4dd71b3a8c2f18"
+        "LICENSE.txt|LICENSE.txt|d5558cd419c8d46bdc958064cb97f963d1ea793866414c025906ec15033512ed")
+    set(NUKE_FFX_OK ${NUKE_TECH_FSR})
+    if(NUKE_TECH_FSR)
+    foreach(_e IN LISTS _nuke_ffx_files)
+        string(REPLACE "|" ";" _e "${_e}")
+        list(GET _e 0 _src)
+        list(GET _e 1 _dst)
+        list(GET _e 2 _sha)
+        if(NOT EXISTS "${_nuke_ffx_dir}/${_dst}")
+            message(STATUS "FidelityFX: downloading ${_dst}...")
+            file(DOWNLOAD "${_nuke_ffx_base}/${_src}" "${_nuke_ffx_dir}/${_dst}" EXPECTED_HASH SHA256=${_sha} STATUS _st)
+            list(GET _st 0 _rc)
+            if(NOT _rc EQUAL 0)
+                message(WARNING "FidelityFX: download of ${_dst} failed - FSR 3.1 / FSR 4 stay off")
+                set(NUKE_FFX_OK FALSE)
+                file(REMOVE "${_nuke_ffx_dir}/${_dst}")
+            endif()
+        endif()
+    endforeach()
+    endif()
+
+    set(_nuke_ffxvk_dir  "${CMAKE_CURRENT_SOURCE_DIR}/deps/ffx-vk")
+    set(_nuke_ffxvk_base "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v1.1.4")
+    set(_nuke_ffxvk_files
+        "ffx-api/include/ffx_api/ffx_api.h|include/ffx_api.h|408b4203545e8299ed188fbb1d9ddfe0932b73ea6e8b14fe10edcf1f45771561"
+        "ffx-api/include/ffx_api/ffx_api_loader.h|include/ffx_api_loader.h|7be51b7bf1e640b84c0c7f22a9db50a6816debce3755b51224e56c89501659c3"
+        "ffx-api/include/ffx_api/ffx_api_types.h|include/ffx_api_types.h|dee2782813d22047c068e0fb27d1347324f8ce79d280a4672848b3b294cb12fe"
+        "ffx-api/include/ffx_api/ffx_framegeneration.h|include/ffx_framegeneration.h|344936dccf49267d4421d1d74dc6db617d0a83c5a9f5991841325e812a38f127"
+        "ffx-api/include/ffx_api/ffx_upscale.h|include/ffx_upscale.h|1155bcdcea9c10e6a95507bc9422ca062a853ac84250f0b09a637a66836b3ac1"
+        "ffx-api/include/ffx_api/vk/ffx_api_vk.h|include/vk/ffx_api_vk.h|a50a8d5ff5689a10a6ce378f2df5569fd880c89ec46e8356aaf35eb40512edd9"
+        "PrebuiltSignedDLL/amd_fidelityfx_vk.dll|bin/amd_fidelityfx_vk.dll|a1624cc4238fef046f30c4d80ce3f47be63fc5f5373f49e3ee9edb9960f54c78"
+        "LICENSE.txt|LICENSE.txt|82cf74fc23885107c7f69249ac3f1dac55898ff68320eb2c753984cae6b2d78a")
+    set(NUKE_FFXVK_OK ${NUKE_TECH_FSR})
+    if(NUKE_TECH_FSR)
+    foreach(_e IN LISTS _nuke_ffxvk_files)
+        string(REPLACE "|" ";" _e "${_e}")
+        list(GET _e 0 _src)
+        list(GET _e 1 _dst)
+        list(GET _e 2 _sha)
+        if(NOT EXISTS "${_nuke_ffxvk_dir}/${_dst}")
+            message(STATUS "FidelityFX (Vulkan, SDK 1.1.4): downloading ${_dst}...")
+            file(DOWNLOAD "${_nuke_ffxvk_base}/${_src}" "${_nuke_ffxvk_dir}/${_dst}" EXPECTED_HASH SHA256=${_sha} STATUS _st)
+            list(GET _st 0 _rc)
+            if(NOT _rc EQUAL 0)
+                message(WARNING "FidelityFX (Vulkan): download of ${_dst} failed - FSR on Vulkan stays off")
+                set(NUKE_FFXVK_OK FALSE)
+                file(REMOVE "${_nuke_ffxvk_dir}/${_dst}")
+            endif()
+        endif()
+    endforeach()
+    endif()
+
+    set(_nuke_xess_dir "${CMAKE_CURRENT_SOURCE_DIR}/deps/xess")
+    set(NUKE_XESS_OK ${NUKE_TECH_XESS})
+    if(NUKE_TECH_XESS AND (NOT EXISTS "${_nuke_xess_dir}/bin/libxess.dll" OR NOT EXISTS "${_nuke_xess_dir}/bin/libxess_fg.dll" OR NOT EXISTS "${_nuke_xess_dir}/bin/libxell.dll"))
+        message(STATUS "XeSS: downloading the 3.0.2 SDK...")
+        file(DOWNLOAD "https://github.com/intel/xess/releases/download/v3.0.2/XeSS_SDK_3.0.2.zip" "${CMAKE_BINARY_DIR}/xess_sdk.zip"
+             EXPECTED_HASH SHA256=88b8a373f30e33f3558a77a93e634f11b8132fc3047ea1a8edeead32b8471990 STATUS _st)
+        list(GET _st 0 _rc)
+        if(_rc EQUAL 0)
+            file(ARCHIVE_EXTRACT INPUT "${CMAKE_BINARY_DIR}/xess_sdk.zip" DESTINATION "${CMAKE_BINARY_DIR}/xess-x"
+                 PATTERNS "inc/xess/*" "inc/xess_fg/*" "inc/xell/*" "bin/libxess.dll" "bin/libxess_fg.dll" "bin/libxell.dll" "LICENSE.txt" "third-party-programs.txt")
+            file(MAKE_DIRECTORY "${_nuke_xess_dir}/inc/xess" "${_nuke_xess_dir}/inc/xess_fg" "${_nuke_xess_dir}/inc/xell" "${_nuke_xess_dir}/bin")
+            file(GLOB _nuke_xess_inc "${CMAKE_BINARY_DIR}/xess-x/inc/xess/*.h")
+            file(COPY ${_nuke_xess_inc} DESTINATION "${_nuke_xess_dir}/inc/xess")
+            file(GLOB _nuke_xess_inc "${CMAKE_BINARY_DIR}/xess-x/inc/xess_fg/*.h")
+            file(COPY ${_nuke_xess_inc} DESTINATION "${_nuke_xess_dir}/inc/xess_fg")
+            file(GLOB _nuke_xess_inc "${CMAKE_BINARY_DIR}/xess-x/inc/xell/*.h")
+            file(COPY ${_nuke_xess_inc} DESTINATION "${_nuke_xess_dir}/inc/xell")
+            file(COPY "${CMAKE_BINARY_DIR}/xess-x/bin/libxess.dll" "${CMAKE_BINARY_DIR}/xess-x/bin/libxess_fg.dll" "${CMAKE_BINARY_DIR}/xess-x/bin/libxell.dll" DESTINATION "${_nuke_xess_dir}/bin")
+            file(COPY "${CMAKE_BINARY_DIR}/xess-x/LICENSE.txt" "${CMAKE_BINARY_DIR}/xess-x/third-party-programs.txt" DESTINATION "${_nuke_xess_dir}")
+            message(STATUS "XeSS: vendored at deps/xess/")
+        else()
+            message(WARNING "XeSS: download failed - XeSS stays off")
+            set(NUKE_XESS_OK FALSE)
+        endif()
+    endif()
+    # NVIDIA Streamline: DLSS Frame Generation runs only through it (sl.interposer.dll loads the
+    # sl.dlss_g / sl.reflex / sl.pcl plugins + nvngx_dlssg.dll). Headers and the production
+    # (signed, non-watermarked) runtimes only; the SDK zip is ~276 MB, fetched once.
+    set(_nuke_sl_dir "${CMAKE_CURRENT_SOURCE_DIR}/deps/streamline")
+    set(NUKE_SL_OK ${NUKE_TECH_DLSS})
+    if(NUKE_TECH_DLSS AND (NOT EXISTS "${_nuke_sl_dir}/bin/sl.dlss_g.dll" OR NOT EXISTS "${_nuke_sl_dir}/bin/NvLowLatencyVk.dll"))
+        message(STATUS "Streamline: downloading the 2.14.1 SDK...")
+        file(DOWNLOAD "https://github.com/NVIDIA-RTX/Streamline/releases/download/v2.14.1/streamline-sdk-v2.14.1.zip" "${CMAKE_BINARY_DIR}/streamline_sdk.zip"
+             EXPECTED_HASH SHA256=92c4d954631a1710da86ca3fa8d5034f2b9503838c95fc4ae977ae149319781b STATUS _st)
+        list(GET _st 0 _rc)
+        if(_rc EQUAL 0)
+            file(ARCHIVE_EXTRACT INPUT "${CMAKE_BINARY_DIR}/streamline_sdk.zip" DESTINATION "${CMAKE_BINARY_DIR}/sl-x"
+                 PATTERNS "include/*" "bin/x64/sl.interposer.dll" "bin/x64/sl.common.dll" "bin/x64/sl.dlss_g.dll"
+                          "bin/x64/sl.reflex.dll" "bin/x64/sl.pcl.dll" "bin/x64/nvngx_dlssg.dll" "bin/x64/NvLowLatencyVk.dll"
+                          "license.txt" "3rd-party-licenses.md")
+            file(MAKE_DIRECTORY "${_nuke_sl_dir}/include" "${_nuke_sl_dir}/bin")
+            file(GLOB _nuke_sl_inc "${CMAKE_BINARY_DIR}/sl-x/include/*.h")
+            file(COPY ${_nuke_sl_inc} DESTINATION "${_nuke_sl_dir}/include")
+            file(GLOB _nuke_sl_bin "${CMAKE_BINARY_DIR}/sl-x/bin/x64/*.dll")
+            file(COPY ${_nuke_sl_bin} DESTINATION "${_nuke_sl_dir}/bin")
+            file(COPY "${CMAKE_BINARY_DIR}/sl-x/license.txt" "${CMAKE_BINARY_DIR}/sl-x/3rd-party-licenses.md" DESTINATION "${_nuke_sl_dir}")
+            message(STATUS "Streamline: vendored at deps/streamline/")
+        else()
+            message(WARNING "Streamline: download failed - DLSS Frame Generation stays off")
+            set(NUKE_SL_OK FALSE)
+        endif()
+    endif()
+
+    if(NUKE_FFX_OK AND EXISTS "${_nuke_ffx_dir}/upscalers/include/ffx_upscale.h")
+        target_include_directories(NukeRenderDiligent PRIVATE "${_nuke_ffx_dir}" "${_nuke_ffx_dir}/upscalers/include")
+        target_compile_definitions(NukeRenderDiligent PRIVATE NUKE_FFX=1)
+        if(EXISTS "${_nuke_ffx_dir}/framegeneration/include/ffx_framegeneration.h")
+            target_include_directories(NukeRenderDiligent PRIVATE "${_nuke_ffx_dir}/framegeneration/include")
+            target_compile_definitions(NukeRenderDiligent PRIVATE NUKE_FFX_FG=1)
+        endif()
+    endif()
+    if(NUKE_XESS_OK AND EXISTS "${_nuke_xess_dir}/inc/xess/xess.h")
+        target_include_directories(NukeRenderDiligent PRIVATE "${_nuke_xess_dir}/inc")
+        target_compile_definitions(NukeRenderDiligent PRIVATE NUKE_XESS=1)
+        if(EXISTS "${_nuke_xess_dir}/inc/xess_fg/xefg_swapchain_d3d12.h" AND EXISTS "${_nuke_xess_dir}/inc/xell/xell_d3d12.h")
+            target_compile_definitions(NukeRenderDiligent PRIVATE NUKE_XESS_FG=1)
+        endif()
+    endif()
+    if(NUKE_SL_OK AND EXISTS "${_nuke_sl_dir}/include/sl.h")
+        target_include_directories(NukeRenderDiligent PRIVATE "${_nuke_sl_dir}/include")
+        target_compile_definitions(NukeRenderDiligent PRIVATE NUKE_STREAMLINE=1)
+    endif()
+    if(NUKE_FFXVK_OK AND EXISTS "${_nuke_ffxvk_dir}/include/vk/ffx_api_vk.h")
+        target_include_directories(NukeRenderDiligent PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps")   # <ffx-vk/include/...>
+        target_compile_definitions(NukeRenderDiligent PRIVATE NUKE_FFX_VK=1)
+    endif()
+    # volk's global function pointers (the Vulkan swap-chain entry points the vendors replace).
+    target_include_directories(NukeRenderDiligent PRIVATE "${_nuke_dc_dir}/ThirdParty/volk")
+endif()
+
 # Deploy the module DLL next to the editor, into modules/.
 set(MODULES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/${NUKE_RUN_SUBDIR}/$<CONFIG>/modules")
 set(EDITOR_DIR  "${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/${NUKE_RUN_SUBDIR}/$<CONFIG>")
+
+# The vendor runtimes of the technologies built in (NUKE_TECH), when the configure-time fetch got
+# them: FSR = FidelityFX D3D12 upscaler + FG + Vulkan, XeSS = XeSS + XeSS-FG + XeLL, DLSS = NGX's
+# nvngx_dlss.dll + the Streamline DLSS-G set. A technology left out deploys nothing (a runtime
+# already in modules/ from an earlier build is inert: the renderer does not look for it).
+set(_nuke_vendor_deploy "")
+if(WIN32)
+    set(_nuke_vendor_dlls "")
+    if(NUKE_TECH_FSR)
+        list(APPEND _nuke_vendor_dlls "${_nuke_ffx_dir}/bin/amd_fidelityfx_upscaler_dx12.dll" "${_nuke_ffx_dir}/bin/amd_fidelityfx_framegeneration_dx12.dll"
+                                      "${_nuke_ffxvk_dir}/bin/amd_fidelityfx_vk.dll")
+    endif()
+    if(NUKE_TECH_XESS)
+        list(APPEND _nuke_vendor_dlls "${_nuke_xess_dir}/bin/libxess.dll" "${_nuke_xess_dir}/bin/libxess_fg.dll" "${_nuke_xess_dir}/bin/libxell.dll")
+    endif()
+    if(NUKE_TECH_DLSS)
+        list(APPEND _nuke_vendor_dlls "${_nuke_sl_dir}/bin/sl.interposer.dll" "${_nuke_sl_dir}/bin/sl.common.dll" "${_nuke_sl_dir}/bin/sl.dlss_g.dll"
+                                      "${_nuke_sl_dir}/bin/sl.reflex.dll" "${_nuke_sl_dir}/bin/sl.pcl.dll" "${_nuke_sl_dir}/bin/nvngx_dlssg.dll"
+                                      "${_nuke_sl_dir}/bin/NvLowLatencyVk.dll")
+        # DLSS runtime (the fetched DLSS-Headers package): NGX searches the directory of the module
+        # that initialised it - this renderer DLL's, modules/ - not the host's.
+        if(DEFINED DLSS_BIN_DIR)
+            list(APPEND _nuke_vendor_dlls "${DLSS_BIN_DIR}/nvngx_dlss.dll")
+        endif()
+    endif()
+    foreach(_dll IN LISTS _nuke_vendor_dlls)
+        if(EXISTS "${_dll}")
+            list(APPEND _nuke_vendor_deploy COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dll}" "${MODULES_DIR}/")
+        endif()
+    endforeach()
+endif()
 
 # Vendored-DXC deploy commands for the Linux branches below (empty without the download).
 set(_nuke_dxc_deploy "")
@@ -372,7 +648,10 @@ if(WIN32)
                 "${VCPKG_INSTALLED}/bin/dstorage.dll" "${EDITOR_DIR}/"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${VCPKG_INSTALLED}/bin/dstoragecore.dll" "${EDITOR_DIR}/"
-        COMMENT "Deploying NukeRenderDiligent.dll + glfw3.dll + DXC (dxcompiler/dxil) + DirectStorage"
+        # The vendor runtimes of the technologies built in (NUKE_TECH; absent = not offered, never
+        # a failed load). Package Project decides which of them ship.
+        ${_nuke_vendor_deploy}
+        COMMENT "Deploying NukeRenderDiligent.dll + glfw3.dll + DXC (dxcompiler/dxil) + DirectStorage + vendor tech (${NUKE_TECH})"
     )
 elseif(APPLE)
     # ---- vendored UNIVERSAL MoltenVK (download-and-run games) --------------------------------

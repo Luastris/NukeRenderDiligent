@@ -40,8 +40,19 @@ void NukeDiligent::Impl::SetCameraViewProj(const NukeCameraDesc& cam, int w, int
 	curCamEditor = cam.editorCamera != 0;   // module passes read this through the native hatch
 }
 
-// Target size for a camera (matches beginCamera): backbuffer (target 0) or the off-screen RT.
+// The RENDER size for a camera: its target's size (backbuffer for target 0, else the off-screen
+// RT) scaled down by this pass's upscaler (the chain's upscale stage; 1:1 without one). The
+// prepass and beginCamera share it, so depth/velocity and colour agree. Resolves curUp*.
 bool NukeDiligent::Impl::CameraSize(const NukeCameraDesc& cam, int& w, int& h)
+{
+	int ow = 0, oh = 0;
+	if (!CameraOutSize(cam, ow, oh)) return false;
+	UpscaleInternalSize(ow, oh, w, h);
+	return w > 0 && h > 0;
+}
+
+// The OUTPUT size of a camera's target: what the tonemap, gizmos and HUD draw at.
+bool NukeDiligent::Impl::CameraOutSize(const NukeCameraDesc& cam, int& w, int& h)
 {
 	if (cam.target == 0)
 	{
@@ -766,6 +777,7 @@ void NukeDiligent::Impl::WriteFrameCB(const float3& P)
 	memcpy(fb->wind2, windParams,      sizeof(fb->wind2));   //      g_Wind2 (turbAmount, 1/turbScale, time, gustFreq)
 	fb->misc[0] = giCaptureMaxD > 0.0f ? 1.0f : 0.0f; fb->misc[1] = giCaptureMaxD; fb->misc[2] = skyMapSRV ? 1.0f : 0.0f; fb->misc[3] = 0.0f;   // z = the sky map is live
 	memcpy(fb->cloudShadow, cloudShadowOrigin, sizeof(fb->cloudShadow));   // VL3: cloud shadow map origin x,z, 1/size, strength
+	fb->mipBias[0] = curMipBias; fb->mipBias[1] = fb->mipBias[2] = fb->mipBias[3] = 0.0f;   // 4.2: material LOD bias under an upscaler
 }
 
 void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
@@ -792,11 +804,19 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	ITextureView* rtv = nullptr;
 	ITextureView* dsv = nullptr;
 	int w = 0, h = 0;
+	// w x h = the internal render size (the upscaler's input); ow x oh = the target's own size.
+	int ow = 0, oh = 0;
+	if (!m_impl->CameraOutSize(cam, ow, oh)) return;
+	m_impl->UpscaleInternalSize(ow, oh, w, h);
+	if (m_impl->curUpTemporal) m_impl->coverWanted = true;   // the reactive mask wants the sprite coverage too
+	if (cam.target == 0)   // the status Game.ActiveUpscaler / UpscaleInfo report
+	{
+		m_impl->statUpVariant = m_impl->curUpVariant; m_impl->statUpQuality = m_impl->curUpQuality;
+		m_impl->statInW = w; m_impl->statInH = h; m_impl->statOutW = ow; m_impl->statOutH = oh; m_impl->statUpFrame = m_impl->frameId;
+	}
 	if (cam.target == 0)
 	{
 		// Backbuffer path renders to an HDR intermediate; endCamera's post pass tonemaps into the swap chain.
-		w = (int)m_impl->swapChain->GetDesc().Width;
-		h = (int)m_impl->swapChain->GetDesc().Height;
 		m_impl->EnsureBackbufferMS(w, h);
 		Impl::RT& bb = m_impl->backbufferMS;
 		rtv = bb.rtv; dsv = bb.dsv;
@@ -809,7 +829,8 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 		auto it = m_impl->rts.find(cam.target);
 		if (it == m_impl->rts.end()) return;
 		Impl::RT& rt = it->second;
-		rtv = rt.rtv; dsv = rt.dsv; w = rt.w; h = rt.h;
+		m_impl->EnsureRTScene(rt, w, h);   // the scene textures follow the render scale; the post output stays
+		rtv = rt.rtv; dsv = rt.dsv;
 		if (ms && rt.colorMS) { m_impl->curMSAA = true; m_impl->curResolveSrc = rt.colorMS; m_impl->curResolveDst = rt.color; }
 		m_impl->curPostSrc = rt.hdrSRV;
 		m_impl->curPostDst = rt.postRTV;
@@ -817,6 +838,9 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	if (!rtv) return;
 	m_impl->curRTV = rtv; m_impl->curDSV = dsv;                     // for the selection-outline pass (restore)
 	m_impl->curRTW = w; m_impl->curRTH = h;
+	m_impl->outW = ow; m_impl->outH = oh;
+	m_impl->curMipBias = (w < ow && ow > 0) ? log2f((float)w / (float)ow) : 0.0f;   // material textures keep their detail for the reconstruction
+	m_impl->curFovY = cam.fov;
 	m_impl->cameraPassActive = true;   // sprites may draw from here until endCamera completes
 	{   // module camera-begin hook (water resets its per-camera underwater candidate here);
 		// its GPU work (FFT/ripple/SWE/FLIP sims) times as "water.sim", then "scene" resumes.
@@ -862,8 +886,15 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	m_impl->curProjNoJitter = m_impl->curProj;   // unjittered — TAA reprojection + the depth prepass use this
 	if (m_impl->curTAA && w > 0 && h > 0)        // TAA: jitter the COLOUR projection sub-pixel (Halton); depth stays clean
 	{
-		m_impl->curProj.m[2][0] += m_impl->curJitterX * 2.0f / (float)w;   // pixel -> NDC (row-vector: clip.x += vz*offset)
-		m_impl->curProj.m[2][1] += m_impl->curJitterY * 2.0f / (float)h;
+		if (m_impl->curUpTemporal)   // a temporal upscaler dictates its own pattern (phase count from the scale)
+		{
+			m_impl->EnsureUpscaler(w, h, ow, oh, Impl::HDR_FMT);   // the chain's format
+			m_impl->UpscaleJitter(m_impl->curJitterX, m_impl->curJitterY);
+		}
+		// Pixel offset -> clip: x as is, y negated (pixel rows grow down, clip y up). The upscaler
+		// gets the same pixel offset back to undo it; our own TAA never reads it.
+		m_impl->curProj.m[2][0] += m_impl->curJitterX * 2.0f / (float)w;   // (row-vector: clip.x += vz*offset)
+		m_impl->curProj.m[2][1] -= m_impl->curJitterY * 2.0f / (float)h;
 	}
 
 	float3 P(cam.camPos[0], cam.camPos[1], cam.camPos[2]);
@@ -1607,6 +1638,7 @@ void NukeDiligent::endCamera()
 	// 1.5) Module post hook — after the resolve, BEFORE the user chain: its output is scene content.
 	ITextureView* chainSrc = m_impl->curPostSrc;
 	bool preDone = false;   // the media block: once per camera pass, before the first non-reflection effect
+	bool upscaled = false;  // the temporal upscale slot ran: the chain image is output-sized
 	// The media between the eye and the scene, composited in depth order: the air (aerial
 	// perspective, clouds, froxel fog, sun shafts), then the water column (module post hook:
 	// underwater compose / wetness), then the lens film. Reflections composite before all of it
@@ -1651,7 +1683,7 @@ void NukeDiligent::endCamera()
 	if (!m_impl->postChain.empty() && chainSrc && m_impl->curRTW > 0 && m_impl->curRTH > 0)
 	{
 		m_impl->EnsureScratch(m_impl->curRTW, m_impl->curRTH);
-		const int w = m_impl->curRTW, h = m_impl->curRTH;
+		int w = m_impl->curRTW, h = m_impl->curRTH;   // internal until the upscale slot, the output after
 		ITextureView* srcSRV = chainSrc;
 		int idx = 0;
 		for (auto& cs : m_impl->postChain)
@@ -1706,9 +1738,25 @@ void NukeDiligent::endCamera()
 				m_impl->RunExposure(srcSRV, dstRTV, w, h, cs.params);
 				m_impl->GpuPass("post");
 			}
+			else if (pit->second.isUpscale)   // 4.2 super resolution: temporal variants reconstruct the output here
+			{
+				if (!m_impl->curUpTemporal || !m_impl->gbufActive) continue;   // spatial runs after the tonemap; no prepass = nothing to reconstruct from
+				// No GPU timer around it: the vendor runtime flushes the command list (NGX evaluate), and
+				// D3D12 needs a query begun and ended in one list.
+				m_impl->GpuPassEnd();
+				ITextureView* up = m_impl->RunUpscaleTemporal(srcSRV);
+				m_impl->GpuPass("post");
+				if (!up) continue;
+				// From here the chain runs at the output size (its own scratch pair).
+				srcSRV = up; upscaled = true;
+				w = m_impl->outW; h = m_impl->outH;
+				m_impl->EnsureScratch(w, h);
+				continue;
+			}
 			else if (pit->second.isTAA)   // built-in temporal AA (jittered accumulation; needs the depth prepass)
 			{
 				if (!m_impl->gbufActive) continue;   // no depth prepass -> skip (src passes through)
+				if (m_impl->curUpTemporal) continue;  // the temporal upscaler IS the temporal AA
 				m_impl->GpuPass("taa");
 				m_impl->RunTAA(pit->second, srcSRV, dstTex, w, h, cs.params);
 				m_impl->GpuPass("post");
@@ -1754,13 +1802,19 @@ void NukeDiligent::endCamera()
 	m_impl->GpuPass("tonemap");
 	if (chainSrc && m_impl->curPostDst)
 	{
-		m_impl->RunPostPass(chainSrc, m_impl->curPostDst, m_impl->curRTW, m_impl->curRTH, m_impl->curTarget == 0);
+		// The output is drawn at the target's size: a temporal upscale already reconstructed it; the
+		// spatial one tonemaps at the internal size and upscales the LDR image into the target; a
+		// pass whose upscaler could not run stretches (bilinear) rather than shows a smaller frame.
+		(void)upscaled;
+		if (!m_impl->RunUpscaleSpatial(chainSrc, m_impl->curPostDst, m_impl->curTarget == 0))
+			m_impl->RunPostPass(chainSrc, m_impl->curPostDst, m_impl->outW, m_impl->outH, m_impl->curTarget == 0);
 
 		// Gizmo lines last, over the final LDR image (target still bound by RunPostPass): TAA has
 		// no velocity for lines and the RT-reflection composite would overwrite them.
 		m_impl->DrawDebugLines(m_impl->curTarget == 0);
 		m_impl->FlushScreenPost(m_impl->curTarget == 0);   // AfterPost screen-space canvas sprites (crisp HUD)
 	}
+	if (m_impl->curTarget == 0) m_impl->FrameGenCapture();   // 4.2: this pass's depth / motion / camera for the generated frame
 
 	m_impl->GpuPassEnd();
 	m_impl->curMSAA = false; m_impl->curResolveSrc = nullptr; m_impl->curResolveDst = nullptr;

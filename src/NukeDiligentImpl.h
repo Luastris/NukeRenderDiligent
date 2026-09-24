@@ -68,6 +68,7 @@ extern "C" void  NukeCocoaSetHiddenFromCapture(GLFWwindow* wnd, bool hide);
 #include "EngineFactoryVk.h"      // Vulkan backend: HLSL->SPIRV via glslang (the only backend off Windows)
 #include "RenderDevice.h"
 #include "DeviceContext.h"
+#include "SuperResolutionFactoryLoader.h"   // Diligent SuperResolution (DLSS / FSR 1): the 4.2 upscaler seam
 #include "SwapChain.h"
 #include "PipelineState.h"
 #include "ShaderResourceBinding.h"
@@ -289,6 +290,19 @@ struct NukeDiligent::Impl
 	std::unordered_map<uint64_t, RefCntAutoPtr<ITexture>> textures;
 
 	// --- render targets (cameras draw into these; the UI can sample them) ---
+	// One size of an RT's scene textures (colour / depth, MS + resolve). An RT keeps the sets of
+	// every render size it drew at lately: a size change (the upscaler's quality, a camera going
+	// native) swaps sets instead of destroying the old one at once - on Vulkan a scene target
+	// destroyed within a few frames of its replacement corrupted later passes (the DDGI atlas went
+	// pure green), GPU idle or not; sets unused for kSceneKeepFrames are released.
+	struct SceneTex
+	{
+		RefCntAutoPtr<ITexture> color, depth, colorMS, depthMS;
+		ITextureView* rtv = nullptr; ITextureView* dsv = nullptr; ITextureView* hdrSRV = nullptr;
+		int sw = 0, sh = 0;
+		uint64_t lastUsed = 0;
+	};
+	static const uint64_t kSceneKeepFrames = 240;
 	struct RT
 	{
 		RefCntAutoPtr<ITexture> color, depth;     // color = HDR (RGBA16F) single-sample: geometry target (no MSAA) / resolve dest
@@ -299,7 +313,9 @@ struct NukeDiligent::Impl
 		ITextureView* hdrSRV = nullptr;           // color's SRV (post-pass input)
 		ITextureView* postRTV = nullptr;          // post's RTV (post-pass output)
 		ITextureView* srv = nullptr;              // post's SRV (final LDR result shown by the UI / sampled as a texture)
-		int w = 0, h = 0;
+		int w = 0, h = 0;                         // the RT's (output) size: post + what the UI sees
+		int sw = 0, sh = 0;                       // the scene textures' size: smaller than w x h under an upscaler (render scale)
+		std::vector<SceneTex> scenes;             // every size drawn lately (the active one included)
 	};
 	std::unordered_map<uint64_t, RT> rts;
 	uint64_t rtCounter = 0;
@@ -324,6 +340,8 @@ struct NukeDiligent::Impl
 	ITextureView* curPostSrc = nullptr; // HDR SRV the post pass reads (after resolve)
 	ITextureView* curPostDst = nullptr; // LDR RTV the post pass writes (RT's post / the backbuffer)
 	void EnsureBackbufferMS(int w, int h);
+	void EnsureRTScene(RT& rt, int sw, int sh);   // make the sw x sh scene set of an RT active (cached per size); post stays
+	void MakeSceneTex(SceneTex& s, int sw, int sh);   // the colour / depth (+ MS) textures of one size
 
 	// --- Post-process ------------------------------------------------------------------------------
 	RefCntAutoPtr<IPipelineState>         postPSO;       // -> RT targets (RGBA8, SDR sRGB)
@@ -341,6 +359,7 @@ struct NukeDiligent::Impl
 	                  IShaderResourceVariable* histVar = nullptr; IShaderResourceVariable* velVar = nullptr; bool isTAA = false;   // temporal AA (history + depth + velocity)
 	                  bool isRTRef = false;   // built-in ray-traced reflections (D3D12)
 	                  bool isDOF = false, isMotion = false, isExposure = false;   // R3 built-ins (NukeDiligent_PostFX.cpp)
+	                  bool isUpscale = false;   // 4.2 super resolution (NukeDiligent_Upscale.cpp): the scene renders smaller, this slot reconstructs the output
 	                  IShaderResourceVariable* tlasVar = nullptr; IShaderResourceVariable* instVar = nullptr;
 	                  IShaderResourceVariable* nrmVar = nullptr;  IShaderResourceVariable* rtProbeVar = nullptr;
 	                  IShaderResourceVariable* uvVar = nullptr;   IShaderResourceVariable* matTexVar = nullptr; };
@@ -425,6 +444,12 @@ struct NukeDiligent::Impl
 		uint64_t lastUsed = 0;
 	};
 	std::unordered_map<uint64_t, GBufferSet> gbufCache;
+	// The prepass coverage sub-pass (beginGBufferCoverage): the transparent / additive draws paint
+	// their alpha into a scratch set's id target over a copy of the opaque depth - the world part of
+	// the upscaler's reactive mask (gbuffer.ps coverage mode via g_Params2.z).
+	GBufferSet                          gbufCoverSet;             // scratch targets at the prepass size
+	bool                                gbufCoverActive = false;  // inside the sub-pass: RenderGBufferRange paints coverage
+	ITextureView*                       gbufCoverSRV = nullptr;   // this pass's world coverage (null = none)
 	uint64_t                            gbufFrameCtr = 0;   // LRU clock
 	uint64_t                            gbufCurKey = 0;     // active set's key (never evicted)
 	// Overlay-slot texture names: kOvSlots x (albedo, normal, MR, mask2D) + the painted
@@ -461,6 +486,116 @@ struct NukeDiligent::Impl
 	bool                                curTAA = false;        // is the current camera running TAA?
 	float                               curJitterX = 0.0f, curJitterY = 0.0f;   // this frame's jitter (pixels, [-0.5,0.5])
 	int                                 taaFrame = 0;
+	// --- 4.2 Super resolution (NukeDiligent_Upscale.cpp) ----------------------------------------
+	// The upscalers this device offers, from three sources: Diligent's SuperResolution factory
+	// (DLSS through NGX on D3D12 + Vulkan, FSR 1 spatial everywhere), the AMD FidelityFX API (FSR
+	// 3.1 / FSR 4, D3D12) and Intel XeSS (D3D12). Every vendor runtime is a separate DLL next to
+	// this renderer DLL, never a hard import. One upscaler per camera (temporal history), re-made
+	// when the variant / quality / sizes change. The chain's "upscale" stage picks the mode.
+	RefCntAutoPtr<ISuperResolutionFactory> srFactory;
+	std::vector<SuperResolutionInfo>       srVariants;
+	struct UpVariant { std::string name; bool temporal = false; int kind = 0; int index = -1; };   // kind: 0 Diligent, 1 FFX, 2 XeSS; index into srVariants for kind 0
+	std::vector<UpVariant>                 upVariants;
+	void*                                  xessProbe = nullptr;   // an XeSS context that only answers the render-size query
+	struct UpscaleState
+	{
+		int kind = -1;
+		RefCntAutoPtr<ISuperResolution> sr;   // kind 0
+		void* ffx = nullptr;                  // kind 1: the FFX upscale context
+		void* xess = nullptr;                 // kind 2: the XeSS context
+		uint32_t xessFlags = 0; bool xessBuilt = false;
+		bool ready = false;                   // the vendor object is live (XeSS: pipelines built + initialised)
+		RefCntAutoPtr<ITexture> out;   // temporal: the reconstructed HDR frame (UAV + SRV), the chain continues from it
+		RefCntAutoPtr<ITexture> ldr;   // spatial: the tonemapped internal-size image the spatial pass reads
+		RefCntAutoPtr<ITexture> in;    // temporal: the source converted into the chain format when it is not in it
+		RefCntAutoPtr<ITexture> react; // temporal: the reactive mask (R8, internal size; upscale_reactive.ps)
+		int variant = -1, quality = -1, inW = 0, inH = 0, outW = 0, outH = 0;
+		int phaseCount = 8;            // the jitter sequence length (the vendor's, or 8 x scale^2)
+		TEXTURE_FORMAT fmt = TEX_FORMAT_UNKNOWN;
+		bool fresh = true;             // reset the history on the first execute
+		uint64_t lastUsed = 0;
+	};
+	std::unordered_map<uint64_t, UpscaleState> upscaleStates;   // by camKey
+	// Resolved for the CURRENT camera pass (beginGBufferPass / beginCamera):
+	int   curUpVariant = -1;       // index into upVariants, -1 = no upscaling this pass
+	int   curUpQuality = 1;
+	float curUpSharp = 0.0f;
+	bool  curUpTemporal = false;   // temporal (replaces TAA, HDR slot) vs spatial (after the tonemap)
+	void  CreateUpscaleFactory();  // after device creation; logs the variants
+	void  ShutdownUpscalers();     // before the device goes
+	int   UpscaleWanted(int& quality, float& sharp) const;   // the chain's upscale stage -> mode (-1 = none)
+	int   ResolveUpscaleVariant(int mode) const;             // mode -> upVariants index (-1 = none available)
+	int   UpscaleVariantOf(int mode) const;                  // the variant implementing exactly that mode (-1 = not offered)
+	// The back-buffer camera's last resolution (getUpscaleStatus): variant, tier, sizes, frame.
+	int      statUpVariant = -1, statUpQuality = 0, statInW = 0, statInH = 0, statOutW = 0, statOutH = 0;
+	uint64_t statUpFrame = 0;
+	unsigned FrameGenOffered() const;                        // bit (1 << UpscaleMode vendor): the generators that can attach here
+	bool  UpscaleInternalSize(int outW, int outH, int& inW, int& inH);   // this pass's render size (sets curUp*)
+	bool  CameraOutSize(const NukeCameraDesc& cam, int& w, int& h);      // the target's own size
+	void  UpscaleJitter(float& jx, float& jy);               // the variant's jitter for this frame (pixels)
+	UpscaleState& EnsureUpscaler(int inW, int inH, int outW, int outH, TEXTURE_FORMAT fmt);
+	void  DestroyUpscaler(UpscaleState& us);
+	ITextureView* BuildReactiveMask(UpscaleState& us);   // water + sprite coverage -> us.react (null = none this pass)
+	RefCntAutoPtr<IPipelineState>         upReactPSO;    // upscale_reactive.ps (built with the R3 post pipelines)
+	RefCntAutoPtr<IShaderResourceBinding> upReactSRB;
+	ITextureView* RunUpscaleTemporal(ITextureView* srcSRV);  // HDR in -> out-size HDR (null = not run)
+	bool  RunUpscaleSpatial(ITextureView* chainSRV, ITextureView* dstRTV, bool toBackbuffer);   // tonemap at in-size, FSR 1 into dst
+	// 4.2 frame generation (NukeDiligent_FrameGen.cpp): a vendor proxy swap chain under the Diligent
+	// one presents generated frames between the rendered ones. D3D12 only; asked for on the chain's
+	// upscale stage (g_FrameGen / g_FrameGenFrames), the generator follows the stage's mode.
+	struct FrameGenState
+	{
+		int  kind = 0;                 // FG_NONE / FG_FSR / FG_DLSS / FG_XESS, as attached
+		int  mode = -1, frames = 0;    // the stage settings the attachment answers to
+		int  framesLive = 1;           // generated frames per rendered one the vendor actually runs
+		bool attached = false, live = false, saidNone = false;
+		int  failed = 0;               // bitmask of kinds that refused this session (not retried)
+		void* proxy = nullptr;         // the vendor's IDXGISwapChain (our reference)
+		void* ffx = nullptr;  void* ffxSc = nullptr;   // FFX: the FG effect + its swap-chain context
+		void* xefg = nullptr; void* xell = nullptr;    // XeSS-FG + XeLL contexts
+		bool  slInit = false, slReady = false; void* slToken = nullptr;   // Streamline: initialised / DLSS-G usable / this frame's token
+		RefCntAutoPtr<ITexture> hudless;   // the presented image before the UI (back-buffer size + format)
+		// This frame's inputs, captured by the back-buffer camera pass (endCamera):
+		bool captured = false, reset = true, hadLast = false;
+		RefCntAutoPtr<ITexture> depth, vel; int rw = 0, rh = 0; float jx = 0.0f, jy = 0.0f;
+		float4x4 view, proj, prevView, prevProj, lastView, lastProj;
+		float nearZ = 0.1f, farZ = 1000.0f, fov = 1.0472f; float pos[3] = {0, 0, 0};
+		uint64_t frameIndex = 0;       // presents since the attach: the vendors' frame id
+		uint64_t lastLog = 0;
+		unsigned presentBase = 0;      // DXGI present count at the last stats line (presents per rendered frame)
+		uint64_t lastCapFrame = 0;     // the last frame a back-buffer camera rendered (the attach waits for one)
+		uint64_t attachFrame = 0;      // the frame the proxy was attached in
+		double ratio = 0.0;            // presents per rendered frame, measured (0 = not yet)
+		unsigned ratioBase = 0; uint64_t ratioFrame = 0;
+		double fpsRendered = 0.0, fpsAcc = 0.0; int fpsFrames = 0; double fpsLast = 0.0;   // the renderer's own rendered-FPS meter (title)
+	} fg;
+	// The Vulkan side (NukeDiligent_FrameGenVk.cpp): Streamline's Vulkan proxies (DLSS-G) and AMD's
+	// Vulkan runtime (FSR 3.1.4 upscaler + frame interpolation), over the same Diligent swap chain.
+	struct FrameGenVkState
+	{
+		bool hooked = false;       // the create-instance / create-device hooks are installed
+		bool slProxied = false;    // Streamline's Vulkan swap-chain proxies are live (NVIDIA + runtime present)
+		bool queues = false;       // the extra queues FSR FG wants were reserved at device creation
+	} fgVk;
+	void FrameGenVkBeforeDevice(bool nvAdapter);   // before CreateDeviceAndContextsVk: slInit + the creation hooks
+	void FrameGenVkAfterDevice();                  // after it: the proxies into the loader table, the extra queues
+	bool FrameGenVkAttach(int kind, int frames);
+	void FrameGenVkDetach();
+	void FrameGenVkBeforePresent(bool ready, float dt, int W, int H);
+	double FrameGenVkPresentRatio();               // presents per rendered frame since the last call (0 = unknown)
+	bool FrameGenSlConstants(int W, int H);        // this frame's sl::Constants (both backends)
+	void FrameGenTitle(std::string& title);        // the generator's state + presented FPS for the window title
+	int  FrameGenWanted(int& frames) const;   // the upscale stage's g_FrameGen -> the stage's mode (-1 = off)
+	int  ResolveFrameGenKind(int mode) const; // mode -> the generator to try (FG_NONE = none left)
+	void FrameGenApply();                     // per frame, before the back buffer is fetched: attach / detach / retune
+	bool FrameGenAttach(int kind, int frames);
+	void FrameGenDetach(const char* why);
+	void FrameGenFrameStart();                // the frame token, the latency sleep, the markers
+	void FrameGenCapture();                   // endCamera of the back-buffer pass: depth / velocity / camera
+	void FrameGenHudless(ITextureView* backRTV);   // after the world passes, before the UI
+	void FrameGenBeforePresent();
+	void FrameGenAfterPresent();
+	void ShutdownFrameGen();
 	float4x4                            curProjNoJitter;       // curProj before jitter (for TAA reprojection)
 	void RunTAA(PostPipe& pp, ITextureView* srcSRV, ITexture* dstTex, int w, int h, const std::vector<float>& params);
 
@@ -1020,8 +1155,13 @@ struct NukeDiligent::Impl
 	// only — never the context), `adopt` on the render thread once it finished (publish flags,
 	// swap pointers). Used by the G-buffer/RT pipelines and by modules through the native hatch.
 	std::vector<std::shared_ptr<BuildJob>> jobDone;
+	std::vector<std::shared_ptr<BuildJob>> jobsRunning;   // dequeued, on a builder thread (WaitBuilds)
+	boost::condition_variable              pipeJobCv;     // a running job finished
 	void EnqueueBuild(const boost::function<void()>& build, const boost::function<void()>& adopt,
 	                  int prio = kPrioModule, const char* name = "");
+	// Drop the queued `name` jobs, wait for a running one, drop its adopt: an owner about to
+	// release what its builds touch (module shutdown, device swap) calls this first.
+	void WaitBuilds(const char* name);
 	void EnqueueItem(BuildItem&& it);   // sorted insert + wake
 	std::atomic<bool> gbufBuilding{false};   // G-buffer pipes in flight: the prepass skips
 	std::atomic<bool> rtBuilding{false};     // RT reflection pipeline in flight: the pass blits through
@@ -1123,7 +1263,8 @@ struct NukeDiligent::Impl
 	                     float wind[4]; float wind2[4];      // dir.xyz+gusted strength; turbAmount, 1/turbScale, time, gustFreq
 	                     float misc[4];                       // x = GI probe capture (alpha = distance / y), y = max distance
 	                     float cloudShadow[4];                // VL3 cloud shadow map: origin x, z, 1/size, strength (appended)
-	                     float atmoA[4]; float atmoB[4]; };   // physical atmosphere: mode, Rg km, Rt km, sky-view w | sun dir xyz, sky-view h (appended)
+	                     float atmoA[4]; float atmoB[4];      // physical atmosphere: mode, Rg km, Rt km, sky-view w | sun dir xyz, sky-view h (appended)
+	                     float mipBias[4]; };                 // x = material texture LOD bias (log2 of internal/output size under an upscaler) (appended)
 	float windDirStrength[4] = { 1, 0, 0, 0 };   // setWind (pushed per frame)
 	float windParams[4]      = { 0, 0, 0, 0 };
 	// Foliage bend: the VS-side BendCB — wind + up to 8 "pushers" that part the blades. Written
@@ -1143,6 +1284,7 @@ struct NukeDiligent::Impl
 	uint64_t                              curCamKey = 0;             // per-camera state key (target + camera id): TAA / AO / occlusion views
 	static uint64_t CamKey(const NukeCameraDesc& c) { return c.target ^ (c.cameraId * 0x9E3779B97F4A7C15ull); }
 	void PruneCameraStates();   // once per frame: drop TAA / AO / occlusion states nobody rendered with lately
+	void PruneUpscaleStates();  // the per-camera upscalers (NukeDiligent_Upscale.cpp)
 	// True between beginCamera binding its targets and the end of endCamera. Sprites REQUIRE the
 	// camera's colour+depth targets, so sprite calls outside a camera pass are dropped.
 	bool                                  cameraPassActive = false;
@@ -1559,7 +1701,10 @@ struct NukeDiligent::Impl
 	ITextureView*                         curRTV = nullptr;   // current camera color target (outline rebind)
 	ITextureView*                         curDSV = nullptr;   // ...and its depth; passes that bind their own
 	                                                          // targets must RESTORE both before returning
-	int                                   curRTW = 0, curRTH = 0;
+	int                                   curRTW = 0, curRTH = 0;   // the INTERNAL (render) size of the pass: every scene/media/prepass target
+	int                                   outW = 0, outH = 0;       // the OUTPUT size (the target itself): tonemap, gizmos, HUD, the swap chain
+	float                                 curMipBias = 0.0f;        // log2(internal / output): FrameCB g_MipBias.x (0 at native)
+	float                                 curFovY = 1.0472f;        // this camera's vertical FOV (radians): the upscaler's depth reconstruction
 	ITextureView*                         uiRTV = nullptr;    // explicit 2D target (bindRenderTarget); null = backbuffer
 	Uint32                                uiTW = 0, uiTH = 0; // its size (0 = use swapchain)
 	void BuildOutlinePipelines();
@@ -1630,7 +1775,7 @@ struct NukeDiligent::Impl
 
 	void CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT dsFmt);
 	void CreateWorldPipeline();
-	RT   MakeRT(int w, int h);
+	RT   MakeRT(int w, int h, int sw = 0, int sh = 0);   // sw x sh = the scene textures (0 = w x h)
 };
 
 namespace nukediligent {

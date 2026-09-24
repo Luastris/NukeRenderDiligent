@@ -1,0 +1,123 @@
+diff --git a/Graphics/GraphicsEngineD3D12/interface/SwapChainD3D12.h b/Graphics/GraphicsEngineD3D12/interface/SwapChainD3D12.h
+--- a/Graphics/GraphicsEngineD3D12/interface/SwapChainD3D12.h
++++ b/Graphics/GraphicsEngineD3D12/interface/SwapChainD3D12.h
+@@ -56,6 +56,16 @@
+     /// The method does **NOT** increment the reference counter of the returned object,
+     /// so Release() **must not** be called.
+     VIRTUAL IDXGISwapChain* METHOD(GetDXGISwapChain)(THIS) PURE;
++
++    /// NUKE PATCH: frame-generation proxies (FSR FG, DLSS-G, XeSS-FG) replace the DXGI swap chain
++    /// underneath a live Diligent swap chain. Releases the current DXGI object and every back-buffer
++    /// view (GPU idle first), then adopts `pSwapChain` (reference added) and rebuilds the views from
++    /// its buffers; null recreates the swap chain's own DXGI object from the stored description.
++    VIRTUAL void METHOD(AttachDXGISwapChain)(THIS_ IDXGISwapChain* pSwapChain) PURE;
++
++    /// NUKE PATCH: releases the current DXGI swap chain and its views (GPU idle first) and leaves
++    /// none attached, so a vendor can create its proxy for the same window; AttachDXGISwapChain follows.
++    VIRTUAL void METHOD(DetachDXGISwapChain)(THIS) PURE;
+ };
+ DILIGENT_END_INTERFACE
+ 
+@@ -65,7 +75,9 @@
+ 
+ // clang-format off
+ 
+-#    define ISwapChainD3D12_GetDXGISwapChain(This)  CALL_IFACE_METHOD(SwapChainD3D12, GetDXGISwapChain, This)
++#    define ISwapChainD3D12_GetDXGISwapChain(This)       CALL_IFACE_METHOD(SwapChainD3D12, GetDXGISwapChain, This)
++#    define ISwapChainD3D12_AttachDXGISwapChain(This, ...) CALL_IFACE_METHOD(SwapChainD3D12, AttachDXGISwapChain, This, __VA_ARGS__)
++#    define ISwapChainD3D12_DetachDXGISwapChain(This)    CALL_IFACE_METHOD(SwapChainD3D12, DetachDXGISwapChain, This)
+ 
+ // clang-format on
+ 
+diff --git a/Graphics/GraphicsEngineD3D12/include/SwapChainD3D12Impl.hpp b/Graphics/GraphicsEngineD3D12/include/SwapChainD3D12Impl.hpp
+--- a/Graphics/GraphicsEngineD3D12/include/SwapChainD3D12Impl.hpp
++++ b/Graphics/GraphicsEngineD3D12/include/SwapChainD3D12Impl.hpp
+@@ -65,6 +65,10 @@
+     /// Implementation of ISwapChainD3D12::GetDXGISwapChain().
+     virtual IDXGISwapChain* DILIGENT_CALL_TYPE GetDXGISwapChain() override final { return m_pSwapChain; }
+ 
++    /// NUKE PATCH: implementation of ISwapChainD3D12::AttachDXGISwapChain() / DetachDXGISwapChain().
++    virtual void DILIGENT_CALL_TYPE AttachDXGISwapChain(IDXGISwapChain* pSwapChain) override final;
++    virtual void DILIGENT_CALL_TYPE DetachDXGISwapChain() override final;
++
+     /// Implementation of ISwapChain::GetCurrentBackBufferRTV() in Direct3D12 backend.
+     virtual ITextureViewD3D12* DILIGENT_CALL_TYPE GetCurrentBackBufferRTV() override final
+     {
+@@ -79,6 +83,7 @@
+ private:
+     virtual void UpdateSwapChain(bool CreateNew) override final;
+     void         InitBuffersAndViews();
++    void         ReleaseDXGISwapChain();   // NUKE PATCH: views + DXGI object, after a GPU idle
+ 
+     std::vector<RefCntAutoPtr<ITextureViewD3D12>, STDAllocatorRawMem<RefCntAutoPtr<ITextureViewD3D12>>> m_pBackBufferRTV;
+     RefCntAutoPtr<ITextureViewD3D12>                                                                    m_pDepthBufferDSV;
+diff --git a/Graphics/GraphicsEngineD3D12/src/SwapChainD3D12Impl.cpp b/Graphics/GraphicsEngineD3D12/src/SwapChainD3D12Impl.cpp
+--- a/Graphics/GraphicsEngineD3D12/src/SwapChainD3D12Impl.cpp
++++ b/Graphics/GraphicsEngineD3D12/src/SwapChainD3D12Impl.cpp
+@@ -123,6 +123,66 @@
+     }
+ }
+ 
++// NUKE PATCH: the back-buffer views hold the DXGI buffers; DXGI allows a second swap chain for a
++// window only once the first is fully released, so the views go, the GPU idles (the deferred
++// releases run) and only then the DXGI object itself.
++void SwapChainD3D12Impl::ReleaseDXGISwapChain()
++{
++    RefCntAutoPtr<IDeviceContext> pDeviceContext = m_wpDeviceContext.Lock();
++    if (pDeviceContext)
++    {
++        pDeviceContext->Flush();
++        DeviceContextD3D12Impl* pImmediateCtxD3D12 = pDeviceContext.RawPtr<DeviceContextD3D12Impl>();
++        for (auto& pRTV : m_pBackBufferRTV)
++            if (pRTV)
++                pImmediateCtxD3D12->UnbindTextureFromFramebuffer(ClassPtrCast<TextureD3D12Impl>(pRTV->GetTexture()), false);
++    }
++    m_pBackBufferRTV.clear();
++    m_pDepthBufferDSV.Release();
++    m_pRenderDevice.RawPtr<RenderDeviceD3D12Impl>()->IdleGPU();
++    m_pSwapChain.Release();
++    // The waitable belonged to the released object; a vendor proxy paces its own presents.
++    m_FrameLatencyWaitableObject = NULL;
++}
++
++void SwapChainD3D12Impl::DetachDXGISwapChain()
++{
++    ReleaseDXGISwapChain();
++}
++
++void SwapChainD3D12Impl::AttachDXGISwapChain(IDXGISwapChain* pSwapChain)
++{
++    ReleaseDXGISwapChain();
++    try
++    {
++        if (pSwapChain)
++        {
++            CHECK_D3D_RESULT_THROW(pSwapChain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(static_cast<IDXGISwapChain3**>(&m_pSwapChain))),
++                                   "The attached swap chain does not expose IDXGISwapChain3");
++        }
++        else
++        {
++            RefCntAutoPtr<IDeviceContext> pDeviceContext = m_wpDeviceContext.Lock();
++            VERIFY(pDeviceContext, "Immediate context has been released");
++            if (!pDeviceContext)
++                return;
++            DeviceContextD3D12Impl* pImmediateCtxD3D12 = pDeviceContext.RawPtr<DeviceContextD3D12Impl>();
++            m_pRenderDevice.RawPtr<RenderDeviceD3D12Impl>()->LockCmdQueueAndRun(
++                pImmediateCtxD3D12->GetCommandQueueId(),
++                [this](ICommandQueueD3D12* pCmdQueue) //
++                {
++                    CreateDXGISwapChain(pCmdQueue->GetD3D12CommandQueue());
++                } //
++            );
++        }
++        InitBuffersAndViews();
++    }
++    catch (const std::runtime_error&)
++    {
++        LOG_ERROR("Failed to attach the swap chain");
++    }
++}
++
+ void SwapChainD3D12Impl::Present(Uint32 SyncInterval)
+ {
+ #if PLATFORM_UNIVERSAL_WINDOWS

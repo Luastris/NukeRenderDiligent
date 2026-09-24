@@ -78,13 +78,13 @@ std::string NukeDiligent::Impl::GenChitSource(const std::string& name, const std
 	  << "  IN.worldPos = WorldRayOrigin()+wdir*RayTCurrent(); IN.viewDir=-wdir;\n"
 	  << "  SurfaceOut O=(SurfaceOut)0; O.albedo=float3(1,1,1); O.roughness=1.0; O.alpha=1.0; O.unlit=false;\n"
 	  << "  Surface(IN,O);\n"
-	  << "  if (O.unlit){ p.color=RTWaterFinish(WorldRayOrigin(),wdir,IN.worldPos,O.emissive,p.depth); return; }\n"
+	  << "  if (O.unlit){ p.color=RTWaterFinish(WorldRayOrigin(),wdir,IN.worldPos,O.emissive,p.depth,p.flags); return; }\n"
 	  << "  float aoM=SampleAO(inst,IN.uv); float3 specM=SampleSpec(inst,IN.uv);\n"
 	  << "  float3 col = ShadeSurface(IN.worldPos,IN.worldNormal,IN.viewDir,O.albedo,O.metallic,O.roughness,O.emissive,aoM,specM);\n"
 	  << "  float3 R=reflect(wdir,IN.worldNormal); float3 env=ReflEnv(R,O.roughness), traced=env;\n"
-	  << "  if (p.depth<(uint)g_RTParams.z){ RayDesc ray; ray.Origin=IN.worldPos+IN.worldNormal*0.08+R*0.05; ray.Direction=R; ray.TMin=0.02; ray.TMax=(g_RTParams.y>0.5)?g_RTParams.y:1000.0; RTPayload p2; p2.color=0.0; p2.depth=p.depth+1; TraceRay(g_TLAS,RAY_FLAG_NONE,RT_REFLECT_MASK,0,1,0,ray,p2); traced=p2.color; }\n"
+	  << "  if (p.depth<(uint)g_RTParams.z){ RayDesc ray; ray.Origin=IN.worldPos+IN.worldNormal*0.08+R*0.05; ray.Direction=R; ray.TMin=0.02; ray.TMax=(g_RTParams.y>0.5)?g_RTParams.y:1000.0; RTPayload p2; p2.color=0.0; p2.depth=p.depth+1; p2.hitT=ray.TMax; p2.rough=0.0; p2.flags=0u; TraceRay(g_TLAS,RAY_FLAG_NONE,RT_REFLECT_MASK,0,1,0,ray,p2); traced=p2.color; }\n"
 	  << "  col += SpecFr(IN.worldNormal,IN.viewDir,O.roughness,O.albedo,O.metallic,specM)*lerp(traced,env,O.roughness);\n"
-	  << "  p.color=RTWaterFinish(WorldRayOrigin(),wdir,IN.worldPos,col,p.depth);\n}\n";
+	  << "  p.color=RTWaterFinish(WorldRayOrigin(),wdir,IN.worldPos,col,p.depth,p.flags);\n}\n";
 	return s.str();
 }
 
@@ -902,7 +902,7 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 	ci.RayTracingPipeline.MaxRecursionDepth = 8;       // primary + bounces; the configured depth caps actual recursion
 	ci.RayTracingPipeline.ShaderRecordSize  = 0;
 	ci.MaxAttributeSize = sizeof(float) * 3;           // max(barycentrics, SpriteAttr {uv, along})
-	ci.MaxPayloadSize   = sizeof(float) * 5;           // RTPayload { float3 color; uint depth; float hitT; }
+	ci.MaxPayloadSize   = sizeof(float) * 7;           // RTPayload { float3 color; uint depth; float hitT; float rough; uint flags; }
 
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP; samp.AddressW = TEXTURE_ADDRESS_CLAMP;
@@ -1014,7 +1014,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		cb->prm = float4(intensity, maxDist, maxDepth, roughCut);
 		// Water occlusion state, published by the water module via SetRTWaterState.
 		cb->waterOcc = float4(rtWaterOcc[0], rtWaterOcc[1], rtWaterOcc[2], rtWaterOcc[3]);   // w = the surface's wave band
-		cb->waterCol = float4(rtWaterCol[0], rtWaterCol[1], rtWaterCol[2], 0.0f);
+		cb->waterCol = float4(rtWaterCol[0], rtWaterCol[1], rtWaterCol[2], 2.0f * tanf(curFovY * 0.5f) / (float)std::max(h, 1));   // w = radians per pixel (the wave maps' mip by footprint)
 		cb->waterAbs = float4(rtWaterAbs[0], rtWaterAbs[1], rtWaterAbs[2], rtWaterOcc[2]);
 		cb->waterCasc = float4(rtWaterCasc[0], rtWaterCasc[1], rtWaterCasc[2], rtWaterCasc[3]);   // the wave maps (SetRTWaterMaps)
 		cb->waterRip0 = float4(rtWaterRip[0], rtWaterRip[1], rtWaterRip[2], rtWaterRip[3]);

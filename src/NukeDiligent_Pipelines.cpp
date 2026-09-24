@@ -1,4 +1,5 @@
 #include "NukeDiligentImpl.h"
+#include <algorithm>
 #include "API/Model/StatusBar.h"   // "compiling: ..." field while the builder thread works
 
 // Overlay-slot texture names, generated to stay in lock-step with kOvSlots (the HLSL declares
@@ -1013,6 +1014,17 @@ void NukeDiligent::Impl::EnqueueBuild(const boost::function<void()>& build, cons
 	EnqueueItem(std::move(it));
 }
 
+void NukeDiligent::Impl::WaitBuilds(const char* name)
+{
+	if (!name || BuilderThreadFlag()) return;   // never from a builder thread (it would wait on itself)
+	const std::string n = name;
+	auto named = [&](const std::shared_ptr<BuildJob>& j) { return j && j->name == n; };
+	boost::unique_lock<boost::mutex> l(pipeMutex);
+	buildQueue.erase(std::remove_if(buildQueue.begin(), buildQueue.end(), [&](const BuildItem& it) { return named(it.job); }), buildQueue.end());
+	while (std::any_of(jobsRunning.begin(), jobsRunning.end(), named)) pipeJobCv.wait(l);
+	jobDone.erase(std::remove_if(jobDone.begin(), jobDone.end(), named), jobDone.end());   // its adopt would publish into a dead owner
+}
+
 void NukeDiligent::Impl::PipeBuilderLoop()
 {
 	BuilderThreadFlag() = true;
@@ -1027,6 +1039,7 @@ void NukeDiligent::Impl::PipeBuilderLoop()
 			it = std::move(buildQueue.front());
 			buildQueue.erase(buildQueue.begin());
 			left = buildQueue.size();
+			if (it.job) jobsRunning.push_back(it.job);   // visible to WaitBuilds from the moment it leaves the queue
 		}
 		// What the builder is on right now, for the status bar ("compiling: World (base) · 7 more").
 		{
@@ -1039,6 +1052,8 @@ void NukeDiligent::Impl::PipeBuilderLoop()
 		{
 			if (it.job->build) it.job->build();
 			boost::lock_guard<boost::mutex> l(pipeMutex);
+			jobsRunning.erase(std::remove(jobsRunning.begin(), jobsRunning.end(), it.job), jobsRunning.end());
+			pipeJobCv.notify_all();
 			if (pipeStop) return;
 			jobDone.push_back(it.job);
 		}
@@ -1194,7 +1209,7 @@ void NukeDiligent::Impl::RebuildForMSAA()
 		if (kv.second.w > 0 && kv.second.h > 0)
 		{
 			RT old = kv.second;              // last frame's UI draw data may still be in flight
-			kv.second = MakeRT(kv.second.w, kv.second.h);
+			kv.second = MakeRT(kv.second.w, kv.second.h, kv.second.sw, kv.second.sh);
 			TrashRT(old);
 		}
 	// Cached UI SRBs key views that were just replaced — park them all; the cache refills on next draw.

@@ -153,6 +153,9 @@ public:
 	void renderGBufferObject(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
 	                         const float prevPos[3] = nullptr, const float prevQuat[4] = nullptr, const float prevScale[3] = nullptr) override;
 	void endGBufferPass() override;
+	void beginGBufferCoverage() override;   // 4.2: the transparent draws into the reactive mask
+	void endGBufferCoverage() override;
+	void getUpscaleStatus(NukeUpscaleStatus* out) override;   // 4.2: Game.ActiveUpscaler / UpscaleInfo / *Available
 	bool rtAvailable() override;
 	void beginRTScene() override;
 	void addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections = true, bool castShadows = true) override;

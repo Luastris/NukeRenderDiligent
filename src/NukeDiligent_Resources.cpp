@@ -10,7 +10,8 @@ void NukeDiligent::Impl::Trash(IObject* o)
 }
 void NukeDiligent::Impl::TrashRT(RT& rt)
 {
-	Trash(rt.color); Trash(rt.colorMS); Trash(rt.depth); Trash(rt.depthMS); Trash(rt.post);
+	for (SceneTex& s : rt.scenes) { Trash(s.color); Trash(s.colorMS); Trash(s.depth); Trash(s.depthMS); }
+	Trash(rt.post);
 }
 void NukeDiligent::Impl::PurgeTrash(bool everything)
 {
@@ -369,55 +370,104 @@ void NukeDiligent::textureStreamInfo(long long& residentBytes, long long& savedB
 	streamedCount = (int)m_impl->streamTex.size();
 }
 
-NukeDiligent::Impl::RT NukeDiligent::Impl::MakeRT(int w, int h)
+// The colour / depth textures of one render size: HDR colour (RGBA16F, or RGBA8 with HDR off) as
+// the geometry target (no MSAA) / the resolve destination (MSAA), plus the MS pair when enabled.
+void NukeDiligent::Impl::MakeSceneTex(SceneTex& s, int sw, int sh)
+{
+	s = SceneTex{};
+	s.sw = sw; s.sh = sh; s.lastUsed = frameId;
+	const bool ms = samples > 1;
+	TextureDesc cd;
+	cd.Name = "RT Color HDR"; cd.Type = RESOURCE_DIM_TEX_2D; cd.Width = (Uint32)sw; cd.Height = (Uint32)sh;
+	cd.Format = SceneFmt(); cd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
+	device->CreateTexture(cd, nullptr, &s.color);
+	if (s.color) s.hdrSRV = s.color->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+	if (ms)
+	{
+		TextureDesc cm = cd; cm.Name = "RT Color HDR MS"; cm.SampleCount = samples; cm.BindFlags = BIND_RENDER_TARGET;
+		device->CreateTexture(cm, nullptr, &s.colorMS);
+		if (s.colorMS) s.rtv = s.colorMS->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+		TextureDesc dm; dm.Name = "RT Depth MS"; dm.Type = RESOURCE_DIM_TEX_2D; dm.Width = (Uint32)sw; dm.Height = (Uint32)sh;
+		// Sampleable: the Hi-Z occlusion pyramid reads the farthest sample per pixel at endOpaque.
+		dm.Format = TEX_FORMAT_D32_FLOAT; dm.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE; dm.SampleCount = samples;
+		device->CreateTexture(dm, nullptr, &s.depthMS);
+		if (s.depthMS) s.dsv = s.depthMS->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
+	}
+	else
+	{
+		if (s.color) s.rtv = s.color->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+		TextureDesc dd; dd.Name = "RT Depth"; dd.Type = RESOURCE_DIM_TEX_2D; dd.Width = (Uint32)sw; dd.Height = (Uint32)sh;
+		dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE;   // Hi-Z source
+		device->CreateTexture(dd, nullptr, &s.depth);
+		if (s.depth) s.dsv = s.depth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
+	}
+}
+
+// Mirror a scene set into the RT's active fields.
+static void ActivateScene(NukeDiligent::Impl::RT& rt, NukeDiligent::Impl::SceneTex& s)
+{
+	rt.color = s.color; rt.colorMS = s.colorMS; rt.depth = s.depth; rt.depthMS = s.depthMS;
+	rt.rtv = s.rtv; rt.dsv = s.dsv; rt.hdrSRV = s.hdrSRV;
+	rt.sw = s.sw; rt.sh = s.sh;
+}
+
+NukeDiligent::Impl::RT NukeDiligent::Impl::MakeRT(int w, int h, int sw, int sh)
 {
 	RT rt; rt.w = w; rt.h = h;
-	const bool ms = samples > 1;
+	// The post (LDR) output is w x h - what the UI sees. The scene textures are sw x sh: the
+	// internal render size, smaller under an upscaler (the chain's upscale stage reconstructs w x h).
+	if (sw <= 0 || sh <= 0) { sw = w; sh = h; }
 
-	// HDR (RGBA16F) color: geometry target (no MSAA) / resolve destination (MSAA). The post pass reads it.
-	TextureDesc cd;
-	cd.Name = "RT Color HDR"; cd.Type = RESOURCE_DIM_TEX_2D; cd.Width = (Uint32)w; cd.Height = (Uint32)h;
-	cd.Format = SceneFmt(); cd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;   // RGBA16F (HDR) or RGBA8 (off)
-	device->CreateTexture(cd, nullptr, &rt.color);
-	if (rt.color) rt.hdrSRV = rt.color->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
-
-	// LDR (RGBA8) post output — the tonemapped result the UI shows / a material samples.
+	// LDR (RGBA8) post output - the tonemapped result the UI shows / a material samples.
 	TextureDesc pd;
 	pd.Name = "RT Color Post"; pd.Type = RESOURCE_DIM_TEX_2D; pd.Width = (Uint32)w; pd.Height = (Uint32)h;
 	pd.Format = TEX_FORMAT_RGBA8_UNORM; pd.BindFlags = BIND_RENDER_TARGET | BIND_SHADER_RESOURCE;
 	device->CreateTexture(pd, nullptr, &rt.post);
 	if (rt.post) { rt.postRTV = rt.post->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); rt.srv = rt.post->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE); }
 
-	if (ms)
-	{
-		TextureDesc cm = cd; cm.Name = "RT Color HDR MS"; cm.SampleCount = samples; cm.BindFlags = BIND_RENDER_TARGET;
-		device->CreateTexture(cm, nullptr, &rt.colorMS);
-		if (rt.colorMS) rt.rtv = rt.colorMS->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
-		TextureDesc dm; dm.Name = "RT Depth MS"; dm.Type = RESOURCE_DIM_TEX_2D; dm.Width = (Uint32)w; dm.Height = (Uint32)h;
-		// Sampleable: the Hi-Z occlusion pyramid reads the farthest sample per pixel at endOpaque.
-		dm.Format = TEX_FORMAT_D32_FLOAT; dm.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE; dm.SampleCount = samples;
-		device->CreateTexture(dm, nullptr, &rt.depthMS);
-		if (rt.depthMS) rt.dsv = rt.depthMS->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
-	}
-	else
-	{
-		if (rt.color) rt.rtv = rt.color->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
-		TextureDesc dd; dd.Name = "RT Depth"; dd.Type = RESOURCE_DIM_TEX_2D; dd.Width = (Uint32)w; dd.Height = (Uint32)h;
-		dd.Format = TEX_FORMAT_D32_FLOAT; dd.BindFlags = BIND_DEPTH_STENCIL | BIND_SHADER_RESOURCE;   // Hi-Z source
-		device->CreateTexture(dd, nullptr, &rt.depth);
-		if (rt.depth) rt.dsv = rt.depth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
-	}
+	rt.scenes.emplace_back();
+	MakeSceneTex(rt.scenes.back(), sw, sh);
+	ActivateScene(rt, rt.scenes.back());
 	return rt;
 }
 
-// (Re)create the HDR intermediate for cameras rendering to target 0: geometry -> HDR target
-// (MS if enabled) -> resolve -> post pass -> swap-chain backbuffer.
+// Make the sw x sh scene set of an RT the active one: the set it drew at before stays cached
+// (see SceneTex) and is released only after kSceneKeepFrames unused. The post output and its
+// SRV - what the UI holds - never change here.
+void NukeDiligent::Impl::EnsureRTScene(RT& rt, int sw, int sh)
+{
+	if (sw <= 0 || sh <= 0) return;
+	SceneTex* cur = nullptr;
+	for (SceneTex& s : rt.scenes) if (s.sw == sw && s.sh == sh) { cur = &s; break; }
+	if (!cur)
+	{
+		rt.scenes.emplace_back();
+		cur = &rt.scenes.back();
+		MakeSceneTex(*cur, sw, sh);
+	}
+	cur->lastUsed = frameId;
+	if (rt.sw != sw || rt.sh != sh || rt.color != cur->color) ActivateScene(rt, *cur);
+	for (size_t i = 0; i < rt.scenes.size(); )
+	{
+		SceneTex& s = rt.scenes[i];
+		if (&s != cur && frameId - s.lastUsed > kSceneKeepFrames)
+		{
+			Trash(s.color); Trash(s.colorMS); Trash(s.depth); Trash(s.depthMS);
+			rt.scenes.erase(rt.scenes.begin() + i);
+			cur = nullptr;   // the vector moved: re-find below
+			for (SceneTex& t : rt.scenes) if (t.sw == sw && t.sh == sh) { cur = &t; break; }
+		}
+		else ++i;
+	}
+}
+
+// The HDR intermediate for cameras rendering to target 0: geometry -> HDR target (MS if
+// enabled) -> resolve -> post pass -> swap-chain backbuffer. w x h = the render size.
 void NukeDiligent::Impl::EnsureBackbufferMS(int w, int h)
 {
 	if (w <= 0 || h <= 0) return;
-	if (backbufferMS.color && backbufferMS.w == w && backbufferMS.h == h) return;
-	TrashRT(backbufferMS);   // a window-resize replaces it mid-loop; the old targets may be in flight
-	backbufferMS = MakeRT(w, h);
+	if (!backbufferMS.color) { backbufferMS = MakeRT(w, h); return; }
+	EnsureRTScene(backbufferMS, w, h);
 }
 
 // ---- pooled mesh streams -----------------------------------------------------------------

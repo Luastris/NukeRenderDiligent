@@ -60,6 +60,7 @@ void NukeDiligent::Impl::CreatePostFXPipelines()
 	};
 	const TEXTURE_FORMAT RG16 = TEX_FORMAT_RG16_FLOAT, R16 = TEX_FORMAT_R16_FLOAT;
 	makePS("dof_coc.ps",     "DOF CoC",     HDR_FMT, "DofCB", dofCB, {{"g_Source", true}, {"g_Depth", false}}, dofCocPSO, dofCocSRB);
+	makePS("upscale_reactive.ps", "Upscale Reactive", TEX_FORMAT_R8_UNORM, "DofCB", dofCB, {{"g_GBuffer", false}, {"g_Cover", false}, {"g_CoverWorld", false}}, upReactPSO, upReactSRB);   // 4.2: the reactive mask
 	makePS("dof_gather.ps",  "DOF Gather",  HDR_FMT, "DofCB", dofCB, {{"g_Source", true}}, dofGatherPSO, dofGatherSRB);
 	makePS("dof_comp.ps",    "DOF Comp",    HDR_FMT, "DofCB", dofCB, {{"g_Source", true}, {"g_Depth", false}, {"g_Far", true}, {"g_Near", true}}, dofCompPSO, dofCompSRB);
 	makePS("mb_tilemax.ps",  "MB Tile Max", RG16,    "MbCB",  mbCB,  {{"g_Velocity", false}}, mbTilePSO, mbTileSRB);

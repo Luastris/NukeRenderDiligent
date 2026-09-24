@@ -1,4 +1,9 @@
 #include "NukeDiligentImpl.h"
+#if NUKE_DLSS_NGX
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>   // the NGX Vulkan header wants the Vulkan types first
+#include <nvsdk_ngx_vk.h>     // NVSDK_NGX_VULKAN_RequiredExtensions (4.2 DLSS on the Vulkan device)
+#endif
 #ifdef _WIN32
 #include "RenderDeviceD3D12.h"   // D3D12 debug-layer drain
 #include "SwapChainD3D12.h"      // ISwapChainD3D12::GetDXGISwapChain (bind into DComp)
@@ -668,6 +673,26 @@ int NukeDiligent::init(const WindowDesc& desc)
 		// Unlike D3D12, Vulkan device features must be opted into at device creation.
 		EngineCI.Features.RayTracing = DEVICE_FEATURE_STATE_OPTIONAL;
 		EngineCI.Features.Tessellation = DEVICE_FEATURE_STATE_OPTIONAL;
+		// The adapter's vendor before the device exists: NGX (DLSS) and Streamline (DLSS-G) want
+		// their extensions / proxies at creation, and only an NVIDIA adapter knows their names.
+		bool nvAdapter = false;
+		{
+			Uint32 nAd = 0; pFactory->EnumerateAdapters(EngineCI.GraphicsAPIVersion, nAd, nullptr);
+			std::vector<GraphicsAdapterInfo> ads(nAd);
+			if (nAd) pFactory->EnumerateAdapters(EngineCI.GraphicsAPIVersion, nAd, ads.data());
+			const Uint32 pick = (EngineCI.AdapterId < nAd) ? EngineCI.AdapterId : 0;
+			nvAdapter = pick < nAd && ads[pick].Vendor == ADAPTER_VENDOR_NVIDIA;
+		}
+#if NUKE_DLSS_NGX
+		// 4.2 DLSS on Vulkan: NGX names the instance/device extensions it needs and they must be on
+		// at creation (D3D12 needs nothing). A GPU without them just lacks the DLSS variant.
+		unsigned int ngxInstN = 0, ngxDevN = 0; const char** ngxInst = nullptr; const char** ngxDev = nullptr;
+		if (nvAdapter && NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_RequiredExtensions(&ngxInstN, &ngxInst, &ngxDevN, &ngxDev)))
+		{
+			EngineCI.InstanceExtensionCount = ngxInstN; EngineCI.ppInstanceExtensionNames = ngxInst;
+			EngineCI.DeviceExtensionCount = ngxDevN;    EngineCI.ppDeviceExtensionNames = ngxDev;
+		}
+#endif
 #ifdef _WIN32
 		// RT shaders are SM6.x HLSL and need DXC; point Diligent at the one vendored
 		// dxcompiler.dll (emits both DXIL and SPIR-V) instead of its "spv_dxcompiler.dll" default.
@@ -678,8 +703,16 @@ int NukeDiligent::init(const WindowDesc& desc)
 		// runpath. Missing file → Diligent falls back to glslang (SM5, no RayQuery).
 		EngineCI.pDxCompilerPath = "libdxcompiler.so";
 #endif   // macOS: no DXC — SM5 HLSL compiles via glslang, RT off (MoltenVK reports no caps anyway)
+#ifdef _WIN32
+		// 4.2 frame generation on Vulkan: Streamline's create proxies (DLSS-G) and the extra queues
+		// AMD's frame-interpolation swap chain wants go in at creation (NukeDiligent_FrameGenVk.cpp).
+		m_impl->FrameGenVkBeforeDevice(nvAdapter);
+#endif
 		pFactory->CreateDeviceAndContextsVk(EngineCI, &m_impl->device, &m_impl->context);
 		if (!m_impl->device) { cout << "[NukeDiligent]\tVulkan device creation failed" << endl; return 1; }
+#ifdef _WIN32
+		m_impl->FrameGenVkAfterDevice();   // the swap-chain entry points the vendors own, before the swap chain exists
+#endif
 		// Transparent window on Vulkan: prefer an alpha-compositing swap chain (macOS: the
 		// chosen mode drives CAMetalLayer.opaque). PRIMARY only — secondary UI chains stay
 		// opaque, mirroring the DComp arrangement. HDR10: request an ST2084 surface format —
@@ -807,6 +840,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 	                      desc.rayTracing &&   // config kill switch: window.rayTracing=false forces the raster path
 	                      (m_impl->useD3D12 || m_impl->useVulkan) && m_impl->device &&
 	                      (m_impl->device->GetAdapterInfo().RayTracing.CapFlags & RAY_TRACING_CAP_FLAG_STANDALONE_SHADERS) != 0;
+	m_impl->CreateUpscaleFactory();   // 4.2: DLSS (NGX) / FSR 1 variants this device offers
 	cout << "[NukeDiligent]\tbackend=" << (m_impl->useD3D12 ? "D3D12" : m_impl->useVulkan ? "Vulkan" : "D3D11")
 	     << " rayTracing=" << (m_impl->rtSupported ? "yes" : (desc.rayTracing ? "no" : "off (config)")) << endl;
 	// Texture streaming: the config budget (0 = off) — live-adjustable via setTextureStreaming.
@@ -900,6 +934,7 @@ int NukeDiligent::render()
 		height = fbh;
 		// D3D12 removes the device if back buffers are still bound or referenced by in-flight work
 		// when Resize() runs: unbind + flush + idle first.
+		m_impl->FrameGenDetach("resize");   // the generator's swap chain is sized at attach; it comes back next frame
 		m_impl->context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
 		m_impl->context->Flush();
 		m_impl->device->IdleGPU();
@@ -932,6 +967,11 @@ int NukeDiligent::render()
 		m_impl->pendingShadowRes = 0;
 	}
 
+	// 4.2 frame generation: attach / release the vendor's swap chain BEFORE this frame's back
+	// buffer is fetched (the proxy owns the buffers from here), then open the vendor's frame.
+	m_impl->FrameGenApply();
+	m_impl->FrameGenFrameStart();
+
 	// 0) Clear the backbuffer up front. It must NOT be cleared again after onRender, or the
 	//    Player's world-rendered-to-backbuffer would be wiped.
 	ITextureView* pRTV = m_impl->swapChain->GetCurrentBackBufferRTV();
@@ -945,6 +985,8 @@ int NukeDiligent::render()
 	if (s_frameDbg) dt2 = dbgclock::now();
 	for (auto& cb : m_impl->onRender) cb();
 	if (s_frameDbg) dt3 = dbgclock::now();
+	m_impl->FrameGenHudless(pRTV);   // the finished world image before the UI goes on
+
 
 	// Reset debug/gizmo buffers HERE, not at frame start: lines emitted later (editor UI
 	// overlays) must survive into the next frame's camera passes.
@@ -970,7 +1012,9 @@ int NukeDiligent::render()
 
 	if (m_impl->DeviceRemoved()) return 1;   // device lost this frame: skip present, keep the app alive
 	if (s_frameDbg) dt4 = dbgclock::now();
+	m_impl->FrameGenBeforePresent();   // this frame's depth / motion / HUD-less / camera to the generator
 	m_impl->swapChain->Present(m_impl->vsync ? 1 : 0);   // SyncInterval 1 = vsync, 0 = uncapped
+	m_impl->FrameGenAfterPresent();
 	if (s_frameDbg) dt5 = dbgclock::now();
 	// Secondary (Vulkan native viewport) swapchains present AFTER the main chain: Present flushes,
 	// and doing it mid-frame splits an RT write from its sampling and removes the device.
@@ -1062,6 +1106,7 @@ void NukeDiligent::Impl::CreateShaderCached(const ShaderCreateInfo& ci, IShader*
 	h = fnv(h, &ci.Desc.UseCombinedTextureSamplers, sizeof(bool));
 	h = fnv(h, &ci.CompileFlags, sizeof(ci.CompileFlags));
 	h = fnv(h, &ci.HLSLVersion, sizeof(ci.HLSLVersion));
+	h = fnv(h, &ci.ShaderCompiler, sizeof(ci.ShaderCompiler));   // FXC (DXBC) vs DXC (DXIL) of the same source: a D3D12 PSO cannot mix them   // FXC (DXBC) vs DXC (DXIL) of the same source: a D3D12 PSO cannot mix them
 	for (Uint32 i = 0; i < ci.Macros.Count; ++i)
 	{
 		if (ci.Macros[i].Name)       h = fnv(h, ci.Macros[i].Name, strlen(ci.Macros[i].Name));
@@ -1228,7 +1273,13 @@ void NukeDiligent::deinit()
 	m_impl->retiredShaderFactories.clear();   // nothing compiles any more; the graveyard may go
 	m_impl->StorageShutdown();    // every DirectStorage request lands before its destinations die
 	m_impl->SavePSOCache(true);   // pipelines built this session -> next start creates them warm
+	cout << "[NukeDiligent]\tdeinit: frame generation" << endl;
+	m_impl->ShutdownFrameGen();    // the generator's swap chain back to Diligent's own, vendor contexts gone
+	cout << "[NukeDiligent]\tdeinit: upscalers" << endl;
+	m_impl->ShutdownUpscalers();   // the upscalers + vendor contexts before the device they wrap
+	cout << "[NukeDiligent]\tdeinit: GPU idle + trash" << endl;
 	// Drain the GPU trash AFTER the queue settles — parked objects must not outlive the device.
+	// (The two shutdowns above park their textures here, so they come first.)
 	if (m_impl->context && m_impl->device)
 	{
 		m_impl->context->Flush();
@@ -1241,9 +1292,11 @@ void NukeDiligent::deinit()
 	if (m_impl->dcompTarget) { m_impl->dcompTarget->Release(); m_impl->dcompTarget = nullptr; }
 	if (m_impl->dcompDevice) { m_impl->dcompDevice->Release(); m_impl->dcompDevice = nullptr; }
 #endif
+	cout << "[NukeDiligent]\tdeinit: swap chain, context, device" << endl;
 	m_impl->swapChain.Release();
 	m_impl->context.Release();
 	m_impl->device.Release();
+	cout << "[NukeDiligent]\tdeinit: window" << endl;
 	if (m_window) { glfwDestroyWindow(m_window); m_window = nullptr; }
 	glfwTerminate();
 }
@@ -1269,7 +1322,13 @@ void NukeDiligent::mouseMove(double, double) {}
 void NukeDiligent::mouseClick(int, int, int) {}
 void NukeDiligent::rawMouse(double, double) {}
 void NukeDiligent::mouseEnterLeave(int) {}
-void NukeDiligent::setWindowTitle(const char* title) { if (m_window && title) glfwSetWindowTitle(m_window, title); }
+void NukeDiligent::setWindowTitle(const char* title)
+{
+	if (!m_window || !title) return;
+	std::string t = title;
+	m_impl->FrameGenTitle(t);   // 4.2: the generator's state + the presented FPS ride the host's title
+	glfwSetWindowTitle(m_window, t.c_str());
+}
 bool NukeDiligent::isWindowFocused() { return m_window && glfwGetWindowAttrib(m_window, GLFW_FOCUSED) != 0; }
 bool NukeDiligent::isWindowMaximized() { return m_window && glfwGetWindowAttrib(m_window, GLFW_MAXIMIZED) != 0; }
 void NukeDiligent::setWindowMaximized(bool m) { if (!m_window) return; if (m) glfwMaximizeWindow(m_window); else glfwRestoreWindow(m_window); }

@@ -119,6 +119,9 @@ NUKEDLG_API bool GetShaderSource(const char* name, std::string& out);
 // 12 = module default, 20 = extras, 25 = RT, 30 = wireframe). `name` shows in the status bar.
 NUKEDLG_API void EnqueueBuild(const boost::function<void()>& build, const boost::function<void()>& adopt,
                               int prio = 12, const char* name = "");
+// Drop the queued `name` builds, wait for a running one, drop its adopt: call before releasing
+// what those builds touch (module shutdown, device swap). Never from the builder thread.
+NUKEDLG_API void WaitBuilds(const char* name);
 NUKEDLG_API void CreateShaderCached(Diligent::ShaderCreateInfo& sci, Diligent::IShader** out);
 NUKEDLG_API void CreateGraphicsPSOCached(Diligent::GraphicsPipelineStateCreateInfo& ci,
                                          Diligent::IPipelineState** out);

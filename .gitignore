@@ -26,3 +26,7 @@ Thumbs.db
 deps/moltenvk/
 # Vendored Linux DXC — downloaded at configure time, pinned by hash (see CMakeLists).
 deps/dxc-linux/
+deps/ffx/
+deps/xess/
+deps/streamline/
+deps/ffx-vk/

@@ -1,4 +1,5 @@
 #include "NukeDiligentImpl.h"
+#include <iostream>
 #include <array>
 
 
@@ -361,6 +362,7 @@ void NukeDiligent::beginGBufferPass(const NukeCameraDesc& cam)
 	// selects LODs against the PREVIOUS camera and mismatches the beauty pass geometry.
 	m_impl->lodCamPos[0] = cam.camPos[0]; m_impl->lodCamPos[1] = cam.camPos[1]; m_impl->lodCamPos[2] = cam.camPos[2];
 	m_impl->gbufActive = false;
+	m_impl->gbufCoverActive = false; m_impl->gbufCoverSRV = nullptr;   // the coverage sub-pass is per prepass
 	if (!m_impl->gbufPSO || m_impl->gbufBuilding) return;   // not built yet / being (re)built in the background
 	int w = 0, h = 0;
 	if (!m_impl->CameraSize(cam, w, h)) return;
@@ -429,6 +431,10 @@ void NukeDiligent::RenderGBufferRange(Mesh* mesh, Material* mat, const float pos
                                       uint32_t firstIndex, uint32_t indexCount)
 {
 	if (!m_impl->gbufActive || !m_impl->gbufPSO || indexCount == 0) return;
+	// The coverage sub-pass paints the transparent (1) / additive (2) draws only; the prepass proper skips them.
+	const int bm = mat ? mat->blendMode : 0;
+	const float coverMode = m_impl->gbufCoverActive ? (float)bm : 0.0f;
+	if (m_impl->gbufCoverActive ? (bm != 1 && bm != 2) : (bm == 1 || bm == 2)) return;
 	Impl::MeshGPU* gp = m_impl->GetMeshGPU(mesh);
 	if (!gp) return;
 	++m_impl->statDraws;
@@ -461,7 +467,7 @@ void NukeDiligent::RenderGBufferRange(Mesh* mesh, Material* mat, const float pos
 		float nrmY = nsrv ? ((mat && mat->norm && !mat->norm->invertGreen) ? -1.0f : 1.0f) : 0.0f;   // sign = green convention
 		float prm[4]  = { texsrv ? 1.0f : 0.0f, nrmY, metallic, roughness };   // g_Params (hasBase, hasNormal±greenConv, metallic, roughness)
 		memcpy(p + 16, prm, sizeof(float) * 4);
-		float prm2[4] = { mrsrv ? 1.0f : 0.0f, 0, 0, 1.0f };   // g_Params2 (hasMR.x)
+		float prm2[4] = { mrsrv ? 1.0f : 0.0f, 0, coverMode, 1.0f };   // g_Params2 (hasMR.x, coverage mode .z)
 		memcpy(p + 32, prm2, sizeof(float) * 4);
 		// LiveMaterial: UV transform + cutout/wipe thresholds mirror the color pass.
 		float uvt[4]  = { mat ? (float)mat->uvTiling.x : 0.0f, mat ? (float)mat->uvTiling.y : 0.0f,
@@ -559,6 +565,9 @@ void NukeDiligent::RenderGBufferRange(Mesh* mesh, Material* mat, const float pos
 // camera view*proj only, so instance velocity is camera-only.
 void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t instBuf, int first, int count)
 {
+	const int bmI = mat ? mat->blendMode : 0;
+	const float coverMode = m_impl->gbufCoverActive ? (float)bmI : 0.0f;   // the coverage sub-pass: transparent / additive only
+	if (m_impl->gbufCoverActive ? (bmI != 1 && bmI != 2) : (bmI == 1 || bmI == 2)) return;
 	if (!m_impl->gbufActive || !m_impl->gbufPSOInst || count <= 0) return;
 	auto bit = m_impl->instBufs.find(instBuf);
 	if (bit == m_impl->instBufs.end() || !bit->second.buf) return;
@@ -594,7 +603,7 @@ void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t in
 		float nrmY = nsrv ? ((mat && mat->norm && !mat->norm->invertGreen) ? -1.0f : 1.0f) : 0.0f;
 		float prm[4]  = { texsrv ? 1.0f : 0.0f, nrmY, metallic, roughness };
 		memcpy(p + 16, prm, sizeof(float) * 4);
-		float prm2[4] = { mrsrv ? 1.0f : 0.0f, 0, 0, 1.0f };
+		float prm2[4] = { mrsrv ? 1.0f : 0.0f, 0, coverMode, 1.0f };   // .z = coverage mode
 		memcpy(p + 32, prm2, sizeof(float) * 4);
 		// LiveMaterial: UV transform + cutout/wipe thresholds mirror the color pass.
 		float uvt[4]  = { mat ? (float)mat->uvTiling.x : 0.0f, mat ? (float)mat->uvTiling.y : 0.0f,
@@ -669,3 +678,65 @@ void NukeDiligent::renderGBufferInstanced(Mesh* mesh, Material* mat, uint64_t in
 }
 
 void NukeDiligent::endGBufferPass() { /* gbufActive stays set so endCamera's SSR pass can sample it; beginCamera rebinds the colour target */ }
+
+// The coverage sub-pass: a scratch G-buffer set at the prepass size, the opaque depth copied in
+// (depth test, the writes are scratch), the id target cleared and painted by the transparent /
+// additive draws (gbuffer.ps coverage mode). Only when a temporal upscaler runs this pass.
+void NukeDiligent::beginGBufferCoverage()
+{
+	Impl* d = m_impl;
+	d->gbufCoverActive = false;
+	if (!d->gbufActive || !d->curUpTemporal || !d->gbufDepth || d->gbufW <= 0 || d->gbufH <= 0) return;
+	Impl::GBufferSet& c = d->gbufCoverSet;
+	if (!c.objId || (int)c.objId->GetDesc().Width != d->gbufW || (int)c.objId->GetDesc().Height != d->gbufH)
+	{
+		d->Trash(c.color); d->Trash(c.vel); d->Trash(c.objId); d->Trash(c.depth);
+		c = Impl::GBufferSet{};
+		auto make = [&](RefCntAutoPtr<ITexture>& t, const char* name, TEXTURE_FORMAT fmt, Diligent::BIND_FLAGS bind)
+		{
+			TextureDesc td; td.Name = name; td.Type = RESOURCE_DIM_TEX_2D; td.Width = (Uint32)d->gbufW; td.Height = (Uint32)d->gbufH;
+			td.Format = fmt; td.BindFlags = bind;
+			d->device->CreateTexture(td, nullptr, &t);
+		};
+		make(c.color, "GBuffer Cover Color", TEX_FORMAT_RGBA16_FLOAT, BIND_RENDER_TARGET);
+		make(c.vel,   "GBuffer Cover Velocity", TEX_FORMAT_RG16_FLOAT, BIND_RENDER_TARGET);
+		make(c.objId, "GBuffer Cover", TEX_FORMAT_R8_UNORM, BIND_RENDER_TARGET | BIND_SHADER_RESOURCE);
+		make(c.depth, "GBuffer Cover Depth", TEX_FORMAT_D32_FLOAT, BIND_DEPTH_STENCIL);
+		if (!c.color || !c.vel || !c.objId || !c.depth) { c = Impl::GBufferSet{}; return; }
+		c.rtv = c.color->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); c.velRTV = c.vel->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
+		c.objIdRTV = c.objId->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET); c.objIdSRV = c.objId->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE);
+		c.dsv = c.depth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
+		std::cout << "[NukeDiligent]	gbuffer coverage targets " << d->gbufW << "x" << d->gbufH << " (the upscaler's transparents)" << std::endl;
+	}
+	IDeviceContext* ctx = d->context;
+	ctx->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
+	{
+		// The copy moves the prepass depth to the copy-source state; the passes after the prepass
+		// bind it as the depth target again expecting the state it was left in. Put it back: on
+		// Vulkan (image layouts) a mismatch there blackened the whole frame, D3D12 did not care.
+		const RESOURCE_STATE before = d->gbufDepth->GetState();
+		CopyTextureAttribs cp(d->gbufDepth, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, c.depth, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		ctx->CopyTexture(cp);
+		if (before != RESOURCE_STATE_UNKNOWN)
+		{
+			StateTransitionDesc back(d->gbufDepth, RESOURCE_STATE_UNKNOWN, before, STATE_TRANSITION_FLAG_UPDATE_STATE);
+			ctx->TransitionResourceStates(1, &back);
+		}
+	}
+	ITextureView* rtvs[3] = { c.rtv, c.velRTV, c.objIdRTV };
+	ctx->SetRenderTargets(3, rtvs, c.dsv, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	const float clr[4] = { 0, 0, 0, 0 };
+	ctx->ClearRenderTarget(c.objIdRTV, clr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)d->gbufW; vp.Height = (float)d->gbufH; vp.MinDepth = 0; vp.MaxDepth = 1;
+	ctx->SetViewports(1, &vp, d->gbufW, d->gbufH);
+	++d->passSerial;   // the shared CBs re-map for the sub-pass
+	d->gbufCoverActive = true;
+	d->gbufCoverSRV = c.objIdSRV;
+}
+
+void NukeDiligent::endGBufferCoverage()
+{
+	if (!m_impl->gbufCoverActive) return;
+	m_impl->gbufCoverActive = false;
+	m_impl->context->SetRenderTargets(0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE);
+}

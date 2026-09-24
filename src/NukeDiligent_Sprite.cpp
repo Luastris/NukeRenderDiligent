@@ -860,7 +860,7 @@ bool NukeDiligent::Impl::PostWantsDepth() const
 	for (const auto& cs : postChain)
 	{
 		auto pit = postPipes.find(cs.pipeline);
-		if (pit != postPipes.end() && (pit->second.isDOF || pit->second.isMotion)) return true;
+		if (pit != postPipes.end() && (pit->second.isDOF || pit->second.isMotion || pit->second.isUpscale)) return true;   // upscale: its depth input + the water flag of the reactive mask
 	}
 	return false;
 }

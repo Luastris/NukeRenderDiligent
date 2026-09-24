@@ -279,6 +279,7 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	if (taa) { pp.depthVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Depth"); pp.histVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_History"); pp.velVar = pp.srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_Velocity"); pp.isTAA = true; }
 	pp.isBloom = (name == "bloom");   // multi-pass: the renderer drives the passes itself
 	pp.isDOF = (name == "dof"); pp.isMotion = (name == "motionblur"); pp.isExposure = (name == "exposure");   // R3 built-ins, same rule
+	pp.isUpscale = (name == "upscale");   // 4.2 super resolution (NukeDiligent_Upscale.cpp)
 	uint64_t h = nextShaderHandle++;
 	postPipes[h] = std::move(pp);
 	return h;

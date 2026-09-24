@@ -1,4 +1,5 @@
 #include "NukeDiligentImpl.h"
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 
@@ -280,6 +281,9 @@ void NukeDiligent::Impl::EnsureGIRays(uint32_t count)
 void NukeDiligent::Impl::ApplyGIResets()
 {
 	if (giResets.empty() || !giUpdatePSO || !giIrrAtlas) return;
+	// The reset mode reads no rays, but the PSO's g_RayData must still be bound: the resets run
+	// BEFORE the frame's EnsureGIRays, so the first reset of a session found no buffer yet.
+	if (!giRayBuf) EnsureGIRays(4096);
 	for (const GIReset& r : giResets)
 	{
 		if (r.vol >= (int)giVols.size()) continue;
@@ -291,7 +295,7 @@ void NukeDiligent::Impl::ApplyGIResets()
 			pc->misc[0] = v.desc.maxRayDistance; pc->misc[1] = 0; pc->misc[2] = 0; pc->misc[3] = (float)r.count;
 		}
 		auto set = [&](const char* n, IDeviceObject* o) { if (auto* s = giUpdateSRB->GetVariableByName(SHADER_TYPE_COMPUTE, n)) s->Set(o); };
-		if (giRayBuf) set("g_RayData", giRayBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
+		set("g_RayData",  giRayBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE));
 		set("g_IrrAtlas", giIrrAtlas->GetDefaultView(TEXTURE_VIEW_UNORDERED_ACCESS));
 		set("g_VisAtlas", giVisAtlas->GetDefaultView(TEXTURE_VIEW_UNORDERED_ACCESS));
 		context->SetPipelineState(giUpdatePSO);

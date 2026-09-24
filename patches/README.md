@@ -19,6 +19,18 @@ What the set contains (all marked `NUKE PATCH` in the code):
 - `DeviceContextVkImpl.cpp` (Vulkan) — empty TLAS (0 instances, spec-legal) skips the
   instance upload: the zero-size copy dereferenced a null block inside the NVIDIA driver.
 
+Addendum patches (applied after the base set, each idempotent the same way):
+- `DiligentCore-vk-alpha.patch` — Vulkan WSI alpha compositing (transparent windows off Windows).
+- `DiligentCore-pso-legalize.patch` — no per-pipeline SPIR-V legalization (Vulkan PSO cost).
+- `DiligentCore-fg-swapchain.patch` — `ISwapChainD3D12::AttachDXGISwapChain` /
+  `DetachDXGISwapChain` (4.2 frame generation): a vendor proxy swap chain (FSR FG, DLSS-G,
+  XeSS-FG) replaces the DXGI object under the live Diligent swap chain; the back-buffer views
+  are rebuilt from the proxy's buffers. Generated with `diff -u` against the patched tree.
+- `DiligentCore-vk-hooks.patch` — the Vulkan side of the same: `g_NukeVkCreateInstance` /
+  `g_NukeVkCreateDevice` (host hooks around instance / device creation: Streamline's proxies,
+  the extra queues AMD's frame-interpolation swap chain wants) and
+  `ISwapChainVk::DetachVkSwapChain` / `AttachVkSwapChain` / `GetVkSwapChainCreateInfo`.
+
 ## Upgrading DiligentCore
 1. Move the submodule to the new commit with a CLEAN tree (the configure step will warn
    "neither applies nor is applied" if the patch no longer fits).
