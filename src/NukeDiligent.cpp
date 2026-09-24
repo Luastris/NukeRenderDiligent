@@ -983,7 +983,9 @@ int NukeDiligent::render()
 
 	// 1) World passes: onRender drives World::Render (beginCamera + renderObject).
 	if (s_frameDbg) dt2 = dbgclock::now();
-	for (auto& cb : m_impl->onRender) cb();
+	// By index: a hook may register another hook from inside (RunOnMain runs in the update hook),
+	// which grows the vector and would invalidate a range-for's iterators.
+	for (size_t i = 0; i < m_impl->onRender.size(); ++i) m_impl->onRender[i]();
 	if (s_frameDbg) dt3 = dbgclock::now();
 	m_impl->FrameGenHudless(pRTV);   // the finished world image before the UI goes on
 
