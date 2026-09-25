@@ -118,6 +118,7 @@ static void FillGBufOverlays(Diligent::Uint8* p, nuke::Material* mat)
 // Returns true when the plain PSO is ready.
 bool NukeDiligent::Impl::BuildGBufferPipe()
 {
+	ReloadScope reloadScope("gbuffer");
 	gbufPSO.Release(); gbufSRB.Release(); gbufMRVar = nullptr;
 	std::string vsSrc = shaderSource("gbuffer.vs"), psSrc = shaderSource("gbuffer.ps");   // velocity-aware VS (motion vectors)
 	if (vsSrc.empty() || psSrc.empty()) return false;

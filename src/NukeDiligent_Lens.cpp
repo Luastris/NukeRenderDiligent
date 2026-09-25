@@ -24,6 +24,7 @@ void NukeDiligent::Impl::EnsureLensPipes()
 	if ((lensFilmPSO && lensDropsPSO) || lensFailed || lensBuilding.exchange(true)) return;
 	EnqueueBuild([this]
 	{
+		ReloadScope reloadScope("lens");
 		std::string vs = shaderSource("post.vs"), fps = shaderSource("lensfilm.ps"), dps = shaderSource("lensdrops.ps");
 		if (vs.empty() || fps.empty() || dps.empty()) { lensFailed = true; return; }
 		if (!lensCB)

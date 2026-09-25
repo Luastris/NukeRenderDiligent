@@ -1094,7 +1094,7 @@ bool NukeDiligent::captureTarget(uint64_t rtId, int& w, int& h, std::vector<uint
 	m_impl->device->IdleGPU();   // the copy must be complete before the map
 
 	MappedTextureSubresource m;
-	m_impl->context->MapTextureSubresource(staging, 0, 0, MAP_READ, MAP_FLAG_NONE, nullptr, m);
+	m_impl->context->MapTextureSubresource(staging, 0, 0, MAP_READ, MAP_FLAG_DO_NOT_WAIT, nullptr, m);   // idled above: no wait (Vulkan warns otherwise)
 	if (!m.pData) return false;
 	w = (int)sd.Width; h = (int)sd.Height;
 	rgba.resize((size_t)w * h * 4);

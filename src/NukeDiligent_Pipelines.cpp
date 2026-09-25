@@ -42,6 +42,10 @@ static const char SRGBA_TO_LINEAR[] =
 
 void NukeDiligent::Impl::CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT dsFmt)
 {
+	ReloadScope reloadScope("ui");
+	uiBBFmt = bbFmt; uiDSFmt = dsFmt;
+	if (uiPSO) { Trash(uiPSO); uiPSO.Release(); }   // a reload reruns this: retire the old pipeline
+	if (uiCB)  { Trash(uiCB);  uiCB.Release(); }
 	baseVertexSupported = (device->GetAdapterInfo().DrawCommand.CapFlags & DRAW_COMMAND_CAP_FLAG_BASE_VERTEX) != 0;
 
 	ShaderCreateInfo ShaderCI;
@@ -121,6 +125,7 @@ void NukeDiligent::Impl::CreateUIPipeline(TEXTURE_FORMAT bbFmt, TEXTURE_FORMAT d
 
 void NukeDiligent::Impl::CreateWorldPipeline()
 {
+	ReloadScope reloadScope("world");
 	// Shared constant buffers (bound as static vars on EVERY world PSO).
 	BufferDesc cbd;
 	cbd.Name = "World CB"; cbd.Size = sizeof(float4x4) * 3; cbd.Usage = USAGE_DYNAMIC;   // wvp, world, prevWVP (gbuffer velocity)
@@ -177,90 +182,13 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 
 	// Foliage bend compute (bend.cs): bends merged chunk meshes so their BLAS sways with the wind.
 	// Shares nukebend.hlsl with the raster VS shaders and BendCB with setWind. RT-only.
-	if (rtSupported)
-	{
-		std::string cs = shaderSource("bend.cs");
-		if (!cs.empty())
-		{
-			ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
-			auto bendSf = ShaderFactory();   // held for the compile: pushes must not kill it mid-FXC
-			sci.pShaderSourceStreamFactory = bendSf;
-			sci.Desc = {"Foliage Bend CS", SHADER_TYPE_COMPUTE, true};
-			sci.Source = cs.c_str();
-			RefCntAutoPtr<IShader> csh; CreateShaderCached(sci, &csh);
-			if (csh)
-			{
-				BufferDesc cpb; cpb.Name = "BendCS Params"; cpb.Size = sizeof(float) * 4;
-				cpb.Usage = USAGE_DYNAMIC; cpb.BindFlags = BIND_UNIFORM_BUFFER; cpb.CPUAccessFlags = CPU_ACCESS_WRITE;
-				device->CreateBuffer(cpb, nullptr, &bendCSParamsCB);
-				ComputePipelineStateCreateInfo cci; cci.PSODesc.Name = "Foliage Bend PSO";
-				ShaderResourceVariableDesc cvars[] = {
-					{SHADER_TYPE_COMPUTE, "g_SrcPos",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-					{SHADER_TYPE_COMPUTE, "g_BendData",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-					{SHADER_TYPE_COMPUTE, "g_BendPivot", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-					{SHADER_TYPE_COMPUTE, "g_DstPos",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-				};
-				cci.PSODesc.ResourceLayout.Variables = cvars; cci.PSODesc.ResourceLayout.NumVariables = 4;
-				cci.pCS = csh;
-				CreateComputePipelineStateCached(cci, &bendCSPSO);
-				if (bendCSPSO)
-				{
-					if (auto* v = bendCSPSO->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "BendCB"))       v->Set(bendCB);
-					if (auto* v = bendCSPSO->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "BendCSParams")) v->Set(bendCSParamsCB);
-					bendCSPSO->CreateShaderResourceBinding(&bendCSSRB, true);
-					if (bendCSSRB)
-					{
-						if (auto* v = bendCSSRB->GetVariableByName(SHADER_TYPE_COMPUTE, "BendCB"))       v->Set(bendCB);
-						if (auto* v = bendCSSRB->GetVariableByName(SHADER_TYPE_COMPUTE, "BendCSParams")) v->Set(bendCSParamsCB);
-					}
-				}
-				cout << "[NukeDiligent]	foliage bend CS " << (bendCSPSO && bendCSSRB ? "ready" : "FAILED") << endl;
-			}
-		}
-	}
+	CreateBendCS();
+
 
 	// GPU skinning compute (skin.cs): morphs + LBS into the skinned instance's buffers.
 	// Not RT-gated — every skinned character uses it; per-instance SRBs bind the streams.
-	{
-		std::string cs = shaderSource("skin.cs");
-		if (!cs.empty())
-		{
-			ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
-			auto sfLocal = ShaderFactory();
-			sci.pShaderSourceStreamFactory = sfLocal;
-			sci.Desc = {"Skin CS", SHADER_TYPE_COMPUTE, true};
-			sci.Source = cs.c_str();
-			RefCntAutoPtr<IShader> csh; CreateShaderCached(sci, &csh);
-			if (csh)
-			{
-				BufferDesc cpb; cpb.Name = "SkinCS Params"; cpb.Size = sizeof(uint32_t) * 4;
-				cpb.Usage = USAGE_DYNAMIC; cpb.BindFlags = BIND_UNIFORM_BUFFER; cpb.CPUAccessFlags = CPU_ACCESS_WRITE;
-				device->CreateBuffer(cpb, nullptr, &skinCSParamsCB);
-				ComputePipelineStateCreateInfo cci; cci.PSODesc.Name = "Skin PSO";
-				ShaderResourceVariableDesc cvars[] = {
-					{SHADER_TYPE_COMPUTE, "g_Palette",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-					{SHADER_TYPE_COMPUTE, "g_BindPos",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-					{SHADER_TYPE_COMPUTE, "g_BindNrm",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-					{SHADER_TYPE_COMPUTE, "g_BoneIdx",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-					{SHADER_TYPE_COMPUTE, "g_BoneWgt",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-					{SHADER_TYPE_COMPUTE, "g_MorphDelta",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-					{SHADER_TYPE_COMPUTE, "g_MorphWeight", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-					{SHADER_TYPE_COMPUTE, "g_PosOut",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-					{SHADER_TYPE_COMPUTE, "g_NrmOut",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-					{SHADER_TYPE_COMPUTE, "g_PosPrev",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
-				};
-				cci.PSODesc.ResourceLayout.Variables = cvars; cci.PSODesc.ResourceLayout.NumVariables = 10;
-				cci.pCS = csh;
-				CreateComputePipelineStateCached(cci, &skinCSPSO);
-				if (skinCSPSO)
-				{
-					if (auto* v = skinCSPSO->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "SkinCSParams")) v->Set(skinCSParamsCB);
-					skinCSPSO->CreateShaderResourceBinding(&skinCSSRB, true);
-				}
-				cout << "[NukeDiligent]	skin CS " << (skinCSPSO && skinCSSRB ? "ready" : "FAILED") << endl;
-			}
-		}
-	}
+	CreateSkinCS();
+
 
 	// 1x1 white fallback texture (bound when a material has no texture).
 	uint32_t white = 0xFFFFFFFFu;
@@ -332,8 +260,106 @@ void NukeDiligent::Impl::CreateWorldPipeline()
 
 // Build the selection-outline pipelines: mask (mesh -> RGBA8, alpha=1) and edge (fullscreen
 // edge-detect drawing a constant-pixel-thickness border).
+// The foliage bend compute (bend.cs, RT builds). Rerun by a shader reload: the old objects retire first.
+void NukeDiligent::Impl::CreateBendCS()
+{
+	ReloadScope reloadScope("bend");
+	if (bendCSPSO) { Trash(bendCSPSO); bendCSPSO.Release(); }
+	if (bendCSSRB) { Trash(bendCSSRB); bendCSSRB.Release(); }
+	if (bendCSParamsCB) { Trash(bendCSParamsCB); bendCSParamsCB.Release(); }
+	if (rtSupported)
+	{
+		std::string cs = shaderSource("bend.cs");
+		if (!cs.empty())
+		{
+			ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+			auto bendSf = ShaderFactory();   // held for the compile: pushes must not kill it mid-FXC
+			sci.pShaderSourceStreamFactory = bendSf;
+			sci.Desc = {"Foliage Bend CS", SHADER_TYPE_COMPUTE, true};
+			sci.Source = cs.c_str();
+			RefCntAutoPtr<IShader> csh; CreateShaderCached(sci, &csh);
+			if (csh)
+			{
+				BufferDesc cpb; cpb.Name = "BendCS Params"; cpb.Size = sizeof(float) * 4;
+				cpb.Usage = USAGE_DYNAMIC; cpb.BindFlags = BIND_UNIFORM_BUFFER; cpb.CPUAccessFlags = CPU_ACCESS_WRITE;
+				device->CreateBuffer(cpb, nullptr, &bendCSParamsCB);
+				ComputePipelineStateCreateInfo cci; cci.PSODesc.Name = "Foliage Bend PSO";
+				ShaderResourceVariableDesc cvars[] = {
+					{SHADER_TYPE_COMPUTE, "g_SrcPos",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_BendData",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_BendPivot", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_DstPos",    SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+				};
+				cci.PSODesc.ResourceLayout.Variables = cvars; cci.PSODesc.ResourceLayout.NumVariables = 4;
+				cci.pCS = csh;
+				CreateComputePipelineStateCached(cci, &bendCSPSO);
+				if (bendCSPSO)
+				{
+					if (auto* v = bendCSPSO->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "BendCB"))       v->Set(bendCB);
+					if (auto* v = bendCSPSO->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "BendCSParams")) v->Set(bendCSParamsCB);
+					bendCSPSO->CreateShaderResourceBinding(&bendCSSRB, true);
+					if (bendCSSRB)
+					{
+						if (auto* v = bendCSSRB->GetVariableByName(SHADER_TYPE_COMPUTE, "BendCB"))       v->Set(bendCB);
+						if (auto* v = bendCSSRB->GetVariableByName(SHADER_TYPE_COMPUTE, "BendCSParams")) v->Set(bendCSParamsCB);
+					}
+				}
+				cout << "[NukeDiligent]	foliage bend CS " << (bendCSPSO && bendCSSRB ? "ready" : "FAILED") << endl;
+			}
+		}
+	}}
+
+// The GPU skinning compute (skin.cs). Rerun by a shader reload: the old objects retire first.
+void NukeDiligent::Impl::CreateSkinCS()
+{
+	ReloadScope reloadScope("skin");
+	if (skinCSPSO) { Trash(skinCSPSO); skinCSPSO.Release(); }
+	if (skinCSSRB) { Trash(skinCSSRB); skinCSSRB.Release(); }
+	if (skinCSParamsCB) { Trash(skinCSParamsCB); skinCSParamsCB.Release(); }
+	{
+		std::string cs = shaderSource("skin.cs");
+		if (!cs.empty())
+		{
+			ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
+			auto sfLocal = ShaderFactory();
+			sci.pShaderSourceStreamFactory = sfLocal;
+			sci.Desc = {"Skin CS", SHADER_TYPE_COMPUTE, true};
+			sci.Source = cs.c_str();
+			RefCntAutoPtr<IShader> csh; CreateShaderCached(sci, &csh);
+			if (csh)
+			{
+				BufferDesc cpb; cpb.Name = "SkinCS Params"; cpb.Size = sizeof(uint32_t) * 4;
+				cpb.Usage = USAGE_DYNAMIC; cpb.BindFlags = BIND_UNIFORM_BUFFER; cpb.CPUAccessFlags = CPU_ACCESS_WRITE;
+				device->CreateBuffer(cpb, nullptr, &skinCSParamsCB);
+				ComputePipelineStateCreateInfo cci; cci.PSODesc.Name = "Skin PSO";
+				ShaderResourceVariableDesc cvars[] = {
+					{SHADER_TYPE_COMPUTE, "g_Palette",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_BindPos",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_BindNrm",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_BoneIdx",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_BoneWgt",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_MorphDelta",  SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_MorphWeight", SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_PosOut",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_NrmOut",      SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+					{SHADER_TYPE_COMPUTE, "g_PosPrev",     SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC},
+				};
+				cci.PSODesc.ResourceLayout.Variables = cvars; cci.PSODesc.ResourceLayout.NumVariables = 10;
+				cci.pCS = csh;
+				CreateComputePipelineStateCached(cci, &skinCSPSO);
+				if (skinCSPSO)
+				{
+					if (auto* v = skinCSPSO->GetStaticVariableByName(SHADER_TYPE_COMPUTE, "SkinCSParams")) v->Set(skinCSParamsCB);
+					skinCSPSO->CreateShaderResourceBinding(&skinCSSRB, true);
+				}
+				cout << "[NukeDiligent]	skin CS " << (skinCSPSO && skinCSSRB ? "ready" : "FAILED") << endl;
+			}
+		}
+	}}
+
 void NukeDiligent::Impl::BuildOutlinePipelines()
 {
+	ReloadScope reloadScope("outline");
 	// Rebuild path (MSAA change re-calls this): release prior objects or Create asserts.
 	outlineMaskPSO.Release(); outlineMaskSRB.Release();
 	outlineEdgePSO.Release(); outlineEdgeSRB.Release(); outlineEdgeCB.Release();
@@ -950,6 +976,7 @@ uint64_t NukeDiligent::Impl::MakeWorldPSO(const std::string& vsSrc, const std::s
 // on the calling thread (tens of milliseconds — it is three tiny shaders).
 void NukeDiligent::Impl::BuildBootPipe()
 {
+	ReloadScope reloadScope("boot");
 	const std::string vs = shaderSource("boot.vs"), ps = shaderSource("boot.ps");
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tboot shaders missing — no stand-in while pipelines build" << endl; return; }
 	WorldPipe np;
@@ -1074,6 +1101,7 @@ void NukeDiligent::Impl::PipeBuilderLoop()
 
 void NukeDiligent::Impl::RequestPipeBuild(uint64_t h, int stage)
 {
+	ReloadScope reloadScope("world");
 	// Diagnostic (NUKE_NO_PIPE_BUILD=1): never build world pipes — everything stays on the boot
 	// stand-in, which is how the stand-in itself gets looked at.
 	static const bool noBuild = std::getenv("NUKE_NO_PIPE_BUILD") != nullptr;

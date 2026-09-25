@@ -98,6 +98,9 @@ extern "C" void  NukeCocoaSetHiddenFromCapture(GLFWwindow* wnd, bool hide);
 #include <cstring>
 #include <vector>
 #include <map>
+#include <set>
+#include <cstring>
+#include <cstdio>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -152,6 +155,64 @@ struct NukeDiligent::Impl
 	double psoCacheSavedAt = 0.0;
 	void InitPSOCache();   // load config/psocache_<backend>.bin (after device creation)
 	void SavePSOCache(bool force);   // write when dirty (throttled) / at shutdown
+	// The D3D12 pipeline library keys entries by PSO NAME: the same name with other bytecode or
+	// state (a shader edited between sessions, a hot reload, an MSAA change) fails both the load
+	// (desc mismatch) and the store (exists) — and the runtime has crashed on that path. The
+	// library name therefore carries a hash of what the pipeline is made of.
+	static void HashBytes(uint64_t& h, const void* p, size_t n)
+	{
+		const unsigned char* b = (const unsigned char*)p;
+		for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+	}
+	static void HashShader(uint64_t& h, Diligent::IShader* s)
+	{
+		if (!s) { HashBytes(h, "-", 1); return; }
+		const void* code = nullptr; Diligent::Uint64 size = 0;
+		s->GetBytecode(&code, size);
+		if (code && size) HashBytes(h, code, (size_t)size);
+	}
+	static void HashLayout(uint64_t& h, const Diligent::PipelineResourceLayoutDesc& rl)
+	{
+		HashBytes(h, &rl.DefaultVariableType, sizeof(rl.DefaultVariableType));
+		for (Diligent::Uint32 i = 0; i < rl.NumVariables; ++i)
+		{
+			const auto& v = rl.Variables[i];
+			if (v.Name) HashBytes(h, v.Name, strlen(v.Name));
+			HashBytes(h, &v.ShaderStages, sizeof(v.ShaderStages)); HashBytes(h, &v.Type, sizeof(v.Type)); HashBytes(h, &v.Flags, sizeof(v.Flags));
+		}
+		for (Diligent::Uint32 i = 0; i < rl.NumImmutableSamplers; ++i)
+		{
+			const auto& s = rl.ImmutableSamplers[i];
+			if (s.SamplerOrTextureName) HashBytes(h, s.SamplerOrTextureName, strlen(s.SamplerOrTextureName));
+			HashBytes(h, &s.ShaderStages, sizeof(s.ShaderStages)); HashBytes(h, &s.Desc, sizeof(s.Desc));
+		}
+	}
+	static std::string PSOCacheName(const char* name, uint64_t h)
+	{
+		char hex[24]; snprintf(hex, sizeof(hex), "#%016llx", (unsigned long long)h);
+		return std::string(name ? name : "PSO") + hex;
+	}
+	static std::string PSOCacheName(const Diligent::GraphicsPipelineStateCreateInfo& ci)
+	{
+		uint64_t h = 1469598103934665603ull;
+		HashShader(h, ci.pVS); HashShader(h, ci.pPS); HashShader(h, ci.pGS); HashShader(h, ci.pHS); HashShader(h, ci.pDS);
+		const auto& gp = ci.GraphicsPipeline;
+		HashBytes(h, &gp.BlendDesc, sizeof(gp.BlendDesc)); HashBytes(h, &gp.RasterizerDesc, sizeof(gp.RasterizerDesc));
+		HashBytes(h, &gp.DepthStencilDesc, sizeof(gp.DepthStencilDesc)); HashBytes(h, &gp.SampleMask, sizeof(gp.SampleMask));
+		HashBytes(h, gp.RTVFormats, sizeof(gp.RTVFormats)); HashBytes(h, &gp.DSVFormat, sizeof(gp.DSVFormat));
+		HashBytes(h, &gp.NumRenderTargets, sizeof(gp.NumRenderTargets)); HashBytes(h, &gp.PrimitiveTopology, sizeof(gp.PrimitiveTopology));
+		HashBytes(h, &gp.SmplDesc, sizeof(gp.SmplDesc)); HashBytes(h, &gp.NumViewports, sizeof(gp.NumViewports));
+		for (Diligent::Uint32 i = 0; i < gp.InputLayout.NumElements; ++i) HashBytes(h, &gp.InputLayout.LayoutElements[i], sizeof(Diligent::LayoutElement));
+		HashLayout(h, ci.PSODesc.ResourceLayout);
+		return PSOCacheName(ci.PSODesc.Name, h);
+	}
+	static std::string PSOCacheName(const Diligent::ComputePipelineStateCreateInfo& ci)
+	{
+		uint64_t h = 1469598103934665603ull;
+		HashShader(h, ci.pCS);
+		HashLayout(h, ci.PSODesc.ResourceLayout);
+		return PSOCacheName(ci.PSODesc.Name, h);
+	}
 	void CreateGraphicsPipelineStateCached(const Diligent::GraphicsPipelineStateCreateInfo& ci, Diligent::IPipelineState** pp)
 	{
 		// Cache-miss shaders compile ASYNC on the worker pool — the PSO needs them ready.
@@ -161,6 +222,8 @@ struct NukeDiligent::Impl
 		const double t1 = nuke::Log::Uptime();
 		Diligent::GraphicsPipelineStateCreateInfo c2 = ci;
 		c2.pPSOCache = psoCache;
+		const std::string cacheName = PSOCacheName(ci);
+		c2.PSODesc.Name = cacheName.c_str();
 		device->CreateGraphicsPipelineState(c2, pp);
 		if (*pp && psoCache) psoCacheDirty = true;
 		const double t2 = nuke::Log::Uptime();
@@ -188,6 +251,8 @@ struct NukeDiligent::Impl
 		if (ci.pCS) ci.pCS->GetStatus(true);
 		Diligent::ComputePipelineStateCreateInfo c2 = ci;
 		c2.pPSOCache = psoCache;
+		const std::string cacheName = PSOCacheName(ci);
+		c2.PSODesc.Name = cacheName.c_str();
 		device->CreateComputePipelineState(c2, pp);
 		if (*pp && psoCache) psoCacheDirty = true;
 		const double ms = (nuke::Log::Uptime() - t0) * 1000.0;
@@ -362,7 +427,9 @@ struct NukeDiligent::Impl
 	                  bool isUpscale = false;   // 4.2 super resolution (NukeDiligent_Upscale.cpp): the scene renders smaller, this slot reconstructs the output
 	                  IShaderResourceVariable* tlasVar = nullptr; IShaderResourceVariable* instVar = nullptr;
 	                  IShaderResourceVariable* nrmVar = nullptr;  IShaderResourceVariable* rtProbeVar = nullptr;
-	                  IShaderResourceVariable* uvVar = nullptr;   IShaderResourceVariable* matTexVar = nullptr; };
+	                  IShaderResourceVariable* uvVar = nullptr;   IShaderResourceVariable* matTexVar = nullptr;
+	                  std::string name, ps;   // what built it: a post.vs / include hot reload rebuilds in place
+	                };
 	std::unordered_map<uint64_t, PostPipe> postPipes;
 	RefCntAutoPtr<IBuffer>                postParamsCB;   // shared PostParams (per-effect params, 256B)
 	RefCntAutoPtr<IBuffer>                postFrameCB;    // shared PostFrame (resolution / time)
@@ -1787,11 +1854,33 @@ struct NukeDiligent::Impl
 	{
 		// The builder thread reads while the game thread pushes — same lock as the factory.
 		boost::mutex::scoped_lock l(shaderLock);
+		if (const char* owner = ReloadOwner()) reloadStems[owner].insert(name);   // hot reload: who compiles from what
 		auto it = shaderSrc.find(name);
 		if (it == shaderSrc.end() || it->second.empty())
 			{ cout << "[NukeDiligent]\tmissing shader source '" << name << "'" << endl; return std::string(); }
 		return it->second;
 	}
+
+	// ---- shader hot reload (NukeDiligent_Reload.cpp) ----
+	// Every pipeline builder runs under a ReloadScope("<owner>"); shaderSource() records the names the
+	// owner compiles from (shaderLock). A changed source (iRender::reloadShader) resolves to the owners
+	// whose stems it reaches through #includes, and ProcessShaderReloads reruns / retires their pipes at
+	// the frame boundary. Modules join through the native seam (AddShaderReloader + BeginShaderOwner).
+	std::map<std::string, std::set<std::string>> reloadStems;   // owner -> source names (shaderLock)
+	std::set<std::string> reloadChanged;                        // names whose text changed since pushed (shaderLock)
+	std::set<std::string> reloadQueue;                          // changed names awaiting the frame boundary (shaderLock)
+	struct ModuleReloader { std::string owner; void (*fn)(void*) = nullptr; void* user = nullptr; };
+	std::vector<ModuleReloader> moduleReloaders;                // render thread
+	static const char*& ReloadOwner();                          // the calling thread's active owner (null = none)
+	struct ReloadScope { const char* prev; explicit ReloadScope(const char* owner) { prev = ReloadOwner(); ReloadOwner() = owner; } ~ReloadScope() { ReloadOwner() = prev; } };
+	void NoteShaderUse(const char* file);                       // a factory-loaded file ("rt_rgen.hlsl") the active owner compiles
+	void ReloadShaderSource(const char* name);                  // iRender::reloadShader (any thread)
+	void ProcessShaderReloads();                                // frame boundary, render thread
+	void DropPostPipe(PostPipe& p) { Trash(p.pso); Trash(p.srb); p = PostPipe{}; }
+	TEXTURE_FORMAT uiBBFmt = TEX_FORMAT_UNKNOWN, uiDSFmt = TEX_FORMAT_UNKNOWN;   // CreateUIPipeline's formats (a reload reruns it)
+	void CreateSkinCS();   // skin.cs compute (GPU skinning); rerun on reload
+	void CreateBendCS();   // bend.cs compute (foliage bend, RT); rerun on reload
+	bool BuildPostPipe(const std::string& name, const std::string& ps, PostPipe& pp);   // CreatePostPipe's body, in place
 
 	ITextureView* GetTexSRV(Texture* t);   // get-or-create a GPU texture from an engine Texture
 

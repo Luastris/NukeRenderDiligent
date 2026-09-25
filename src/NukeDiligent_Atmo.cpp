@@ -23,6 +23,7 @@ static const int kAtmoSkyW = 192, kAtmoSkyH = 108, kAtmoAP = 32;
 
 bool NukeDiligent::Impl::BuildAtmoPipes()
 {
+	ReloadScope reloadScope("atmo");
 	static_assert(sizeof(AtmoCBData) == kAtmoCBSize, "AtmoCB size");
 	const string cs = shaderSource("atmo_lut.cs"), vs = shaderSource("post.vs"), ps = shaderSource("atmo_apply.ps");
 	if (cs.empty() || vs.empty() || ps.empty()) return false;

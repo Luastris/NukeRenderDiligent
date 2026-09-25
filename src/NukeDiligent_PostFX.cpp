@@ -8,9 +8,13 @@
 
 void NukeDiligent::Impl::CreatePostFXPipelines()
 {
+	ReloadScope reloadScope("postfx");
 	dofCocPSO.Release(); dofGatherPSO.Release(); dofCompPSO.Release();
 	mbTilePSO.Release(); mbNeighborPSO.Release(); mbReconPSO.Release();
-	expLumPSO.Release(); expAdaptPSO.Release(); expApplyPSO.Release();
+	expLumPSO.Release(); expAdaptPSO.Release(); expApplyPSO.Release(); upReactPSO.Release();
+	dofCocSRB.Release(); dofGatherSRB.Release(); dofCompSRB.Release();   // (a shader reload reruns this)
+	mbTileSRB.Release(); mbNeighborSRB.Release(); mbReconSRB.Release();
+	expLumSRB.Release(); expAdaptSRB.Release(); expApplySRB.Release(); upReactSRB.Release();
 	auto makeCB = [&](const char* name, size_t bytes, RefCntAutoPtr<IBuffer>& cb)
 	{
 		if (cb) return;

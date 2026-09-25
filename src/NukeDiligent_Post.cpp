@@ -69,7 +69,9 @@ void NukeDiligent::Impl::SetupHDROutput()
 
 void NukeDiligent::Impl::CreatePostResources()
 {
+	ReloadScope reloadScope("post");
 	postPSO.Release(); postSRB.Release(); postPSOBB.Release(); postSRBBB.Release(); postCB.Release();   // rebuild-safe
+	bloomBrightSRB.Release(); bloomBlurSRB.Release(); bloomCompSRB.Release();                          // (a shader reload reruns this)
 	// The Panini remap pipes are stamped with the swap-chain format too: drop them, they rebuild on first use.
 	paniniPSO.Release(); paniniSRB.Release(); paniniPSOBB.Release(); paniniSRBBB.Release();
 	paniniSrcVar = paniniSrcVarBB = nullptr; paniniFailed = false;
@@ -208,14 +210,26 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 		uint64_t h = nextShaderHandle++; postPipes[h] = std::move(pp);
 		return h;
 	}
+	PostPipe pp;
+	if (!BuildPostPipe(name, ps, pp)) return 0;
+	pp.name = name; pp.ps = ps;   // a post.vs / include hot reload rebuilds it in place
+	uint64_t h = nextShaderHandle++;
+	postPipes[h] = std::move(pp);
+	return h;
+}
+
+// One post effect pipeline from its PS text (post.vs shared). Also the hot-reload rebuild path.
+bool NukeDiligent::Impl::BuildPostPipe(const std::string& name, const std::string& ps, PostPipe& pp)
+{
+	ReloadScope reloadScope("postpipe");
 	std::string vs = shaderSource("post.vs");
-	if (vs.empty() || ps.empty()) return 0;
+	if (vs.empty() || ps.empty()) return false;
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
 	auto sf = ShaderFactory(); sci.pShaderSourceStreamFactory = sf;   // post shaders may #include the engine's .hlsli (ssr: vol.hlsli)
 	RefCntAutoPtr<IShader> v, p;
 	sci.Desc = {"Post Effect VS", SHADER_TYPE_VERTEX, true}; sci.Source = vs.c_str(); CreateShaderCached(sci, &v);
 	sci.Desc = {"Post Effect PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &p);
-	if (!v || !p) return 0;
+	if (!v || !p) return false;
 
 	GraphicsPipelineStateCreateInfo ci; ci.PSODesc.Name = "Post Effect PSO";
 	auto& gp = ci.GraphicsPipeline;
@@ -264,9 +278,9 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	ci.PSODesc.ResourceLayout.Variables = vars.data(); ci.PSODesc.ResourceLayout.NumVariables = (Uint32)vars.size();
 	ci.PSODesc.ResourceLayout.ImmutableSamplers = imms.data(); ci.PSODesc.ResourceLayout.NumImmutableSamplers = (Uint32)imms.size();
 	ci.pVS = v; ci.pPS = p;
-	PostPipe pp;
+	pp = PostPipe{};
 	CreateGraphicsPipelineStateCached(ci, &pp.pso);
-	if (!pp.pso) { cout << "[NukeDiligent]\tpost effect PSO build failed" << endl; return 0; }
+	if (!pp.pso) { cout << "[NukeDiligent]\tpost effect PSO build failed" << endl; return false; }
 	if (auto* c = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostParams")) c->Set(postParamsCB);
 	if (auto* f = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "PostFrame"))  f->Set(postFrameCB);
 	if (ssr) if (auto* s = pp.pso->GetStaticVariableByName(SHADER_TYPE_PIXEL, "SSRCB")) s->Set(ssrCB);
@@ -283,15 +297,14 @@ uint64_t NukeDiligent::Impl::CreatePostPipe(const std::string& name, const std::
 	pp.isBloom = (name == "bloom");   // multi-pass: the renderer drives the passes itself
 	pp.isDOF = (name == "dof"); pp.isMotion = (name == "motionblur"); pp.isExposure = (name == "exposure");   // R3 built-ins, same rule
 	pp.isUpscale = (name == "upscale");   // 4.2 super resolution (NukeDiligent_Upscale.cpp)
-	uint64_t h = nextShaderHandle++;
-	postPipes[h] = std::move(pp);
-	return h;
+	return true;
 }
 
 // Copy srcSRV into dstTex. Equal formats use CopyTexture; different formats need a fullscreen
 // blit because D3D12 only allows copies inside one format family. One lazy PSO per dst format.
 void NukeDiligent::Impl::BlitTexture(ITextureView* srcSRV, ITexture* dstTex)
 {
+	ReloadScope reloadScope("blit");
 	if (!srcSRV || !dstTex) return;
 	ITexture* srcTex = srcSRV->GetTexture();
 	if (srcTex && srcTex->GetDesc().Format == dstTex->GetDesc().Format)

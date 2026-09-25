@@ -7,6 +7,7 @@
 // Build the unlit, screen and lit sprite PSOs and their SRBs/constant buffers.
 void NukeDiligent::Impl::CreateSpriteResources()
 {
+	ReloadScope reloadScope("sprite");
 	spritePSO.Release(); spriteSRB.Release(); spriteCB.Release(); spriteTexVar = nullptr;
 	spriteScreenPSO.Release(); spriteScreenSRB.Release(); spriteScreenTexVar = nullptr;
 	spriteScreenPSOBB.Release(); spriteScreenSRBBB.Release(); spriteScreenTexVarBB = nullptr;

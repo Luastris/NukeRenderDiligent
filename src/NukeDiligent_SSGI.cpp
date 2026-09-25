@@ -20,6 +20,7 @@ void NukeDiligent::setScreenGI(int quality, float radius, float intensity)
 
 bool NukeDiligent::Impl::BuildSSGIPipes()
 {
+	ReloadScope reloadScope("ssgi");
 	const string vs = shaderSource("post.vs"), psT = shaderSource("ssgi.ps"), psR = shaderSource("ssgi_resolve.ps");
 	if (vs.empty() || psT.empty() || psR.empty()) return false;
 	SamplerDesc lin; lin.MinFilter = FILTER_TYPE_LINEAR; lin.MagFilter = FILTER_TYPE_LINEAR; lin.MipFilter = FILTER_TYPE_LINEAR;

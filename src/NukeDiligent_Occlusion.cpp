@@ -10,6 +10,7 @@
 
 void NukeDiligent::Impl::CreateOcclResources()
 {
+	ReloadScope reloadScope("occl");
 	occlCSPSO.Release(); hizCopyPSO.Release(); hizCopyMSPSO.Release(); hizDownPSO.Release();
 	occlCSSRB.Release(); hizCopySRB.Release(); hizCopyMSSRB.Release(); hizDownSRB.Release();
 	hizCopyVar = hizCopyMSVar = hizDownVar = nullptr;

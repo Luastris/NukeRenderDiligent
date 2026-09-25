@@ -197,6 +197,7 @@ void NukeDiligent::Impl::WriteGICB()
 // The three compute pipes (+ the probe debug PSO on demand). Built on the builder thread.
 bool NukeDiligent::Impl::BuildGIPipes()
 {
+	ReloadScope reloadScope("gi");
 	auto sf = ShaderFactory();   // resolves ddgi.hlsli / rt_common.hlsl includes
 	auto compile = [&](const char* name, const char* dbg, bool rt, RefCntAutoPtr<IShader>& out)
 	{
@@ -518,6 +519,7 @@ void NukeDiligent::giCaptureCommit()
 // camera targets while its (MS) depth is still bound.
 void NukeDiligent::Impl::DrawGIProbes()
 {
+	ReloadScope reloadScope("giprobe");
 	if (giVols.empty() || !giIrrSRV || !giCB) return;
 	bool any = false; for (const GIVol& v : giVols) any = any || v.desc.debugProbes;
 	if (!any) return;

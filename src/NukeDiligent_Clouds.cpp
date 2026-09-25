@@ -21,6 +21,7 @@ struct CloudCBData
 
 bool NukeDiligent::Impl::BuildCloudPipes()
 {
+	ReloadScope reloadScope("clouds");
 	static_assert(sizeof(CloudCBData) == kCloudCBSize, "CloudCB size");
 	const string csG = shaderSource("clouds_gen.cs"), csM = shaderSource("clouds.cs"), csT = shaderSource("clouds_temporal.cs"), csS = shaderSource("clouds_shadow.cs");
 	const string vs = shaderSource("post.vs"), psA = shaderSource("clouds_apply.ps");
@@ -123,6 +124,7 @@ bool NukeDiligent::Impl::BuildCloudPipes()
 // built for the current sample count + scene format like the sky, rebuilt when they change.
 bool NukeDiligent::Impl::BuildCloudProbePipe()
 {
+	ReloadScope reloadScope("cloudprobe");
 	const string vs = shaderSource("post.vs"), ps = shaderSource("clouds_probe.ps");
 	if (vs.empty() || ps.empty() || !cloudCB) return false;
 	auto sf = ShaderFactory();
@@ -266,6 +268,10 @@ void NukeDiligent::Impl::FillCloudCB(int rw, int rh, int w, int h, float mode, c
 void NukeDiligent::Impl::GenerateCloudNoise()
 {
 	if (cloudNoiseReady || !cloudGenPSO) return;
+	// A shader reload regenerates: the old noise retires first (a bound texture can't be overwritten).
+	if (cloudBase)    { Trash(cloudBase);    cloudBase.Release(); }
+	if (cloudDetail)  { Trash(cloudDetail);  cloudDetail.Release(); }
+	if (cloudWeather) { Trash(cloudWeather); cloudWeather.Release(); }
 	auto make3 = [&](RefCntAutoPtr<ITexture>& t, const char* name, int n)
 	{
 		TextureDesc td; td.Name = name; td.Type = RESOURCE_DIM_TEX_3D; td.Width = td.Height = (Uint32)n; td.Depth = (Uint32)n;

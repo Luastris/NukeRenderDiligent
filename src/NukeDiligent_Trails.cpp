@@ -33,6 +33,7 @@ void NukeDiligent::Impl::EnsureTrailPipes()
 	if ((trailShiftPSO && trailStampPSO) || trailFailed || trailBuilding.exchange(true)) return;
 	EnqueueBuild([this]
 	{
+		ReloadScope reloadScope("trails");
 		std::string pvs = shaderSource("post.vs"), sps = shaderSource("trails_shift.ps");
 		std::string svs = shaderSource("trails_stamp.vs"), tps = shaderSource("trails_stamp.ps");
 		if (pvs.empty() || sps.empty() || svs.empty() || tps.empty()) { trailFailed = true; return; }

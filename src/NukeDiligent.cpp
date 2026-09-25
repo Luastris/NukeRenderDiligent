@@ -144,6 +144,15 @@ static void DrainD3D12DebugMessages(Diligent::IRenderDevice* dev, bool useD3D12)
 		{
 			d3dDev = d12->GetD3D12Device();
 			d3dDev->QueryInterface(__uuidof(ID3D12InfoQueue), (void**)&iq);
+			// A pipeline-library miss is the expected cold path (the PSO is built and stored),
+			// not an error worth a line: keep it out of the queue.
+			if (iq)
+			{
+				D3D12_MESSAGE_ID deny[] = { D3D12_MESSAGE_ID_LOADPIPELINE_NAMENOTFOUND };
+				D3D12_INFO_QUEUE_FILTER f = {};
+				f.DenyList.NumIDs = 1; f.DenyList.pIDList = deny;
+				iq->AddStorageFilterEntries(&f);
+			}
 		}
 	}
 	if (d3dDev) DumpDeviceRemoval(d3dDev);   // async GPU faults surface here
@@ -329,7 +338,10 @@ void NukeDiligent::setShaderSource(const char* name, const char* source)
 {
 	if (!name || !source) return;
 	boost::mutex::scoped_lock l(m_impl->shaderLock);
-	m_impl->shaderSrc[name] = source;
+	std::string& slot = m_impl->shaderSrc[name];
+	if (slot == source) return;   // a re-push of the same text (the build deploying what was already hot-reloaded)
+	slot = source;
+	m_impl->reloadChanged.insert(name);   // reloadShader turns it into a rebuild
 	++m_impl->shaderSrcVersion;   // the factory rebuilds lazily at the next ShaderFactory()
 }
 
@@ -843,6 +855,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 	m_impl->CreateUpscaleFactory();   // 4.2: DLSS (NGX) / FSR 1 variants this device offers
 	cout << "[NukeDiligent]\tbackend=" << (m_impl->useD3D12 ? "D3D12" : m_impl->useVulkan ? "Vulkan" : "D3D11")
 	     << " rayTracing=" << (m_impl->rtSupported ? "yes" : (desc.rayTracing ? "no" : "off (config)")) << endl;
+	DrainD3D12DebugMessages(m_impl->device, m_impl->useD3D12);   // installs the info-queue filter BEFORE the first PSO
 	// Texture streaming: the config budget (0 = off) — live-adjustable via setTextureStreaming.
 	m_impl->streamBudget = (long long)(desc.textureStreamMB < 0 ? 0 : desc.textureStreamMB) << 20;
 	if (m_impl->streamBudget > 0)
@@ -955,6 +968,7 @@ int NukeDiligent::render()
 		}
 		m_impl->pendingSamples = -1; m_impl->pendingHDR = -1;
 	}
+	m_impl->ProcessShaderReloads();   // shader hot reload: between frames, like the MSAA rebuild
 	// Deferred shadow-resolution change (rebuilds the shadow maps; never mid-frame).
 	if (m_impl->pendingShadowRes > 0)
 	{

@@ -995,6 +995,7 @@ void NukeDiligent::drawDebugLineDepth(const float a[3], const float b[3], const 
 
 void NukeDiligent::Impl::CreateDebugResources()
 {
+	ReloadScope reloadScope("debug");
 	debugPSO.Release(); debugPSOBB.Release(); debugSRB.Release(); debugSRBBB.Release(); debugCB.Release();
 	std::string vs = shaderSource("debug.vs"), ps = shaderSource("debug.ps");
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]	debug-line shaders missing" << endl; return; }
@@ -1086,6 +1087,7 @@ void NukeDiligent::Impl::DrawDebugLines(bool toBackbuffer)
 // lazily against the current SceneFmt()/samples; the batch is consumed (never bleeds to the next camera).
 void NukeDiligent::Impl::DrawDepthDebugLines()
 {
+	ReloadScope reloadScope("depthdebug");
 	std::vector<float> verts;
 	{
 		std::lock_guard<std::mutex> lock(debugMutex);
@@ -1162,6 +1164,7 @@ void NukeDiligent::drawEditorGrid(float step) { m_impl->gridStep = step; }
 // the still-bound MS scene depth, drawn under the gizmo lines.
 void NukeDiligent::Impl::DrawEditorGridPass()
 {
+	ReloadScope reloadScope("grid");
 	if (gridStep <= 0.0f) return;
 	if (!gridPSO || gridSamples != (int)samples || gridFmt != SceneFmt())
 	{
@@ -1262,6 +1265,7 @@ void NukeDiligent::Impl::DrawEditorGridPass()
 // The cursor/overlay screen-quad PSO (cursor.vs/ps); rebuilt when the swapchain format changes.
 bool NukeDiligent::Impl::EnsureCursorPSO()
 {
+	ReloadScope reloadScope("cursor");
 	const TEXTURE_FORMAT fmt = swapChain->GetDesc().ColorBufferFormat;
 	if (!cursorPSO || cursorFmt != fmt)
 	{
@@ -1417,6 +1421,7 @@ static void CostColor(double tris, float4& out)
 
 bool NukeDiligent::Impl::EnsureCostPSOs()
 {
+	ReloadScope reloadScope("cost");
 	if (costPSO && costStamp.current(samples, SceneFmt())) return true;
 	costPSO.Release(); costPSOInst.Release(); costWirePSO.Release(); costWirePSOInst.Release();
 	costSRB.Release(); costSRBInst.Release(); costWireSRB.Release(); costWireSRBInst.Release();

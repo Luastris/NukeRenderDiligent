@@ -3,6 +3,7 @@
 
 void NukeDiligent::Impl::CreateShadowResources()
 {
+	ReloadScope reloadScope("shadow");
 	// Release prior objects first — re-callable (shadow-res change) without Diligent's overwrite assert.
 	shadowTex.Release(); shadowCmpSampler.Release();
 	for (auto& v : shadowSliceDSV) v.Release();

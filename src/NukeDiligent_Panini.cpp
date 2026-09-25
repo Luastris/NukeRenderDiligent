@@ -17,6 +17,7 @@ void NukeDiligent::Impl::EnsurePaniniPipes()
 	if (PaniniReady() || paniniFailed || paniniBuilding.exchange(true)) return;
 	EnqueueBuild([this]
 	{
+		ReloadScope reloadScope("panini");
 		std::string vs = shaderSource("post.vs"), ps = shaderSource("panini.ps");
 		if (vs.empty() || ps.empty()) { paniniFailed = true; return; }
 		if (!paniniCB)

@@ -14,6 +14,7 @@ struct AOData { float4x4 view, proj, invProj, invView; float res[4]; float param
 
 bool NukeDiligent::Impl::BuildAOPipes()
 {
+	ReloadScope reloadScope("ao");
 	const string vs = shaderSource("post.vs"), psA = shaderSource("ao.ps"), psR = shaderSource("aoresolve.ps");
 	if (vs.empty() || psA.empty() || psR.empty()) return false;
 	SamplerDesc lin; lin.MinFilter = FILTER_TYPE_LINEAR; lin.MagFilter = FILTER_TYPE_LINEAR; lin.MipFilter = FILTER_TYPE_LINEAR;

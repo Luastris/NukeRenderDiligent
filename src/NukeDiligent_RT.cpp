@@ -879,6 +879,7 @@ void NukeDiligent::buildRTScene()
 // an auto-generated closest-hit per custom material shader. Returns false on failure.
 bool NukeDiligent::Impl::BuildRTPipeline()
 {
+	ReloadScope reloadScope("rt");
 	if (rtPSO && !rtPipelineDirty) return true;
 	auto rtSf = ShaderFactory();
 	if (!rtSupported || !rtSf) return false;
@@ -891,6 +892,7 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 		sci.ShaderCompiler = SHADER_COMPILER_DXC; sci.HLSLVersion = ShaderVersion{6, 5};
 		sci.pShaderSourceStreamFactory = rtSf;            // loads the file + resolves #include "rt_common.hlsl"
 		sci.FilePath = file; sci.EntryPoint = "main"; sci.Desc = {dbg, type, true};
+		NoteShaderUse(file);   // hot reload: owner "rt" compiles from this file
 		device->CreateShader(sci, &out);
 		if (!out) cout << "[NukeDiligent]\tRT shader build failed: " << file << endl;
 		return (bool)out;

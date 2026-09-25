@@ -139,6 +139,17 @@ NUKEDLG_API void AddPipelineWarmup(const char* name, WarmupFn fn, void* user);
 NUKEDLG_API void RearmPipelineWarmup(void* user);
 NUKEDLG_API void RemovePipelineWarmup(void* user);
 
+// Shader hot reload. Wrap the code that compiles pipelines in a ShaderOwnerScope: every source it
+// pulls through GetShaderSource is recorded under `owner`. When one of those sources (or a file
+// they #include) changes on disk, the renderer calls the owner's reloader at the frame boundary:
+// retire the pipelines (Trash) and re-arm the warm-up — the rebuild lands in the background.
+typedef void (*ShaderReloadFn)(void* user);
+NUKEDLG_API void AddShaderReloader(const char* owner, ShaderReloadFn fn, void* user);
+NUKEDLG_API void RemoveShaderReloader(void* user);
+NUKEDLG_API void BeginShaderOwner(const char* owner);
+NUKEDLG_API void EndShaderOwner();
+struct ShaderOwnerScope { explicit ShaderOwnerScope(const char* owner) { BeginShaderOwner(owner); } ~ShaderOwnerScope() { EndShaderOwner(); } };
+
 // Deferred destruction. Never Release() a live device object inline — hand it here.
 NUKEDLG_API void Trash(Diligent::IDeviceObject* obj);
 

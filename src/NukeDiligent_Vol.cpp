@@ -42,6 +42,7 @@ void NukeDiligent::setFogVolumes(const NukeFogVolumeDesc* volumes, int count)
 
 bool NukeDiligent::Impl::BuildVolPipes()
 {
+	ReloadScope reloadScope("vol");
 	const string csI = shaderSource("vol_inject.cs"), csT = shaderSource("vol_temporal.cs"), csN = shaderSource("vol_integrate.cs");
 	const string vs = shaderSource("post.vs"), psA = shaderSource("vol_apply.ps");
 	if (csI.empty() || csN.empty() || vs.empty() || psA.empty()) return false;
@@ -361,6 +362,7 @@ void NukeDiligent::Impl::RunVolumetrics(int w, int h)
 // ---- Fluid volumes ---------------------------------------------------------------------------------
 bool NukeDiligent::Impl::BuildFluidPipes()
 {
+	ReloadScope reloadScope("fluid");
 	const string cs = shaderSource("vol_fluid.cs");
 	if (cs.empty()) return false;
 	auto sf = ShaderFactory();
@@ -645,6 +647,7 @@ ITextureView* NukeDiligent::Impl::VolScatSRV()
 // ---- Screen-space sun shafts ----------------------------------------------------------------------
 bool NukeDiligent::Impl::BuildSunShaftPipes()
 {
+	ReloadScope reloadScope("sunshafts");
 	const string vs = shaderSource("post.vs"), ps = shaderSource("sunshafts.ps");
 	if (vs.empty() || ps.empty()) return false;
 	auto sf = ShaderFactory();

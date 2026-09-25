@@ -20,6 +20,7 @@ void NukeDiligent::Impl::EnsureSkyMapPipe()
 	if (skyMapPSO || skyMapFailed || skyMapBuilding.exchange(true)) return;
 	EnqueueBuild([this]
 	{
+		ReloadScope reloadScope("skymap");
 		const std::string src = shaderSource("skymap.cs");
 		if (src.empty()) { skyMapFailed = true; return; }
 		// The static CBs must exist at PSO creation (the clouds' and the atmosphere's are created here

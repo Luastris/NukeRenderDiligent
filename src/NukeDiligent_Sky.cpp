@@ -3,6 +3,7 @@
 
 void NukeDiligent::Impl::CreateSkyResources()
 {
+	ReloadScope reloadScope("sky");
 	skyPSO.Release(); skySRB.Release(); skyCB.Release();   // rebuild-safe (MSAA change re-calls this)
 	std::string vs = shaderSource("sky.vs"), ps = shaderSource("sky.ps");
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tsky shaders missing" << endl; return; }

@@ -13,6 +13,7 @@ struct DecalCBData
 
 void NukeDiligent::Impl::CreateDecalResources()
 {
+	ReloadScope reloadScope("decal");
 	decalPSO.Release(); decalPSOAdd.Release(); decalPSOMod.Release();
 	decalSRB.Release(); decalSRBAdd.Release(); decalSRBMod.Release(); decalCB.Release();
 	decalTexVar = decalDepthVar = decalTexVarAdd = decalDepthVarAdd = decalTexVarMod = decalDepthVarMod = nullptr;
