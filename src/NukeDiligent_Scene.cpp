@@ -21,8 +21,33 @@ void NukeDiligent::Impl::SetCameraViewProj(const NukeCameraDesc& cam, int w, int
 		                            << ") F(" << F.x << "," << F.y << "," << F.z << ") vp " << w << "x" << h
 		                            << " ortho " << cam.ortho << " near " << cam.nearZ << " far " << cam.farZ << std::endl; }
 	}
+	// Honest wide FOV (cam.panini): the pass renders rectilinear with the vertical over-scan the
+	// Panini remap needs at the corners (NukeDiligent_Panini.cpp); the horizontal edge angle is the
+	// rectilinear one. Off until the remap pipes exist (the image would be squeezed without them).
+	float fovY = cam.fov, aspectP = aspect;
+	curPanini = 0.0f;
+	if (cam.panini > 1e-4f && cam.ortho <= 0.0001f)
+	{
+		EnsurePaniniPipes();
+		if (PaniniReady())
+		{
+			const float d = cam.panini > 1.0f ? 1.0f : cam.panini;
+			const float v = cam.paniniVertical < 0.0f ? 0.0f : (cam.paniniVertical > 1.0f ? 1.0f : cam.paniniVertical);
+			const float s = v * d / (d + 1.0f);                     // vertical term: y = S tanTheta (1 + s (1/cosPhi - 1))
+			const float tanV = tanf(cam.fov * 0.5f), tanH = tanV * aspect;
+			const float phiMax = atanf(tanH), cosMax = cosf(phiMax);
+			const float Smax = (d + 1.0f) / (d + cosMax);
+			float k = 1.0f / (Smax * (cosMax + s * (1.0f - cosMax)));   // corner over-scan of the source's vertical extent (1 at v = 1)
+			if (k < 1.0f) k = 1.0f;
+			if (tanV * k > 8.0f) k = 8.0f / tanV;                   // rectilinear sources cannot go past ~166 deg
+			curPanini = d; panVertS = s; panXMax = Smax * sinf(phiMax); panTanV = tanV;
+			panSrcTanH = tanH; panSrcTanV = tanV * k;
+			fovY = 2.0f * atanf(panSrcTanV); aspectP = tanH / panSrcTanV;
+		}
+	}
+	curFovY = fovY;   // the projection's real vertical FOV (the upscalers' depth reconstruction, RT footprints)
 	// Projection: perspective, orthographic, or an element-wise blend of the two (cam.ortho tween).
-	float4x4 persp = float4x4::Projection(cam.fov, aspect, cam.nearZ, cam.farZ, false);
+	float4x4 persp = float4x4::Projection(fovY, aspectP, cam.nearZ, cam.farZ, false);
 	if (cam.ortho <= 0.0001f)
 		curProj = persp;
 	else
@@ -1806,13 +1831,23 @@ void NukeDiligent::endCamera()
 		// spatial one tonemaps at the internal size and upscales the LDR image into the target; a
 		// pass whose upscaler could not run stretches (bilinear) rather than shows a smaller frame.
 		(void)upscaled;
-		if (!m_impl->RunUpscaleSpatial(chainSrc, m_impl->curPostDst, m_impl->curTarget == 0))
-			m_impl->RunPostPass(chainSrc, m_impl->curPostDst, m_impl->outW, m_impl->outH, m_impl->curTarget == 0);
+		const bool toBB = m_impl->curTarget == 0;
+		// Panini: tonemap + gizmo lines land in a scratch LDR frame, the remap draws the real output.
+		Impl::PaniniScratch* pan = nullptr;
+		if (m_impl->curPanini > 0.0f)
+		{
+			const TEXTURE_FORMAT fmt = toBB ? m_impl->swapChain->GetDesc().ColorBufferFormat : TEX_FORMAT_RGBA8_UNORM;
+			pan = m_impl->PaniniTarget(m_impl->curTarget, m_impl->outW, m_impl->outH, fmt);
+		}
+		ITextureView* ldrDst = pan ? pan->rtv : m_impl->curPostDst;
+		if (!m_impl->RunUpscaleSpatial(chainSrc, ldrDst, toBB))
+			m_impl->RunPostPass(chainSrc, ldrDst, m_impl->outW, m_impl->outH, toBB);
 
 		// Gizmo lines last, over the final LDR image (target still bound by RunPostPass): TAA has
 		// no velocity for lines and the RT-reflection composite would overwrite them.
-		m_impl->DrawDebugLines(m_impl->curTarget == 0);
-		m_impl->FlushScreenPost(m_impl->curTarget == 0);   // AfterPost screen-space canvas sprites (crisp HUD)
+		m_impl->DrawDebugLines(toBB);
+		if (pan) m_impl->RunPanini(pan->srv, m_impl->curPostDst, m_impl->outW, m_impl->outH, toBB);
+		m_impl->FlushScreenPost(toBB);   // AfterPost screen-space canvas sprites (crisp HUD), unwarped
 	}
 	if (m_impl->curTarget == 0) m_impl->FrameGenCapture();   // 4.2: this pass's depth / motion / camera for the generated frame
 

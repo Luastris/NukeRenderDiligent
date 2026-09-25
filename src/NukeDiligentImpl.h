@@ -1323,6 +1323,24 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IBuffer>                lensCB;
 	std::atomic<bool>                     lensBuilding{false};
 	bool                                  lensFailed = false;
+
+	// Honest wide FOV (NukeCameraDesc::panini): the camera pass renders rectilinear with a vertical
+	// over-scan, the final LDR image is remapped to the cylindrical Panini view (panini.ps) before the
+	// HUD. curPanini = 0 until the pipes are built (the pass then stays rectilinear, no over-scan).
+	float                                 curPanini = 0.0f;
+	float                                 panXMax = 0.0f, panTanV = 0.0f, panSrcTanH = 0.0f, panSrcTanV = 0.0f, panVertS = 0.0f;
+	RefCntAutoPtr<IPipelineState>         paniniPSO, paniniPSOBB;          // RGBA8 targets / the swap chain format
+	RefCntAutoPtr<IShaderResourceBinding> paniniSRB, paniniSRBBB;
+	IShaderResourceVariable*              paniniSrcVar = nullptr, *paniniSrcVarBB = nullptr;
+	RefCntAutoPtr<IBuffer>                paniniCB;
+	std::atomic<bool>                     paniniBuilding{false};
+	bool                                  paniniFailed = false;
+	struct PaniniScratch { RefCntAutoPtr<ITexture> tex; ITextureView* rtv = nullptr; ITextureView* srv = nullptr; int w = 0, h = 0; TEXTURE_FORMAT fmt = TEX_FORMAT_UNKNOWN; };
+	std::map<uint64_t, PaniniScratch>     paniniScratch;                   // per camera target: the un-remapped LDR frame
+	void EnsurePaniniPipes();                                             // off the draw path (EnqueueBuild)
+	bool PaniniReady() const { return paniniPSO && paniniPSOBB; }
+	PaniniScratch* PaniniTarget(uint64_t target, int w, int h, TEXTURE_FORMAT fmt);
+	void RunPanini(ITextureView* src, ITextureView* dstRTV, int w, int h, bool toBackbuffer);
 	double   lensClock = 0.0; uint64_t lensClockFrame = ~0ull;   // game clock, accumulated once per frame
 	ITextureView* lensInjectSRV = nullptr; float lensInjectAmount = 0.f, lensInjectDrain = 3.f; bool lensInjectOn = false;   // this camera pass's soak map (a module's)
 	float    lensRainRate = 0.f, lensRainAmount = 0.f, lensRainDrain = 3.f; uint64_t lensRainStamp = ~0ull;   // iRender::setLensRain, per frame

@@ -70,6 +70,9 @@ void NukeDiligent::Impl::SetupHDROutput()
 void NukeDiligent::Impl::CreatePostResources()
 {
 	postPSO.Release(); postSRB.Release(); postPSOBB.Release(); postSRBBB.Release(); postCB.Release();   // rebuild-safe
+	// The Panini remap pipes are stamped with the swap-chain format too: drop them, they rebuild on first use.
+	paniniPSO.Release(); paniniSRB.Release(); paniniPSOBB.Release(); paniniSRBBB.Release();
+	paniniSrcVar = paniniSrcVarBB = nullptr; paniniFailed = false;
 	std::string vs = shaderSource("post.vs"), ps = shaderSource("post.ps");
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]\tpost shaders missing" << endl; return; }
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;

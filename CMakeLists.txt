@@ -258,6 +258,7 @@ add_library(NukeRenderDiligent SHARED
     src/NukeDiligent_Vol.cpp
     src/NukeDiligent_Clouds.cpp
     src/NukeDiligent_Lens.cpp
+    src/NukeDiligent_Panini.cpp
     src/NukeDiligent_SkyOcc.cpp
     src/NukeDiligent_Trails.cpp
     src/NukeDiligent_SkyMap.cpp
