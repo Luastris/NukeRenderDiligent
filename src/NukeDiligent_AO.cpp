@@ -156,8 +156,10 @@ void NukeDiligent::Impl::RunAO(int w, int h)
 	if (aoPipe.gbufVar)  aoPipe.gbufVar->Set(gbufSRV);
 	if (aoPipe.depthVar) aoPipe.depthVar->Set(gbufDepthSRV);
 	if (aoTlasVar) aoTlasVar->Set((rtSceneReady && tlas) ? (IDeviceObject*)tlas.RawPtr() : (IDeviceObject*)fallbackTLAS.RawPtr());
-	if (aoRTInstVar) aoRTInstVar->Set((IDeviceObject*)(rtInstSRV ? rtInstSRV : rtNrmSRV));
-	if (aoDynPosVar) aoDynPosVar->Set((IDeviceObject*)(rtDynPosSRV ? rtDynPosSRV : rtNrmSRV));
+	// No scene data yet (empty world): the fallback RAW buffer keeps the slots bound.
+	IBufferView* nrmOrFb = rtNrmSRV ? rtNrmSRV : fbDummySRV;
+	if (aoRTInstVar) aoRTInstVar->Set((IDeviceObject*)(rtInstSRV ? rtInstSRV : fbInstSRV));   // structured slot
+	if (aoDynPosVar) aoDynPosVar->Set((IDeviceObject*)(rtDynPosSRV ? rtDynPosSRV : nrmOrFb));
 	draw(aoPipe, st.raw, nullptr, lw, lh);
 
 	// 2) 5x5 bilateral denoise, still at the AO resolution

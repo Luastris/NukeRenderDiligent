@@ -939,6 +939,10 @@ struct NukeDiligent::Impl
 	bool                               rtSceneReady = false;   // a valid TLAS is built for the current frame
 	RefCntAutoPtr<ITopLevelAS>         fallbackTLAS;           // empty TLAS bound to g_TLAS when no scene TLAS (rays miss)
 	RefCntAutoPtr<IBuffer>             fbTlasScratch, fbTlasInst;
+	RefCntAutoPtr<IBottomLevelAS>      fbBlas;                 // one degenerate triangle: the fallback TLAS's single (mask 0) instance
+	RefCntAutoPtr<IBuffer>             fbVB, fbDummyBuf, fbInstBuf;   // its vertices; a 64-byte RAW buffer and a 1-element STRUCTURED
+	IBufferView*                       fbDummySRV = nullptr;           // instance-info buffer for the SRV slots with no scene data
+	IBufferView*                       fbInstSRV  = nullptr;           // (D3D12 validates raw vs structured per variable)
 	IBottomLevelAS* GetMeshBLAS(Mesh* mesh);                   // get-or-build the BLAS for a mesh (from its pos buffer)
 	void EnsureRTFallback();                                   // build the empty fallback TLAS once
 

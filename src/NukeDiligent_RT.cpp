@@ -284,13 +284,55 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLASRange(Mesh* mesh, uint32_t firstI
 	return blas;
 }
 
-// Build the empty TLAS bound to g_TLAS when there is no scene TLAS, so the shader resource
-// is always valid; all ray queries against it miss. Built once.
+// The fallback TLAS bound to g_TLAS when there is no scene TLAS (empty world, RT scene not built
+// yet): ONE instance of a degenerate triangle with visibility mask 0, so every ray misses and the
+// validation layer sees a built, non-empty TLAS. Also a 64-byte RAW buffer for the per-scene SRV
+// slots (instance infos, dynamic positions, normals) that have nothing to bind yet. Built once.
 void NukeDiligent::Impl::EnsureRTFallback()
 {
 	if (fallbackTLAS || !rtSupported) return;
 
-	// Zero-instance TLAS: requires the NUKE patch in DeviceContextVkImpl::BuildTLAS (null upload block).
+	{   // the SRV stand-in first: needed even when the BLAS/TLAS below cannot be created
+		static const float zeros[16] = {};
+		BufferDesc bd; bd.Name = "RT fallback SRV"; bd.Usage = USAGE_IMMUTABLE; bd.BindFlags = BIND_SHADER_RESOURCE;
+		bd.Mode = BUFFER_MODE_RAW; bd.Size = sizeof(zeros);
+		BufferData bdat{zeros, bd.Size};
+		device->CreateBuffer(bd, &bdat, &fbDummyBuf);
+		if (fbDummyBuf) fbDummySRV = fbDummyBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE);
+		static const RTInstanceData zeroInst{};
+		BufferDesc sd; sd.Name = "RT fallback instances"; sd.Usage = USAGE_IMMUTABLE; sd.BindFlags = BIND_SHADER_RESOURCE;
+		sd.Mode = BUFFER_MODE_STRUCTURED; sd.ElementByteStride = sizeof(RTInstanceData); sd.Size = sizeof(RTInstanceData);
+		BufferData sdat{&zeroInst, sd.Size};
+		device->CreateBuffer(sd, &sdat, &fbInstBuf);
+		if (fbInstBuf) fbInstSRV = fbInstBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE);
+	}
+
+	// BLAS: one zero-area triangle.
+	static const float tri3[9] = {};
+	{
+		BufferDesc vb; vb.Name = "Fallback BLAS VB"; vb.Usage = USAGE_IMMUTABLE; vb.BindFlags = BIND_RAY_TRACING; vb.Size = sizeof(tri3);
+		BufferData vd{tri3, vb.Size};
+		device->CreateBuffer(vb, &vd, &fbVB);
+		if (!fbVB) return;
+		BLASTriangleDesc tri;
+		tri.GeometryName = "geo"; tri.MaxVertexCount = 3; tri.VertexValueType = VT_FLOAT32; tri.VertexComponentCount = 3;
+		tri.MaxPrimitiveCount = 1; tri.IndexType = VT_UNDEFINED;
+		BottomLevelASDesc bdesc; bdesc.Name = "Fallback BLAS"; bdesc.pTriangles = &tri; bdesc.TriangleCount = 1;
+		bdesc.Flags = RAYTRACING_BUILD_AS_PREFER_FAST_TRACE;
+		device->CreateBLAS(bdesc, &fbBlas);
+		if (!fbBlas) return;
+		BLASBuildTriangleData td;
+		td.GeometryName = "geo"; td.pVertexBuffer = fbVB; td.VertexStride = 3 * sizeof(float); td.VertexCount = 3;
+		td.VertexValueType = VT_FLOAT32; td.VertexComponentCount = 3; td.IndexType = VT_UNDEFINED; td.PrimitiveCount = 1;
+		td.Flags = RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+		BuildBLASAttribs ba;
+		ba.pBLAS = fbBlas; ba.pTriangleData = &td; ba.TriangleDataCount = 1;
+		ba.pScratchBuffer = BlasScratchFor(fbBlas->GetScratchBufferSizes().Build);
+		ba.BLASTransitionMode = ba.GeometryTransitionMode = ba.ScratchBufferTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		context->BuildBLAS(ba);
+	}
+
+	// TLAS: that one instance, invisible to every ray (mask 0).
 	TopLevelASDesc td; td.Name = "Fallback TLAS"; td.MaxInstanceCount = 1; td.Flags = RAYTRACING_BUILD_AS_PREFER_FAST_TRACE;
 	device->CreateTLAS(td, &fallbackTLAS);
 	if (!fallbackTLAS) return;
@@ -298,9 +340,11 @@ void NukeDiligent::Impl::EnsureRTFallback()
 	sbd.Size = fallbackTLAS->GetScratchBufferSizes().Build; device->CreateBuffer(sbd, nullptr, &fbTlasScratch);
 	BufferDesc ibd; ibd.Name = "FB TLAS inst"; ibd.Usage = USAGE_DEFAULT; ibd.BindFlags = BIND_RAY_TRACING;
 	ibd.Size = Uint64{TLAS_INSTANCE_DATA_SIZE} * 1; device->CreateBuffer(ibd, nullptr, &fbTlasInst);
-	TLASBuildInstanceData dummy{};   // Diligent requires pInstances != null even when InstanceCount == 0
+	TLASBuildInstanceData inst;
+	inst.InstanceName = "fb"; inst.pBLAS = fbBlas; inst.Mask = 0; inst.Flags = RAYTRACING_INSTANCE_NONE;
+	inst.CustomId = 0; inst.ContributionToHitGroupIndex = 0;
 	BuildTLASAttribs ba;
-	ba.pTLAS = fallbackTLAS; ba.pInstances = &dummy; ba.InstanceCount = 0;   // empty -> all rays miss
+	ba.pTLAS = fallbackTLAS; ba.pInstances = &inst; ba.InstanceCount = 1;
 	ba.pInstanceBuffer = fbTlasInst; ba.pScratchBuffer = fbTlasScratch;
 	ba.BindingMode = HIT_GROUP_BINDING_MODE_USER_DEFINED; ba.HitGroupStride = 0;
 	ba.TLASTransitionMode = ba.BLASTransitionMode = ba.InstanceBufferTransitionMode = ba.ScratchBufferTransitionMode
