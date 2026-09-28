@@ -265,7 +265,7 @@ void NukeDiligent::Impl::RunVolumetrics(int w, int h)
 					int slot = -1;
 					for (int k = 0; k < kFluidSlots; ++k) if (!fluidSRV[k]) { slot = k; break; }
 					if (slot >= 0)
-						if (ITextureView* fv = StepFluid(d, fluidDt)) { fluidSRV[slot] = fv; g.fluidInfo[0] = (float)(slot + 1); }
+						if (ITextureView* fv = StepFluid(d, fluidDt)) { fluidSRV[slot] = fv; g.fluidInfo[0] = (float)(slot + 1); FluidReadback(d, fluidStates[d.id], fv->GetTexture()); }
 				}
 				fillStatic(g, d);
 			}
@@ -425,7 +425,9 @@ ITextureView* NukeDiligent::Impl::StepFluid(const NukeFogVolumeDesc& d, float dt
 	// resolution: fluidRes along the longest half extent, the others in proportion (multiples of 4)
 	const float he[3] = { std::max(d.halfExt[0], 0.01f), std::max(d.halfExt[1], 0.01f), std::max(d.halfExt[2], 0.01f) };
 	const float hmax = std::max(he[0], std::max(he[1], he[2]));
-	const int res = std::max(8, std::min(192, d.fluidRes));
+	// No cap of our own: the only limit is the device's 3D texture dimension (and the VRAM the user spends).
+	const int maxDim = std::max(64, (int)std::min<Uint32>(device->GetAdapterInfo().Texture.MaxTexture3DDimension, 16384u));
+	const int res = std::max(8, std::min(maxDim, d.fluidRes));
 	int r[3];
 	for (int a = 0; a < 3; ++a) r[a] = std::max(8, ((int)std::lround(res * he[a] / hmax) + 3) / 4 * 4);
 	if (!st.map[0] || st.rx != r[0] || st.ry != r[1] || st.rz != r[2])
@@ -461,7 +463,7 @@ ITextureView* NukeDiligent::Impl::StepFluid(const NukeFogVolumeDesc& d, float dt
 		const float rad = d.clumpSize > 0.01f ? d.clumpSize : std::max(0.1f, 0.2f * hmin);
 		const float vol = 8.0f * he[0] * he[1] * he[2], spacing = rad * 0.55f;
 		const int n = std::max(256, std::min(65536, (int)(vol / (spacing * spacing * spacing)))) / 256 * 256;
-		int sr[3]; for (int a = 0; a < 3; ++a) sr[a] = std::max(8, std::min(96, ((int)std::ceil(2.0f * he[a] / (rad / 3.0f)) + 3) / 4 * 4));
+		int sr[3]; for (int a = 0; a < 3; ++a) sr[a] = std::max(8, std::min(maxDim, ((int)std::ceil(2.0f * he[a] / (rad / 3.0f)) + 3) / 4 * 4));
 		if (!st.parcels || !st.acc || !st.rhoS || st.parcelCount != n || st.sx != sr[0] || st.sy != sr[1] || st.sz != sr[2] || std::fabs(st.parcelRadius - rad) > 1e-4f)
 		{
 			Trash(st.parcels); st.parcels.Release(); Trash(st.acc); st.acc.Release(); Trash(st.rhoS); st.rhoS.Release();
@@ -613,6 +615,121 @@ ITextureView* NukeDiligent::Impl::StepFluid(const NukeFogVolumeDesc& d, float dt
 	run(9, vA, dA, pin, dv, vB, dB, pout, dv);   // MacCormack correction, continuity, relaxation -> dB, rho
 	st.cur = (st.cur + 5) % 6; st.valid = true; st.ledgerCur = (st.ledgerCur + 1) % 3;
 	return srv(st.rho);
+}
+
+// ---- fluid readback (iRender::getFogFluidCpu) ---------------------------------------------
+static float HalfToFloat(uint16_t h)
+{
+	const uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+	if (e == 0) { const float f = (float)m * (1.0f / 16777216.0f); return s ? -f : f; }   // subnormal: m x 2^-24
+	uint32_t bits;
+	if (e == 31) bits = (s << 31) | 0x7F800000u | (m << 13);
+	else         bits = (s << 31) | ((e + 112) << 23) | (m << 13);
+	float f; memcpy(&f, &bits, 4); return f;
+}
+
+// Two staging pairs per volume: a copy is issued after the step and signalled; a pair whose
+// signal passed is mapped (no wait) and published as an immutable snapshot the game thread
+// samples. Nothing is copied while nobody asks (fluidCpuWanted goes stale).
+void NukeDiligent::Impl::FluidReadback(const NukeFogVolumeDesc& d, FluidState& st, ITexture* fog)
+{
+	if (!fog || !st.valid || !st.vel[0] || !st.vel[1]) return;
+	if (frameId > fluidCpuWanted + 120) return;
+	if (!fluidFence)
+	{
+		FenceDesc fd; fd.Name = "Fluid readback";
+		device->CreateFence(fd, &fluidFence);
+		if (!fluidFence) return;
+	}
+	ITexture* vel = st.vel[(st.cur % 2) ^ 1];   // the air of the last step (StepFluid rotated cur past it)
+	const TextureDesc& vd = vel->GetDesc();
+	const TextureDesc& rd = fog->GetDesc();
+	const Uint64 done = fluidFence->GetCompletedValue();
+	// 1) a landed pair -> snapshot
+	for (int k = 0; k < 2; ++k)
+	{
+		if (!st.rbFence[k] || done < st.rbFence[k] || !st.rbVel[k] || !st.rbRho[k]) continue;
+		const TextureDesc& sv = st.rbVel[k]->GetDesc();
+		const TextureDesc& sr = st.rbRho[k]->GetDesc();
+		auto snap = std::make_shared<NukeFogFluidCpu>();
+		snap->id = d.id;
+		memcpy(snap->pos, d.pos, sizeof(snap->pos)); memcpy(snap->rot, d.rot, sizeof(snap->rot));
+		for (int a = 0; a < 3; ++a) snap->halfExt[a] = std::max(d.halfExt[a], 0.01f);
+		snap->vr[0] = (int)sv.Width; snap->vr[1] = (int)sv.Height; snap->vr[2] = (int)sv.Depth;
+		snap->rr[0] = (int)sr.Width; snap->rr[1] = (int)sr.Height; snap->rr[2] = (int)sr.Depth;
+		bool ok = false;
+		MappedTextureSubresource mv;
+		context->MapTextureSubresource(st.rbVel[k], 0, 0, MAP_READ, MAP_FLAG_DO_NOT_WAIT, nullptr, mv);
+		if (mv.pData)
+		{
+			snap->vel.resize((size_t)sv.Width * sv.Height * sv.Depth * 3);
+			for (Uint32 z = 0; z < sv.Depth; ++z)
+				for (Uint32 y = 0; y < sv.Height; ++y)
+				{
+					const uint16_t* row = (const uint16_t*)((const char*)mv.pData + z * mv.DepthStride + y * mv.Stride);
+					float* out = snap->vel.data() + ((size_t)z * sv.Height + y) * sv.Width * 3;
+					for (Uint32 x = 0; x < sv.Width; ++x) { out[x * 3] = HalfToFloat(row[x * 4]); out[x * 3 + 1] = HalfToFloat(row[x * 4 + 1]); out[x * 3 + 2] = HalfToFloat(row[x * 4 + 2]); }
+				}
+			context->UnmapTextureSubresource(st.rbVel[k], 0, 0);
+			MappedTextureSubresource mr;
+			context->MapTextureSubresource(st.rbRho[k], 0, 0, MAP_READ, MAP_FLAG_DO_NOT_WAIT, nullptr, mr);
+			if (mr.pData)
+			{
+				snap->rho.resize((size_t)sr.Width * sr.Height * sr.Depth);
+				for (Uint32 z = 0; z < sr.Depth; ++z)
+					for (Uint32 y = 0; y < sr.Height; ++y)
+					{
+						const uint16_t* row = (const uint16_t*)((const char*)mr.pData + z * mr.DepthStride + y * mr.Stride);
+						float* out = snap->rho.data() + ((size_t)z * sr.Height + y) * sr.Width;
+						for (Uint32 x = 0; x < sr.Width; ++x) out[x] = std::max(0.0f, std::min(1.0f, HalfToFloat(row[x])));
+					}
+				context->UnmapTextureSubresource(st.rbRho[k], 0, 0);
+				ok = true;
+			}
+		}
+		st.rbFence[k] = 0;   // the pair is free again
+		if (ok)
+		{
+			boost::mutex::scoped_lock l(fluidCpuLock);
+			bool replaced = false;
+			for (auto& e : fluidCpu) if (e->id == d.id) { e = snap; replaced = true; break; }
+			if (!replaced)
+			{
+				fluidCpu.push_back(snap);
+				cout << "[NukeDiligent]\tfluid readback on: volume " << d.id << " air " << snap->vr[0] << "x" << snap->vr[1] << "x" << snap->vr[2]
+				     << ", fog " << snap->rr[0] << "x" << snap->rr[1] << "x" << snap->rr[2] << endl;
+			}
+			fluidCpuFrame[d.id] = frameId;
+			for (size_t i = 0; i < fluidCpu.size(); )   // volumes gone for 2 s drop out
+			{
+				auto it = fluidCpuFrame.find(fluidCpu[i]->id);
+				if (it == fluidCpuFrame.end() || frameId > it->second + 240) { if (it != fluidCpuFrame.end()) fluidCpuFrame.erase(it); fluidCpu.erase(fluidCpu.begin() + i); }
+				else ++i;
+			}
+		}
+	}
+	// 2) this step -> a free pair
+	int k = st.rbFence[0] == 0 ? 0 : (st.rbFence[1] == 0 ? 1 : -1);
+	if (k < 0) return;   // both in flight: the GPU is behind, skip this step
+	auto ensure = [&](RefCntAutoPtr<ITexture>& t, const TextureDesc& src, const char* name)
+	{
+		if (t) { const TextureDesc& td = t->GetDesc(); if (td.Width == src.Width && td.Height == src.Height && td.Depth == src.Depth && td.Format == src.Format) return; Trash(t); t.Release(); }
+		TextureDesc td = src; td.Name = name; td.Usage = USAGE_STAGING; td.CPUAccessFlags = CPU_ACCESS_READ; td.BindFlags = BIND_NONE; td.MipLevels = 1;
+		device->CreateTexture(td, nullptr, &t);
+	};
+	ensure(st.rbVel[k], vd, "Fluid readback velocity"); ensure(st.rbRho[k], rd, "Fluid readback fog");
+	if (!st.rbVel[k] || !st.rbRho[k]) return;
+	context->CopyTexture(CopyTextureAttribs{vel, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, st.rbVel[k], RESOURCE_STATE_TRANSITION_MODE_TRANSITION});
+	context->CopyTexture(CopyTextureAttribs{fog, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, st.rbRho[k], RESOURCE_STATE_TRANSITION_MODE_TRANSITION});
+	context->EnqueueSignal(fluidFence, ++fluidFenceValue);
+	st.rbFence[k] = fluidFenceValue;
+}
+
+void NukeDiligent::getFogFluidCpu(std::vector<std::shared_ptr<const NukeFogFluidCpu>>& out)
+{
+	boost::mutex::scoped_lock l(m_impl->fluidCpuLock);
+	m_impl->fluidCpuWanted = m_impl->frameId;
+	out = m_impl->fluidCpu;
 }
 
 // A fog volume's occlusion tag: stable while the volume stands still (the hash of its placement;

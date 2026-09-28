@@ -759,8 +759,16 @@ struct NukeDiligent::Impl
 		RefCntAutoPtr<IBuffer> ledger; int ledgerCur = 0;            // ledger (4 uints): the resting amount per step, the parcels are normalised to it
 		RefCntAutoPtr<IBuffer> parcels; RefCntAutoPtr<ITexture> acc, rhoS; int parcelCount = 0; float parcelRadius = 1.0f; int sx = 0, sy = 0, sz = 0; int mode = 0;   // clumps: the parcels, their splat grid (its own resolution) and the fog on it
 		int rx = 0, ry = 0, rz = 0, cur = 0; uint64_t lastUsed = 0; bool valid = false;
+		// CPU readback (getFogFluidCpu): two staging pairs in flight, each stamped with the fence value of its copy.
+		RefCntAutoPtr<ITexture> rbVel[2], rbRho[2]; Uint64 rbFence[2] = { 0, 0 };
 	};
 	std::map<uint64_t, FluidState> fluidStates;
+	RefCntAutoPtr<IFence> fluidFence; Uint64 fluidFenceValue = 0;
+	boost::mutex fluidCpuLock;
+	std::vector<std::shared_ptr<const NukeFogFluidCpu>> fluidCpu;   // the published copies (game thread reads under the lock)
+	std::map<uint64_t, uint64_t> fluidCpuFrame;                       // id -> frame of its last copy (stale ones drop)
+	uint64_t fluidCpuWanted = 0;                                      // frame of the last getFogFluidCpu (no asker = no copies)
+	void FluidReadback(const NukeFogVolumeDesc& d, FluidState& st, ITexture* fog);   // after StepFluid: map what landed, copy this step
 	std::vector<NukeFogDisplacerDesc> fogDisplacers;
 	RefCntAutoPtr<IBuffer> fluidCB;
 	RefCntAutoPtr<IPipelineState> fluidPSO; RefCntAutoPtr<IShaderResourceBinding> fluidSRB;

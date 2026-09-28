@@ -157,6 +157,7 @@ public:
 	void endGBufferCoverage() override;
 	void getUpscaleStatus(NukeUpscaleStatus* out) override;   // 4.2: Game.ActiveUpscaler / UpscaleInfo / *Available
 	void reloadShader(const char* name) override;             // shader hot reload (NukeDiligent_Reload.cpp)
+	void getFogFluidCpu(std::vector<std::shared_ptr<const NukeFogFluidCpu>>& out) override;   // fluid fog readback (NukeDiligent_Vol.cpp)
 	bool rtAvailable() override;
 	void beginRTScene() override;
 	void addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections = true, bool castShadows = true) override;
