@@ -17,6 +17,7 @@
 #include <dcomp.h>               // DirectComposition (per-pixel window transparency)
 #endif
 #include <cstdlib>               // std::getenv (NUKE_GPU_VALIDATION opt-in)
+#include <cstring>               // adapter name copy (getAdapterInfo)
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>   // shader/PSO cache file IO
 #include <boost/dll/runtime_symbol_info.hpp>   // program_location: cache dir is exe-relative
@@ -853,6 +854,12 @@ int NukeDiligent::init(const WindowDesc& desc)
 	                      (m_impl->useD3D12 || m_impl->useVulkan) && m_impl->device &&
 	                      (m_impl->device->GetAdapterInfo().RayTracing.CapFlags & RAY_TRACING_CAP_FLAG_STANDALONE_SHADERS) != 0;
 	m_impl->CreateUpscaleFactory();   // 4.2: DLSS (NGX) / FSR 1 variants this device offers
+	if (m_impl->device)
+	{
+		const Diligent::GraphicsAdapterInfo& ai = m_impl->device->GetAdapterInfo();
+		cout << "[NukeDiligent]\tadapter: " << ai.Description << " " << (ai.Memory.LocalMemory >> 20) << " MB"
+		     << (ai.Type == Diligent::ADAPTER_TYPE_DISCRETE ? " discrete" : "") << endl;
+	}
 	cout << "[NukeDiligent]\tbackend=" << (m_impl->useD3D12 ? "D3D12" : m_impl->useVulkan ? "Vulkan" : "D3D11")
 	     << " rayTracing=" << (m_impl->rtSupported ? "yes" : (desc.rayTracing ? "no" : "off (config)")) << endl;
 	DrainD3D12DebugMessages(m_impl->device, m_impl->useD3D12);   // installs the info-queue filter BEFORE the first PSO
@@ -1528,4 +1535,22 @@ const char* NukeDiligent::backendName()
 {
 	if (!m_impl || !m_impl->device) return "";
 	return m_impl->useD3D12 ? "Dx12" : (m_impl->useVulkan ? "Vk" : "Dx11");
+}
+
+// ---- PT3 scalability presets ------------------------------------------------------------------------
+bool NukeDiligent::getAdapterInfo(NukeAdapterInfo& out)
+{
+	if (!m_impl->device) return false;
+	const Diligent::GraphicsAdapterInfo& ai = m_impl->device->GetAdapterInfo();
+	std::memset(&out, 0, sizeof(out));
+	std::strncpy(out.name, ai.Description, sizeof(out.name) - 1);
+	out.memoryMB   = (double)(ai.Memory.LocalMemory >> 20);
+	out.discrete   = ai.Type == Diligent::ADAPTER_TYPE_DISCRETE;
+	out.rayTracing = (ai.RayTracing.CapFlags & Diligent::RAY_TRACING_CAP_FLAG_STANDALONE_SHADERS) != 0;
+	return true;
+}
+
+void NukeDiligent::setTessellationScale(float scale)
+{
+	m_impl->tessScale = scale < 0.0f ? 0.0f : scale;
 }

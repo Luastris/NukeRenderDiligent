@@ -1328,6 +1328,7 @@ struct NukeDiligent::Impl
 	// dropped and the shader goes black, so keep headroom.
 	static const uint32_t                 kMatCBBytes = 2048;
 	float                                 tessFillFactor = 0.0f;   // per-draw tess factor patched into g_Disp.w
+	float                                 tessScale = 1.0f;        // quality preset: x the adaptive factor (0 = off)
 	Diligent::RefCntAutoPtr<Diligent::IBuffer> drawFlagsCB;    // per-draw flags (x = receiveShadows)
 	RefCntAutoPtr<ITexture>               whiteTex;    // 1x1 fallback when a material has no texture
 	RefCntAutoPtr<ITexture>               flatNormTex; // 1x1 (0.5,0.5,1) flat normal fallback

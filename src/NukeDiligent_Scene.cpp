@@ -325,7 +325,7 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 			const float ez = std::max(fabsf(mesh->aabbMin[2]), fabsf(mesh->aabbMax[2])) * fabsf(scale[2]);
 			dist = std::max(dist - sqrtf(ex * ex + ey * ey + ez * ez), 1.0f);
 		}
-		const float f = std::min(48.0f / std::max(dist, 1.0f), 12.0f);
+		const float f = std::min(48.0f / std::max(dist, 1.0f), 12.0f) * m_impl->tessScale;   // the preset scales it (0 = off)
 		// QUANTIZED to integers: the factor only gates/caps the adaptive hull, and terrain is
 		// dozens of same-material draws — per-draw unique factors forced a full MatCB refill
 		// and SRB commit on EVERY one of them (the 70 ms "slideshow" was CPU, not the GPU).
