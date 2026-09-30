@@ -1107,6 +1107,13 @@ struct NukeDiligent::Impl
 	float                                 toneWhite = 1.0f;         // SDR tonemap white point (linear value mapped to pure white)
 	void CreatePostResources();
 	void RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV, int w, int h, bool toBackbuffer);
+	// HDR screenshot: the armed target's tonemap input is copied into a staging texture at its
+	// tonemap (RunPostPass); captureTargetHDR maps it. ~0 = nothing armed.
+	uint64_t                hdrShotArmed = ~0ull;
+	uint64_t                hdrShotId = ~0ull;      // target the staging copy belongs to
+	RefCntAutoPtr<ITexture> hdrShotStaging;
+	bool                    hdrShotReady = false;
+	bool                    hdrShotLDR = false;     // the copy holds world.ps's sRGB result (LDR pipeline)
 	void SetupHDROutput();   // after swap-chain creation: set the HDR10 colour space if the display supports it
 	static constexpr TEXTURE_FORMAT HDR_FMT = TEX_FORMAT_RGBA16_FLOAT;
 	bool hdr = true;                   // HDR pipeline on (scene = RGBA16F, post tonemaps) / off (RGBA8, world.ps tonemaps)

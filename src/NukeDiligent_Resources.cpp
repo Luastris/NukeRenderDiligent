@@ -1051,8 +1051,10 @@ uint64_t NukeDiligent::getRenderTargetTexture(uint64_t id)
 	return (it == m_impl->rts.end()) ? 0 : reinterpret_cast<uint64_t>(it->second.srv);
 }
 
-// Read back the LDR image of `rtId` (0 = backbuffer) into `rgba`, sized w*h. Handles RGBA8 and
-// BGRA8 layouts including sRGB views. Returns false when the target is not readable.
+// Read back the shown image of `rtId` (0 = backbuffer) into `rgba`, sized w*h. Handles RGBA8 and
+// BGRA8 layouts including sRGB views, and the backbuffer of the HDR-output path: RGB10A2 (DXGI)
+// or the RGBA16F ST2084 chain (Vulkan); a live HDR10 chain is decoded PQ -> SDR at paper white.
+// Returns false when the target is not readable.
 bool NukeDiligent::captureTarget(uint64_t rtId, int& w, int& h, std::vector<uint8_t>& rgba)
 {
 	if (!m_impl->device || !m_impl->context) return false;
@@ -1076,7 +1078,9 @@ bool NukeDiligent::captureTarget(uint64_t rtId, int& w, int& h, std::vector<uint
 	const TEXTURE_FORMAT fmt = sd.Format;
 	const bool isRGBA = fmt == TEX_FORMAT_RGBA8_UNORM || fmt == TEX_FORMAT_RGBA8_UNORM_SRGB;
 	const bool isBGRA = fmt == TEX_FORMAT_BGRA8_UNORM || fmt == TEX_FORMAT_BGRA8_UNORM_SRGB;
-	if (!isRGBA && !isBGRA) return false;   // LDR 8-bit only — HDR targets are not "what's shown"
+	const bool is10   = fmt == TEX_FORMAT_RGB10A2_UNORM;
+	const bool is16F  = fmt == TEX_FORMAT_RGBA16_FLOAT && rtId == 0 && m_impl->hdr10Active;   // PQ signal in a float chain
+	if (!isRGBA && !isBGRA && !is10 && !is16F) return false;   // scene-linear float targets are not "what's shown"
 
 	TextureDesc st;
 	st.Name = "capture staging"; st.Type = RESOURCE_DIM_TEX_2D;
@@ -1102,7 +1106,49 @@ bool NukeDiligent::captureTarget(uint64_t rtId, int& w, int& h, std::vector<uint
 	for (int y = 0; y < h; ++y, srcRow += m.Stride)
 	{
 		uint8_t* dst = rgba.data() + (size_t)y * w * 4;
-		if (isRGBA)
+		if (is10 || is16F)
+		{
+			const bool pq = (rtId == 0) && m_impl->hdr10Active;
+			auto half = [](uint16_t hv) -> float {
+				const int e = (hv >> 10) & 31, mnt = hv & 1023;
+				const float f = (e == 0) ? std::ldexp((float)mnt, -24) : std::ldexp((float)(mnt + 1024), e - 25);
+				return (hv & 0x8000) ? -f : f;
+			};
+			for (int x = 0; x < w; ++x)
+			{
+				float c[3];
+				if (is16F)
+				{
+					uint16_t hv[3]; std::memcpy(hv, srcRow + (size_t)x * 8, 6);
+					for (int k = 0; k < 3; ++k) c[k] = std::clamp(half(hv[k]), 0.0f, 1.0f);
+				}
+				else
+				{
+					uint32_t v; std::memcpy(&v, srcRow + (size_t)x * 4, 4);
+					c[0] = (float)(v & 1023u) / 1023.0f; c[1] = (float)((v >> 10) & 1023u) / 1023.0f; c[2] = (float)((v >> 20) & 1023u) / 1023.0f;
+				}
+				if (pq)   // PQ -> nits -> Rec709 -> paper white = 1 -> sRGB
+				{
+					for (float& e : c)
+					{
+						const float ep = std::pow(e, 1.0f / 78.84375f);
+						e = 10000.0f * std::pow(std::max(ep - 0.8359375f, 0.0f) / (18.8515625f - 18.6875f * ep), 1.0f / 0.1593017578125f);
+					}
+					const float r = 1.660491f * c[0] - 0.587641f * c[1] - 0.072850f * c[2];
+					const float g = -0.124550f * c[0] + 1.132900f * c[1] - 0.008349f * c[2];
+					const float b = -0.018151f * c[0] - 0.100579f * c[1] + 1.118730f * c[2];
+					const float pw = std::max(m_impl->hdrPaperWhite, 1.0f);
+					c[0] = std::pow(std::clamp(r / pw, 0.0f, 1.0f), 1.0f / 2.2f);
+					c[1] = std::pow(std::clamp(g / pw, 0.0f, 1.0f), 1.0f / 2.2f);
+					c[2] = std::pow(std::clamp(b / pw, 0.0f, 1.0f), 1.0f / 2.2f);
+				}
+				dst[x * 4 + 0] = (uint8_t)(c[0] * 255.0f + 0.5f);
+				dst[x * 4 + 1] = (uint8_t)(c[1] * 255.0f + 0.5f);
+				dst[x * 4 + 2] = (uint8_t)(c[2] * 255.0f + 0.5f);
+				dst[x * 4 + 3] = 255;
+			}
+		}
+		else if (isRGBA)
 			std::memcpy(dst, srcRow, (size_t)w * 4);
 		else
 			for (int x = 0; x < w; ++x)   // BGRA -> RGBA

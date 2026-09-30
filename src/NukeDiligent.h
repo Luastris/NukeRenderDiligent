@@ -160,6 +160,8 @@ public:
 	void getFogFluidCpu(std::vector<std::shared_ptr<const NukeFogFluidCpu>>& out) override;   // fluid fog readback (NukeDiligent_Vol.cpp)
 	bool getAdapterInfo(NukeAdapterInfo& out) override;       // PT3 presets: the device's adapter
 	void setTessellationScale(float scale) override;
+	void requestHDRCapture(uint64_t rtId) override;                                        // HDR screenshot (ABI 58)
+	bool captureTargetHDR(uint64_t rtId, int& w, int& h, std::vector<float>& rgbNits) override;
 	bool rtAvailable() override;
 	void beginRTScene() override;
 	void addRTInstance(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3], bool inReflections = true, bool castShadows = true) override;

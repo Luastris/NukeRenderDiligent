@@ -602,8 +602,10 @@ int NukeDiligent::init(const WindowDesc& desc)
 #endif
 	SwapChainDesc SCDesc;
 	// Must match the World PSO + offscreen RTs (Diligent would default the backbuffer to *_SRGB);
-	// HDR10 output needs a 10-bit backbuffer for the PQ-encoded signal.
-	SCDesc.ColorBufferFormat = m_impl->hdrOutput ? TEX_FORMAT_RGB10A2_UNORM : TEX_FORMAT_RGBA8_UNORM;
+	// HDR10 output needs a 10-bit backbuffer for the PQ-encoded signal (DXGI). Vulkan asks for
+	// RGBA8: Diligent's RGB10A2 is A2R10G10B10 there, which no surface offers - the swap chain
+	// picks an ST2084 surface format itself when the display has one (g_NukeVkHDR10).
+	SCDesc.ColorBufferFormat = (m_impl->hdrOutput && !m_impl->useVulkan) ? TEX_FORMAT_RGB10A2_UNORM : TEX_FORMAT_RGBA8_UNORM;
 	// 3, not Diligent's default 2: Vulkan MAILBOX with 2 images blocks acquire until vblank.
 	SCDesc.BufferCount = 3;
 	// The DESIRED size must be explicit: a Wayland surface reports currentExtent as
@@ -1553,4 +1555,52 @@ bool NukeDiligent::getAdapterInfo(NukeAdapterInfo& out)
 void NukeDiligent::setTessellationScale(float scale)
 {
 	m_impl->tessScale = scale < 0.0f ? 0.0f : scale;
+}
+
+// ---- HDR screenshots (ABI 58) -------------------------------------------------------------------
+void NukeDiligent::requestHDRCapture(uint64_t rtId)
+{
+	m_impl->hdrShotArmed = rtId;
+}
+
+static float ShotHalfToFloat(uint16_t h)
+{
+	const int e = (h >> 10) & 31, m = h & 1023;
+	const float f = (e == 0) ? std::ldexp((float)m, -24) : (e == 31) ? 65504.0f : std::ldexp((float)(m + 1024), e - 25);
+	return (h & 0x8000) ? -f : f;
+}
+
+// The staging copy RunPostPass took, as display-referred nits: the HDR10 mapping of post.ps
+// (nits = min(c * paperWhite, peak)); an LDR pipeline's sRGB result decodes to paper white.
+bool NukeDiligent::captureTargetHDR(uint64_t rtId, int& w, int& h, std::vector<float>& rgbNits)
+{
+	Impl* im = m_impl;
+	if (!im->device || !im->context || !im->hdrShotReady || im->hdrShotId != rtId || !im->hdrShotStaging) return false;
+	im->hdrShotReady = false;
+	const TextureDesc& sd = im->hdrShotStaging->GetDesc();
+	const bool f16 = sd.Format == TEX_FORMAT_RGBA16_FLOAT;
+	const bool u8  = sd.Format == TEX_FORMAT_RGBA8_UNORM || sd.Format == TEX_FORMAT_RGBA8_UNORM_SRGB;
+	if (!f16 && !u8) return false;
+	im->context->Flush();
+	im->device->IdleGPU();
+	MappedTextureSubresource m;
+	im->context->MapTextureSubresource(im->hdrShotStaging, 0, 0, MAP_READ, MAP_FLAG_DO_NOT_WAIT, nullptr, m);
+	if (!m.pData) return false;
+	w = (int)sd.Width; h = (int)sd.Height;
+	rgbNits.resize((size_t)w * h * 3);
+	const float pw = std::max(im->hdrPaperWhite, 1.0f), peak = std::max(im->hdrPeak, pw);
+	const uint8_t* row = (const uint8_t*)m.pData;
+	for (int y = 0; y < h; ++y, row += m.Stride)
+	{
+		float* dst = rgbNits.data() + (size_t)y * w * 3;
+		for (int x = 0; x < w; ++x)
+			for (int k = 0; k < 3; ++k)
+			{
+				float c = f16 ? ShotHalfToFloat(((const uint16_t*)row)[x * 4 + k]) : row[x * 4 + k] / 255.0f;
+				if (im->hdrShotLDR || u8) c = std::pow(std::max(c, 0.0f), 2.2f);   // sRGB-encoded result -> linear
+				dst[x * 3 + k] = std::min(std::max(c, 0.0f) * pw, peak);
+			}
+	}
+	im->context->UnmapTextureSubresource(im->hdrShotStaging, 0, 0);
+	return true;
 }

@@ -176,6 +176,28 @@ void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV,
 	IShaderResourceVariable* var = toBackbuffer ? postHdrVarBB : postHdrVar;
 	if (!pso || !srb || !hdrSRV || !dstRTV) return;
 	const float mode = !hdr ? 0.0f : ((toBackbuffer && hdr10Active) ? 2.0f : 1.0f);   // 0=passthrough,1=sRGB SDR,2=HDR10 PQ
+	// An armed HDR screenshot takes THIS input (the post chain's result) before it is tonemapped.
+	if (hdrShotArmed == (toBackbuffer ? 0ull : curTarget))
+	{
+		ITexture* src = hdrSRV->GetTexture();
+		const TextureDesc& sd = src->GetDesc();
+		if (!hdrShotStaging || hdrShotStaging->GetDesc().Width != sd.Width || hdrShotStaging->GetDesc().Height != sd.Height
+		    || hdrShotStaging->GetDesc().Format != sd.Format)
+		{
+			hdrShotStaging.Release();
+			TextureDesc st; st.Name = "hdr shot staging"; st.Type = RESOURCE_DIM_TEX_2D;
+			st.Width = sd.Width; st.Height = sd.Height; st.Format = sd.Format; st.MipLevels = 1;
+			st.Usage = USAGE_STAGING; st.CPUAccessFlags = CPU_ACCESS_READ; st.BindFlags = BIND_NONE;
+			device->CreateTexture(st, nullptr, &hdrShotStaging);
+		}
+		if (hdrShotStaging)
+		{
+			CopyTextureAttribs cp(src, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, hdrShotStaging, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+			context->CopyTexture(cp);
+			hdrShotId = hdrShotArmed; hdrShotReady = true; hdrShotLDR = !hdr;
+		}
+		hdrShotArmed = ~0ull;
+	}
 	{
 		MapHelper<float> cb(context, postCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		if (cb == nullptr) return;   // dead device: Map yields null mid-frame removal
