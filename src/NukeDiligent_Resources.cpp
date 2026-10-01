@@ -1053,7 +1053,7 @@ uint64_t NukeDiligent::getRenderTargetTexture(uint64_t id)
 
 // Read back the shown image of `rtId` (0 = backbuffer) into `rgba`, sized w*h. Handles RGBA8 and
 // BGRA8 layouts including sRGB views, and the backbuffer of the HDR-output path: RGB10A2 (DXGI)
-// or the RGBA16F ST2084 chain (Vulkan); a live HDR10 chain is decoded PQ -> SDR at paper white.
+// or the RGBA16F chain (Vulkan); a live HDR chain is decoded (PQ or scRGB) -> SDR at paper white.
 // Returns false when the target is not readable.
 bool NukeDiligent::captureTarget(uint64_t rtId, int& w, int& h, std::vector<uint8_t>& rgba)
 {
@@ -1120,7 +1120,17 @@ bool NukeDiligent::captureTarget(uint64_t rtId, int& w, int& h, std::vector<uint
 				if (is16F)
 				{
 					uint16_t hv[3]; std::memcpy(hv, srcRow + (size_t)x * 8, 6);
-					for (int k = 0; k < 3; ++k) c[k] = std::clamp(half(hv[k]), 0.0f, 1.0f);
+					for (int k = 0; k < 3; ++k) c[k] = std::clamp(half(hv[k]), 0.0f, m_impl->hdrScRGB ? 125.0f : 1.0f);
+					if (m_impl->hdrScRGB)   // scRGB: 1.0 = 80 nits, Rec709 linear -> paper white = 1 -> sRGB
+					{
+						const float pw = std::max(m_impl->hdrPaperWhite, 1.0f);
+						for (int k = 0; k < 3; ++k) c[k] = std::pow(std::clamp(c[k] * 80.0f / pw, 0.0f, 1.0f), 1.0f / 2.2f);
+						dst[x * 4 + 0] = (uint8_t)(c[0] * 255.0f + 0.5f);
+						dst[x * 4 + 1] = (uint8_t)(c[1] * 255.0f + 0.5f);
+						dst[x * 4 + 2] = (uint8_t)(c[2] * 255.0f + 0.5f);
+						dst[x * 4 + 3] = 255;
+						continue;
+					}
 				}
 				else
 				{

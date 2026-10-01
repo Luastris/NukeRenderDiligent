@@ -82,7 +82,7 @@ std::string NukeDiligent::Impl::GenChitSource(const std::string& name, const std
 	  << "  float aoM=SampleAO(inst,IN.uv); float3 specM=SampleSpec(inst,IN.uv);\n"
 	  << "  float3 col = ShadeSurface(IN.worldPos,IN.worldNormal,IN.viewDir,O.albedo,O.metallic,O.roughness,O.emissive,aoM,specM);\n"
 	  << "  float3 R=reflect(wdir,IN.worldNormal); float3 env=ReflEnv(R,O.roughness), traced=env;\n"
-	  << "  if (p.depth<(uint)g_RTParams.z){ RayDesc ray; ray.Origin=IN.worldPos+IN.worldNormal*0.08+R*0.05; ray.Direction=R; ray.TMin=0.02; ray.TMax=(g_RTParams.y>0.5)?g_RTParams.y:1000.0; RTPayload p2; p2.color=0.0; p2.depth=p.depth+1; p2.hitT=ray.TMax; p2.rough=0.0; p2.flags=0u; TraceRay(g_TLAS,RAY_FLAG_NONE,RT_REFLECT_MASK,0,1,0,ray,p2); traced=p2.color; }\n"
+	  << "  if (p.depth<(uint)g_RTParams.z){ RayDesc ray; ray.Origin=IN.worldPos+IN.worldNormal*0.08+R*0.05; ray.Direction=R; ray.TMin=0.02; ray.TMax=(g_RTParams.y>0.5)?g_RTParams.y:1000.0; RTPayload p2=RTNewPayload(p.depth+1u,ray.TMax,0.0,0u); TraceRay(g_TLAS,RAY_FLAG_NONE,RT_REFLECT_MASK,0,1,0,ray,p2); RTCompose(p2); traced=p2.color; }\n"
 	  << "  col += SpecFr(IN.worldNormal,IN.viewDir,O.roughness,O.albedo,O.metallic,specM)*lerp(traced,env,O.roughness);\n"
 	  << "  p.color=RTWaterFinish(WorldRayOrigin(),wdir,IN.worldPos,col,p.depth,p.flags);\n}\n";
 	return s.str();
@@ -501,6 +501,7 @@ void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
 	uint32_t emIdx   = mat ? slotFor(mat->em)   : 0xFFFFFFFFu;
 	uint32_t specIdx = mat ? slotFor(mat->spec) : 0xFFFFFFFFu;
 	uint32_t maskIdx = mat ? slotFor(mat->mask) : 0xFFFFFFFFu;   // alpha mask (sprite Shape x texture)
+	const uint32_t additive = (mat && mat->blendMode == Material::Additive) ? 1u : 0u;   // sprites: layer adds, covers nothing
 
 	float4x4 world = float4x4::Scale(scale[0], scale[1], scale[2])
 	               * Diligent::Quaternion<float>(quat[0], quat[1], quat[2], quat[3]).ToMatrix()
@@ -531,7 +532,7 @@ void NukeDiligent::AddRTInstanceRange(Mesh* mesh, Material* mat,
 	d.specularFactor = specF;
 	d.albedoMetal[0] = alb[0]; d.albedoMetal[1] = alb[1]; d.albedoMetal[2] = alb[2]; d.albedoMetal[3] = metal;
 	d.emissiveRough[0] = em[0] * emI; d.emissiveRough[1] = em[1] * emI; d.emissiveRough[2] = em[2] * emI; d.emissiveRough[3] = rough;
-	d.colOffset = 0xFFFFFFFFu;
+	d.colOffset = 0xFFFFFFFFu; d.pad1 = additive;
 	if (mesh->rtColorArray && mesh->rtDynamic)
 	{
 		d.colOffset = (uint32_t)(m_impl->rtDynColCPU.size() * sizeof(float));
@@ -948,7 +949,7 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 	ci.RayTracingPipeline.MaxRecursionDepth = 8;       // primary + bounces; the configured depth caps actual recursion
 	ci.RayTracingPipeline.ShaderRecordSize  = 0;
 	ci.MaxAttributeSize = sizeof(float) * 3;           // max(barycentrics, SpriteAttr {uv, along})
-	ci.MaxPayloadSize   = sizeof(float) * 7;           // RTPayload { float3 color; uint depth; float hitT; float rough; uint flags; }
+	ci.MaxPayloadSize   = sizeof(float) * (7 + 5 * 4 + 1);   // RTPayload: color/depth/hitT/rough/flags + RT_SPRITE_LAYERS x (float4 + t) + count
 
 	SamplerDesc samp; samp.MinFilter = FILTER_TYPE_LINEAR; samp.MagFilter = FILTER_TYPE_LINEAR; samp.MipFilter = FILTER_TYPE_LINEAR;
 	samp.AddressU = TEXTURE_ADDRESS_CLAMP; samp.AddressV = TEXTURE_ADDRESS_CLAMP; samp.AddressW = TEXTURE_ADDRESS_CLAMP;
@@ -1047,7 +1048,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	if (!rtOutTex) return;
 
 	{   // RTRefCB: clip->view + view->world + camera + (intensity, maxDist, maxDepth) + water
-		struct CB { float4x4 ip, iv; float4 cam; float4 prm; float4 waterOcc; float4 waterCol; float4 waterAbs; float4 waterCasc; float4 waterRip0; float4 waterRip1; float4 waterCau0; float4 waterCau1; };
+		struct CB { float4x4 ip, iv; float4 cam; float4 prm; float4 waterOcc; float4 waterCol; float4 waterAbs; float4 waterCasc; float4 waterRip0; float4 waterRip1; float4 waterCau0; float4 waterCau1; float4 clear; };
 		MapHelper<CB> cb(context, rtRefCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		cb->ip  = curProjNoJitter.Inverse(); cb->iv = curView.Inverse();   // unjittered: must match the gbuffer depth
 		cb->cam = float4(curCamPos[0], curCamPos[1], curCamPos[2], (float)std::fmod(lensClock, 4096.0));   // w = the game clock (the water's capillary scroll)
@@ -1068,6 +1069,8 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		const bool cauOn = rtWaterOcc[1] > 0.5f && rtWaterCaustic != nullptr;   // the photon tile (SetRTWaterCaustic)
 		cb->waterCau0 = float4(rtWaterCau[0], rtWaterCau[1], rtWaterCau[2], cauOn ? rtWaterCau[3] : 0.0f);
 		cb->waterCau1 = float4(rtWaterCau[4], rtWaterCau[5], rtWaterCau[6], rtWaterCau[7]);
+		// The camera's clear colour: a miss with the sky off shows it, as the raster does.
+		cb->clear = float4(curClear[0], curClear[1], curClear[2], sky.mode == 0 ? 1.0f : 0.0f);
 	}
 
 	// Bind dynamic resources for every RT stage that references them (null lookups are harmless).

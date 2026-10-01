@@ -38,6 +38,7 @@ extern "C" bool g_NukeCompositionSwapChain;
 extern "C" bool g_NukeVkAlphaComposite;
 extern "C" bool g_NukeVkHDR10;
 extern "C" bool g_NukeVkHDR10Active;
+extern "C" bool g_NukeVkHDRScRGB;
 
 #include "DebugOutput.h"   // Diligent::SetDebugMessageCallback
 #include <API/Model/CrashReport.h>   // probe runs: symbolized stack on a Diligent assert
@@ -751,9 +752,10 @@ int NukeDiligent::init(const WindowDesc& desc)
 		if (m_impl->hdrOutput)
 		{
 			m_impl->hdr10Active = g_NukeVkHDR10Active;
+			m_impl->hdrScRGB    = g_NukeVkHDRScRGB;
 			cout << "[NukeDiligent]\tHDR10 output "
-			     << (m_impl->hdr10Active ? "ACTIVE (ST2084 swap chain)"
-			                             : "off (surface offers no HDR10 format)") << endl;
+			     << (m_impl->hdr10Active ? (m_impl->hdrScRGB ? "ACTIVE (scRGB linear swap chain)" : "ACTIVE (ST2084 swap chain)")
+			                             : "off (surface offers no HDR format)") << endl;
 		}
 	}
 #ifdef _WIN32

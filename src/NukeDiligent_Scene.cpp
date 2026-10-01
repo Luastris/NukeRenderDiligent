@@ -901,6 +901,7 @@ void NukeDiligent::beginCamera(const NukeCameraDesc& cam)
 	// Clear alpha is carried premultiplied through the final pass — it drives per-pixel
 	// transparency on a composited window (ignored on an opaque one).
 	ctx->ClearRenderTarget(rtv, cam.clear, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+	for (int k = 0; k < 4; ++k) m_impl->curClear[k] = cam.clear[k];
 	if (dsv)
 		ctx->ClearDepthStencil(dsv, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	Viewport vp; vp.TopLeftX = 0; vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;

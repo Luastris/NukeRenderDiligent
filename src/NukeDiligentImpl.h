@@ -1033,7 +1033,7 @@ struct NukeDiligent::Impl
 		// shadowShape = 0 quad / 1 disc / 2 strip, dynPosOffset = byte offset into g_DynPos
 		// for a sprite mesh (ray-facing procedural quads), else 0xFFFFFFFF.
 		uint32_t colOffset; uint32_t shadowShape; float shadowAlpha; uint32_t dynPosOffset;
-		uint32_t maskTexIndex; uint32_t pad1, pad2, pad3;   // bindless alpha mask (Material::mask), 0xFFFFFFFF = none
+		uint32_t maskTexIndex; uint32_t pad1, pad2, pad3;   // bindless alpha mask (Material::mask), 0xFFFFFFFF = none; pad1 = additive sprite
 	};
 	std::unordered_map<Mesh*, uint32_t> meshNrmByteOffset;     // mesh -> byte offset of its normals in rtNrmBuf
 	std::unordered_map<Mesh*, uint32_t> meshUVByteOffset;      // mesh -> byte offset of its uvs in rtUVBuf
@@ -1100,7 +1100,8 @@ struct NukeDiligent::Impl
 	float       probeMaxMip = 0.0f;
 	float       probeBoxHalf[3] = {0,0,0};   // parallax box half-extents (0 = no parallax correction)
 	bool                                  hdrOutput = false;   // requested HDR10 display output (Player only, before init)
-	bool                                  hdr10Active = false; // an HDR10 swap chain is actually live (display is HDR)
+	bool                                  hdr10Active = false; // an HDR swap chain is actually live (display is HDR)
+	bool                                  hdrScRGB = false;    // ...and it is scRGB linear (RGBA16F, Vulkan) rather than PQ
 	float                                 hdrPaperWhite = 200.0f;   // diffuse-white nits for the HDR10 encode
 	float                                 hdrPeak = 1000.0f;        // highlight peak nits
 	float                                 toneExposure = 1.0f;      // SDR tonemap exposure multiplier
@@ -1365,6 +1366,7 @@ struct NukeDiligent::Impl
 	void  UpdateBendCB();
 	void WriteFrameCB(const Diligent::float3& P);   // fill worldFrameCB (lights/shadows/sky/probe)
 	float                                 curCamPos[3] = {0, 0, 0};  // set in beginCamera (PBR view dir)
+	float                                 curClear[4] = {0, 0, 0, 1}; // this camera's clear colour (RT miss with the sky off)
 	float                                 curCamFwd[3] = {0, 0, 1};  // camera forward (ripple window aim)
 	bool                                  curCamEditor = false;      // this pass = editor viewport camera
 	uint64_t                              curTarget = 0;             // RT id bound by beginCamera (feedback guard)

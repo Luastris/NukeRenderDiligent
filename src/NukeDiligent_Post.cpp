@@ -91,7 +91,7 @@ void NukeDiligent::Impl::CreatePostResources()
 	if (!postFrameCB)  { BufferDesc d; d.Name = "PostFrame";  d.Size = sizeof(float) * 8; d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &postFrameCB); }
 	if (!ssrCB) { BufferDesc d; d.Name = "SSRCB"; d.Size = sizeof(float) * (16 * 4 + 4); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &ssrCB); }   // view/proj/invProj/invView + res
 	// 2 float4x4 + 5 float4 (camera, params, water level/fade, water scatter, water absorb).
-	if (!rtRefCB) { BufferDesc d; d.Name = "RTRefCB"; d.Size = sizeof(float) * (32 + 4 * 11); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &rtRefCB); }
+	if (!rtRefCB) { BufferDesc d; d.Name = "RTRefCB"; d.Size = sizeof(float) * (32 + 4 * 12); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &rtRefCB); }
 	if (!taaCB) { BufferDesc d; d.Name = "TAACB"; d.Size = sizeof(float) * (16 * 4 + 4 * 2); d.Usage = USAGE_DYNAMIC; d.BindFlags = BIND_UNIFORM_BUFFER; d.CPUAccessFlags = CPU_ACCESS_WRITE; device->CreateBuffer(d, nullptr, &taaCB); }
 	// G-buffer pipes (3 PSOs, ~0.5 s of driver work): built on the builder thread; the prepass
 	// stays off until they land (beginGBufferPass gates on gbufBuilding).
@@ -175,7 +175,7 @@ void NukeDiligent::Impl::RunPostPass(ITextureView* hdrSRV, ITextureView* dstRTV,
 	IShaderResourceBinding*  srb = toBackbuffer ? postSRBBB : postSRB;
 	IShaderResourceVariable* var = toBackbuffer ? postHdrVarBB : postHdrVar;
 	if (!pso || !srb || !hdrSRV || !dstRTV) return;
-	const float mode = !hdr ? 0.0f : ((toBackbuffer && hdr10Active) ? 2.0f : 1.0f);   // 0=passthrough,1=sRGB SDR,2=HDR10 PQ
+	const float mode = !hdr ? 0.0f : ((toBackbuffer && hdr10Active) ? (hdrScRGB ? 3.0f : 2.0f) : 1.0f);   // 0=passthrough,1=sRGB SDR,2=HDR10 PQ,3=scRGB linear
 	// An armed HDR screenshot takes THIS input (the post chain's result) before it is tonemapped.
 	if (hdrShotArmed == (toBackbuffer ? 0ull : curTarget))
 	{
