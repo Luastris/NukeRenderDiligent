@@ -21,7 +21,7 @@ void NukeDiligent::Impl::CreateSpriteResources()
 	sci.Desc = {"Sprite PS", SHADER_TYPE_PIXEL, true};  sci.Source = ps.c_str(); CreateShaderCached(sci, &p);
 	if (!v || !p) return;
 
-	BufferDesc cbd; cbd.Name = "SpriteCB"; cbd.Size = sizeof(float4x4) + 2 * sizeof(float) * 4;   // VP + g_Soft + g_Soft2
+	BufferDesc cbd; cbd.Name = "SpriteCB"; cbd.Size = sizeof(SpriteCBData);   // VP + g_Soft + g_Soft2 + g_Sdf + g_Outline + g_Clip
 	cbd.Usage = USAGE_DYNAMIC; cbd.BindFlags = BIND_UNIFORM_BUFFER; cbd.CPUAccessFlags = CPU_ACCESS_WRITE;
 	device->CreateBuffer(cbd, nullptr, &spriteCB);
 	// The vertex buffer is created/grown on demand in FlushSprites (it survives PSO rebuilds).
@@ -279,10 +279,12 @@ void NukeDiligent::drawSprite(Texture* tex, const float center[3], const float r
 	m_impl->lastInstBind.pso = nullptr;   // sprite pipeline replaces the instanced VB/PSO state
 	if (!m_impl->spritePSO || !tex) return;
 	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw
+	if (m_impl->spriteParams.overlay) { m_impl->AppendOverlayQuad(tex, center, right, up, uv, tint); return; }
 	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();   // kind switch: keep paint order
 	if (m_impl->spriteSixA) m_impl->FlushSpritesSix();
-	if (m_impl->spriteBatchOpen && tex != m_impl->spriteBatchTex) m_impl->FlushSprites();   // texture changed -> new batch
-	m_impl->spriteBatchTex = tex; m_impl->spriteBatchMask = m_impl->spriteMask;
+	if (m_impl->spriteBatchOpen && (tex != m_impl->spriteBatchTex || !Impl::SameSpriteParams(m_impl->spriteParams, m_impl->spriteBatchParams)))
+		m_impl->FlushSprites();   // texture or params changed -> new batch
+	m_impl->spriteBatchTex = tex; m_impl->spriteBatchMask = m_impl->spriteMask; m_impl->spriteBatchParams = m_impl->spriteParams;
 	m_impl->spriteBatchOpen = true;
 
 	auto push = [&](float sx, float sy, float u, float vv)
@@ -297,6 +299,48 @@ void NukeDiligent::drawSprite(Texture* tex, const float center[3], const float r
 	const float u0 = uv[0], v0 = uv[1], u1 = uv[2], v1 = uv[3];
 	push(-1.f,  1.f, u0, v0); push( 1.f,  1.f, u1, v0); push( 1.f, -1.f, u1, v1);   // TL, TR, BR
 	push(-1.f,  1.f, u0, v0); push( 1.f, -1.f, u1, v1); push(-1.f, -1.f, u0, v1);   // TL, BR, BL
+}
+
+// An overlay world quad: world-space verts into the after-post list, one run per texture / params.
+void NukeDiligent::Impl::AppendOverlayQuad(Texture* tex, const float center[3], const float right[3], const float up[3],
+                                           const float uv[4], const float tint[4])
+{
+	spriteOvlVP = curView * curProj;
+	auto push = [&](float sx, float sy, float u, float vv)
+	{
+		std::vector<float>& b = spriteOvlVerts;
+		b.push_back(center[0] + sx * right[0] + sy * up[0]);
+		b.push_back(center[1] + sx * right[1] + sy * up[1]);
+		b.push_back(center[2] + sx * right[2] + sy * up[2]);
+		b.push_back(u); b.push_back(vv);
+		b.push_back(tint[0]); b.push_back(tint[1]); b.push_back(tint[2]); b.push_back(tint[3]);
+	};
+	const float u0 = uv[0], v0 = uv[1], u1 = uv[2], v1 = uv[3];
+	push(-1.f,  1.f, u0, v0); push( 1.f,  1.f, u1, v0); push( 1.f, -1.f, u1, v1);
+	push(-1.f,  1.f, u0, v0); push( 1.f, -1.f, u1, v1); push(-1.f, -1.f, u0, v1);
+	if (spriteOvlRuns.empty() || spriteOvlRuns.back().tex != tex || !SameSpriteParams(spriteOvlRuns.back().prm, spriteParams))
+	{
+		SprRun nr; nr.tex = tex; nr.count = 0; nr.prm = spriteParams;
+		nr.clipPx[0] = 1.f; nr.clipPx[1] = 0.f; nr.clipPx[2] = 0.f; nr.clipPx[3] = 0.f;   // never clipped
+		spriteOvlRuns.push_back(nr);
+	}
+	spriteOvlRuns.back().count += 6;
+}
+
+// Sticky SDF / clip parameters for the sprite draws that follow (canvas widgets, ABI 61).
+void NukeDiligent::setSpriteParams(const NukeSpriteParams* p)
+{
+	m_impl->spriteParams = p ? *p : NukeSpriteParams();
+}
+
+// The params part of SpriteCB: g_Sdf = (sdf on, soft, outline width, 0), g_Outline = colour,
+// g_Clip = pixel rect {x0, y0, x1, y1} (x0 >= x1 = no clip).
+void NukeDiligent::Impl::FillSpriteCB(SpriteCBData& cb, const NukeSpriteParams& p, const float clipPx[4])
+{
+	cb.sdf[0] = p.sdf ? 1.f : 0.f; cb.sdf[1] = p.sdfSoft; cb.sdf[2] = p.outlineWidth; cb.sdf[3] = 0.f;
+	memcpy(cb.outline, p.outline, sizeof(cb.outline));
+	if (clipPx) memcpy(cb.clip, clipPx, sizeof(cb.clip));
+	else { cb.clip[0] = 1.f; cb.clip[1] = 0.f; cb.clip[2] = 0.f; cb.clip[3] = 0.f; }
 }
 
 // Set the soft-particle fade distance for subsequent sprite runs (0 = off); flushes the open batch.
@@ -354,8 +398,9 @@ void NukeDiligent::drawSpriteRun(Texture* tex, const float* verts, int vertCount
 	if (!m_impl->cameraPassActive) return;   // no camera targets bound -> nowhere valid to draw
 	if (m_impl->spriteLitTex) m_impl->FlushSpritesLit();   // kind switch: keep paint order
 	if (m_impl->spriteSixA) m_impl->FlushSpritesSix();
-	if (m_impl->spriteBatchOpen && tex != m_impl->spriteBatchTex) m_impl->FlushSprites();
-	m_impl->spriteBatchTex = tex; m_impl->spriteBatchMask = m_impl->spriteMask;
+	if (m_impl->spriteBatchOpen && (tex != m_impl->spriteBatchTex || !Impl::SameSpriteParams(m_impl->spriteParams, m_impl->spriteBatchParams)))
+		m_impl->FlushSprites();
+	m_impl->spriteBatchTex = tex; m_impl->spriteBatchMask = m_impl->spriteMask; m_impl->spriteBatchParams = m_impl->spriteParams;
 	m_impl->spriteBatchOpen = true;
 	std::vector<float>& b = m_impl->spriteBatchVerts;
 	b.insert(b.end(), verts, verts + (size_t)vertCount * 9);
@@ -479,13 +524,13 @@ void NukeDiligent::Impl::FlushSprites()
 		// The froxel grid (own-column fog + light) binds the same way, white3D when off.
 		bool soft = false; float soft2[4];
 		BindSpriteVolume(spriteSRB, spriteVolIntegVar, spriteVolLightVar, spriteDepthVar, soft2, soft);
-		struct SpriteCBData { float4x4 vp; float soft[4]; float soft2[4]; };
 		MapHelper<SpriteCBData> cb(context, spriteCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		if (cb != nullptr)
 		{
 			cb->vp = curView * curProj;
 			cb->soft[0] = spriteSoftDist; cb->soft[1] = curNear; cb->soft[2] = curFar; cb->soft[3] = soft ? 1.f : 0.f;
 			memcpy(cb->soft2, soft2, sizeof(soft2));
+			FillSpriteCB(*cb, spriteBatchParams, nullptr);   // world quads: SDF applies, no clip
 		}
 	}
 	if (spriteTexVar) spriteTexVar->Set(srv);
@@ -552,9 +597,8 @@ void NukeDiligent::Impl::FlushSpritesLit()
 	}
 	{ MapHelper<float>    mv(context, spriteVB, MAP_WRITE, MAP_FLAG_DISCARD); std::memcpy(mv, spriteLitVerts.data(), spriteLitVerts.size() * sizeof(float)); }
 	{
-		struct SpriteCBData { float4x4 vp; float soft[4]; float soft2[4]; };
 		MapHelper<SpriteCBData> cb(context, spriteCB, MAP_WRITE, MAP_FLAG_DISCARD);
-		if (cb != nullptr) { cb->vp = curView * curProj; memset(cb->soft, 0, sizeof(cb->soft)); memset(cb->soft2, 0, sizeof(cb->soft2)); }
+		if (cb != nullptr) { memset(&*cb, 0, sizeof(SpriteCBData)); cb->vp = curView * curProj; cb->clip[0] = 1.f; }
 	}
 
 	// One SRB per (diffuse, normal) pair: MUTABLE vars are set once, avoiding dynamic descriptors.
@@ -637,10 +681,10 @@ void NukeDiligent::Impl::FlushSpritesSix()
 		bool soft = false; float soft2[4];
 		BindSpriteVolume(srb, srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolInteg"), srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_VolLight"),
 		                 srb->GetVariableByName(SHADER_TYPE_PIXEL, "g_SceneDepth"), soft2, soft);
-		struct SpriteCBData { float4x4 vp; float soft[4]; float soft2[4]; };
 		MapHelper<SpriteCBData> cb(context, spriteCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		if (cb != nullptr)
 		{
+			memset(&*cb, 0, sizeof(SpriteCBData)); cb->clip[0] = 1.f;
 			cb->vp = curView * curProj;
 			cb->soft[0] = spriteSoftDist; cb->soft[1] = curNear; cb->soft[2] = curFar; cb->soft[3] = soft ? 1.f : 0.f;
 			memcpy(cb->soft2, soft2, sizeof(soft2));
@@ -715,9 +759,8 @@ void NukeDiligent::Impl::DrawSpriteCoverage()
 	}
 	{ MapHelper<float> mv(context, coverVB, MAP_WRITE, MAP_FLAG_DISCARD); std::memcpy(mv, coverVerts.data(), coverVerts.size() * sizeof(float)); }
 	{
-		struct SpriteCBData { float4x4 vp; float soft[4]; float soft2[4]; };
 		MapHelper<SpriteCBData> cb(context, spriteCB, MAP_WRITE, MAP_FLAG_DISCARD);
-		if (cb != nullptr) { cb->vp = curView * curProj; memset(cb->soft, 0, sizeof(cb->soft)); memset(cb->soft2, 0, sizeof(cb->soft2)); }
+		if (cb != nullptr) { memset(&*cb, 0, sizeof(SpriteCBData)); cb->vp = curView * curProj; cb->clip[0] = 1.f; }
 	}
 	ITextureView* rtv = s.a->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET);
 	context->SetRenderTargets(1, &rtv, gbufDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
@@ -794,13 +837,27 @@ void NukeDiligent::Impl::AppendScreenSprite(std::vector<float>& verts, std::vect
 	};
 	push(cx - hw, cy + hh, u0, v0); push(cx + hw, cy + hh, u1, v0); push(cx + hw, cy - hh, u1, v1);   // TL,TR,BR
 	push(cx - hw, cy + hh, u0, v0); push(cx + hw, cy - hh, u1, v1); push(cx - hw, cy - hh, u0, v1);   // TL,BR,BL
-	if (runs.empty() || runs.back().tex != tex) runs.push_back({ tex, 0 });
+	// The clip rect goes through the same reference->target mapping, to target pixels (top-left origin).
+	float clipPx[4] = { 1.f, 0.f, 0.f, 0.f };
+	if (spriteParams.clip)
+	{
+		const float* c = spriteParams.clipRect;
+		const float x0 = (c[0] * sx / (tw * 0.5f) + 1.f) * 0.5f * tw, x1 = (c[2] * sx / (tw * 0.5f) + 1.f) * 0.5f * tw;
+		const float y0 = (1.f - c[3] * sy / (th * 0.5f)) * 0.5f * th, y1 = (1.f - c[1] * sy / (th * 0.5f)) * 0.5f * th;
+		clipPx[0] = x0; clipPx[1] = y0; clipPx[2] = x1; clipPx[3] = y1;
+	}
+	if (runs.empty() || runs.back().tex != tex || !SameSpriteParams(runs.back().prm, spriteParams)
+	    || memcmp(runs.back().clipPx, clipPx, sizeof(clipPx)) != 0)
+	{
+		SprRun nr; nr.tex = tex; nr.count = 0; nr.prm = spriteParams; memcpy(nr.clipPx, clipPx, sizeof(clipPx));
+		runs.push_back(nr);
+	}
 	runs.back().count += 6;
 }
 
 // Replay a screen batch: identity transform (verts are already NDC), one draw per texture run.
 void NukeDiligent::Impl::FlushScreen(std::vector<float>& verts, std::vector<SprRun>& runs, IPipelineState* pso,
-                                     IShaderResourceBinding* srb, IShaderResourceVariable* texVar)
+                                     IShaderResourceBinding* srb, IShaderResourceVariable* texVar, const float4x4* vp)
 {
 	if (!pso || verts.empty() || runs.empty()) { verts.clear(); runs.clear(); return; }
 	const int vertCount = (int)(verts.size() / 9);
@@ -815,11 +872,6 @@ void NukeDiligent::Impl::FlushScreen(std::vector<float>& verts, std::vector<SprR
 		if (!spriteVB) { verts.clear(); runs.clear(); return; }
 	}
 	{ MapHelper<float>    mv(context, spriteVB, MAP_WRITE, MAP_FLAG_DISCARD); std::memcpy(mv, verts.data(), verts.size() * sizeof(float)); }
-	{
-		struct SpriteCBData { float4x4 vp; float soft[4]; float soft2[4]; };
-		MapHelper<SpriteCBData> cb(context, spriteCB, MAP_WRITE, MAP_FLAG_DISCARD);
-		if (cb != nullptr) { cb->vp = float4x4::Identity(); memset(cb->soft, 0, sizeof(cb->soft)); memset(cb->soft2, 0, sizeof(cb->soft2)); }
-	}
 	Uint64 offset = 0; IBuffer* vbs[] = { spriteVB };
 	context->SetVertexBuffers(0, 1, vbs, &offset, RESOURCE_STATE_TRANSITION_MODE_TRANSITION, SET_VERTEX_BUFFERS_FLAG_RESET);
 	context->SetPipelineState(pso);
@@ -829,6 +881,10 @@ void NukeDiligent::Impl::FlushScreen(std::vector<float>& verts, std::vector<SprR
 		ITextureView* srv = r.tex ? GetTexSRV(r.tex) : nullptr;
 		if (srv && texVar)
 		{
+			{   // per run: identity transform + this run's SDF / clip params
+				MapHelper<SpriteCBData> cb(context, spriteCB, MAP_WRITE, MAP_FLAG_DISCARD);
+				if (cb != nullptr) { memset(&*cb, 0, sizeof(SpriteCBData)); cb->vp = vp ? *vp : float4x4::Identity(); FillSpriteCB(*cb, r.prm, r.clipPx); }
+			}
 			texVar->Set(srv);
 			context->CommitShaderResources(srb, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 			DrawAttribs da; da.NumVertices = (Uint32)r.count; da.StartVertexLocation = (Uint32)base; da.Flags = DRAW_FLAG_VERIFY_ALL;
@@ -851,6 +907,13 @@ void NukeDiligent::Impl::FlushScreenPost(bool toBackbuffer)
 {
 	if (toBackbuffer) FlushScreen(spriteScrPostVerts, spriteScrPostRuns, spriteScreenPSOBB, spriteScreenSRBBB, spriteScreenTexVarBB);
 	else              FlushScreen(spriteScrPostVerts, spriteScrPostRuns, spriteScreenPSO,   spriteScreenSRB,   spriteScreenTexVar);
+	spriteOvlVerts.clear(); spriteOvlRuns.clear();   // a camera that never reached the overlay flush drops them
+}
+
+void NukeDiligent::Impl::FlushWorldOverlay(bool toBackbuffer)
+{
+	if (toBackbuffer) FlushScreen(spriteOvlVerts, spriteOvlRuns, spriteScreenPSOBB, spriteScreenSRBBB, spriteScreenTexVarBB, &spriteOvlVP);
+	else              FlushScreen(spriteOvlVerts, spriteOvlRuns, spriteScreenPSO,   spriteScreenSRB,   spriteScreenTexVar,   &spriteOvlVP);
 }
 
 // A depth-based post stage (DOF, motion blur) reads the G-buffer depth: module surfaces (the

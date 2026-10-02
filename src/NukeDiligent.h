@@ -180,6 +180,7 @@ public:
 	                              uint64_t argsBuf, uint64_t argsOffset) override;
 	void     renderGBufferObjectIndirect(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
 	                                     uint64_t argsBuf, uint64_t argsOffset) override;
+	void setSpriteParams(const NukeSpriteParams* p) override;                              // canvas widgets (ABI 61)
 	void requestHDRCapture(uint64_t rtId) override;                                        // HDR screenshot (ABI 58)
 	bool captureTargetHDR(uint64_t rtId, int& w, int& h, std::vector<float>& rgbNits) override;
 	bool rtAvailable() override;

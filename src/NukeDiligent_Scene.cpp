@@ -1009,6 +1009,10 @@ void NukeDiligent::Impl::CreateDebugResources()
 {
 	ReloadScope reloadScope("debug");
 	debugPSO.Release(); debugPSOBB.Release(); debugSRB.Release(); debugSRBBB.Release(); debugCB.Release();
+	// The depth-tested variant binds DebugCB as a STATIC variable: a rebuilt CB must rebuild it too,
+	// or it keeps the old buffer and its stale dynamic allocation (Vulkan: "out-of-date" assert).
+	if (debugDepthPSO) Trash(debugDepthPSO);
+	debugDepthPSO.Release(); debugDepthSRB.Release();
 	std::string vs = shaderSource("debug.vs"), ps = shaderSource("debug.ps");
 	if (vs.empty() || ps.empty()) { cout << "[NukeDiligent]	debug-line shaders missing" << endl; return; }
 	ShaderCreateInfo sci; sci.SourceLanguage = SHADER_SOURCE_LANGUAGE_HLSL;
@@ -1863,6 +1867,7 @@ void NukeDiligent::endCamera()
 		// Gizmo lines last, over the final LDR image (target still bound by RunPostPass): TAA has
 		// no velocity for lines and the RT-reflection composite would overwrite them.
 		m_impl->DrawDebugLines(toBB);
+		m_impl->FlushWorldOverlay(toBB);   // overlay world widgets (no depth), warped with the world under panini
 		if (pan) m_impl->RunPanini(pan->srv, m_impl->curPostDst, m_impl->outW, m_impl->outH, toBB);
 		m_impl->FlushScreenPost(toBB);   // AfterPost screen-space canvas sprites (crisp HUD), unwarped
 	}

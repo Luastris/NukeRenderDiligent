@@ -677,6 +677,7 @@ int NukeDiligent::init(const WindowDesc& desc)
 			EngineCI.SetValidationLevel(VALIDATION_LEVEL_1);
 			cout << "[NukeDiligent]\tVulkan validation layers ENABLED (gpuValidation)" << endl;
 		}
+		else EngineCI.SetValidationLevel(VALIDATION_LEVEL_DISABLED);   // Debug Diligent asks for the layer by default: a warning on every machine without the SDK
 #endif
 		// Editor-class dynamic budgets, mirroring the D3D12 branch.
 		EngineCI.DynamicHeapSize = 32u << 20;
@@ -1246,7 +1247,10 @@ void NukeDiligent::Impl::SavePSOCache(bool force)
 	const double now = nuke::Log::Uptime();
 	if (!force && now - psoCacheSavedAt < 5.0) return;   // batch: new pipelines keep arriving during warm-up
 	RefCntAutoPtr<IDataBlob> blob;
-	psoCache->GetData(&blob);
+	{
+		std::unique_lock<std::shared_mutex> lk(psoCacheMutex);   // no pipeline joins the library mid-serialize
+		psoCache->GetData(&blob);
+	}
 	psoCacheDirty = false; psoCacheSavedAt = now;
 	if (!blob || !blob->GetSize()) return;
 	namespace bfs = boost::filesystem;

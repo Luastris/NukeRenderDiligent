@@ -102,6 +102,7 @@ extern "C" void  NukeCocoaSetHiddenFromCapture(GLFWwindow* wnd, bool hide);
 #include <cstring>
 #include <cstdio>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
@@ -153,6 +154,10 @@ struct NukeDiligent::Impl
 	RefCntAutoPtr<IPipelineStateCache> psoCache;
 	std::atomic<bool> psoCacheDirty{false};   // set from the builder thread too
 	double psoCacheSavedAt = 0.0;
+	// Creations hold it shared (the D3D12 pipeline library is free-threaded), the save holds it
+	// exclusive: GetData sizes the blob before serializing, a pipeline stored in between made the
+	// serialize fail ("insufficient amount of memory").
+	std::shared_mutex psoCacheMutex;
 	void InitPSOCache();   // load config/psocache_<backend>.bin (after device creation)
 	void SavePSOCache(bool force);   // write when dirty (throttled) / at shutdown
 	// The D3D12 pipeline library keys entries by PSO NAME: the same name with other bytecode or
@@ -224,7 +229,10 @@ struct NukeDiligent::Impl
 		c2.pPSOCache = psoCache;
 		const std::string cacheName = PSOCacheName(ci);
 		c2.PSODesc.Name = cacheName.c_str();
-		device->CreateGraphicsPipelineState(c2, pp);
+		{
+			std::shared_lock<std::shared_mutex> lk(psoCacheMutex);
+			device->CreateGraphicsPipelineState(c2, pp);
+		}
 		if (*pp && psoCache) psoCacheDirty = true;
 		const double t2 = nuke::Log::Uptime();
 		// Diagnostic (NUKE_PSO_TWICE=1): create the identical pipeline again — a warm driver
@@ -253,7 +261,10 @@ struct NukeDiligent::Impl
 		c2.pPSOCache = psoCache;
 		const std::string cacheName = PSOCacheName(ci);
 		c2.PSODesc.Name = cacheName.c_str();
-		device->CreateComputePipelineState(c2, pp);
+		{
+			std::shared_lock<std::shared_mutex> lk(psoCacheMutex);
+			device->CreateComputePipelineState(c2, pp);
+		}
 		if (*pp && psoCache) psoCacheDirty = true;
 		const double ms = (nuke::Log::Uptime() - t0) * 1000.0;
 		if (ms > 30.0)
@@ -1579,6 +1590,16 @@ struct NukeDiligent::Impl
 	// pre-sorted back-to-front). Flushed on texture change and at endCamera, before the MSAA resolve.
 	Texture*                              spriteBatchTex = nullptr;
 	bool                                  spriteBatchOpen = false;   // batch live (tex may legally be null -> white 1x1)
+	// SpriteCB layout (sprite.vs/ps + the lit/six/cover variants read a prefix of it).
+	struct SpriteCBData { float4x4 vp; float soft[4]; float soft2[4]; float sdf[4]; float outline[4]; float clip[4]; };
+	// Sticky sprite params (iRender::setSpriteParams): SDF text + clip. The open world batch and
+	// each screen run carry a snapshot; a change closes the batch / starts a run.
+	NukeSpriteParams                      spriteParams;
+	NukeSpriteParams                      spriteBatchParams;
+	static bool SameSpriteParams(const NukeSpriteParams& a, const NukeSpriteParams& b)
+	{ return a.sdf == b.sdf && a.sdfSoft == b.sdfSoft && a.outlineWidth == b.outlineWidth && a.clip == b.clip && a.overlay == b.overlay
+	      && memcmp(a.outline, b.outline, sizeof(a.outline)) == 0 && memcmp(a.clipRect, b.clipRect, sizeof(a.clipRect)) == 0; }
+	void FillSpriteCB(SpriteCBData& cb, const NukeSpriteParams& p, const float clipPx[4]);   // the params part
 	float                                 spriteSoftDist = 0.f;      // soft-particle fade distance for the CURRENT run (0 = off)
 	float                                 spriteVolLight = 0.f;      // froxel-grid lighting amount for the CURRENT run (0 = off)
 	IShaderResourceVariable*              spriteDepthVar = nullptr;  // PS "g_SceneDepth" (prepass depth; white when absent)
@@ -1623,7 +1644,7 @@ struct NukeDiligent::Impl
 	// Screen-space (Canvas HUD) sprites — verts already in NDC, identity transform. Two queues:
 	// PRE = drawn with the scene before post (reuses spritePSO); POST = drawn on the final image
 	// after post (own output-format PSO, single-sample, no depth). Each stores per-texture runs.
-	struct SprRun { Texture* tex; int count; };
+	struct SprRun { Texture* tex; int count; NukeSpriteParams prm; float clipPx[4]; };   // clipPx: target pixels, top-left origin
 	std::vector<float>   spriteScrPreVerts;   std::vector<SprRun> spriteScrPreRuns;
 	std::vector<float>   spriteScrPostVerts;  std::vector<SprRun> spriteScrPostRuns;
 	RefCntAutoPtr<IPipelineState>         spriteScreenPSO, spriteScreenPSOBB;      // after-post: RT / backbuffer format
@@ -1633,9 +1654,15 @@ struct NukeDiligent::Impl
 	                        const float rect[4], const float refSize[2], const float uv[4], const float tint[4],
 	                        int scaleMode = 0);   // 0 Fit / 1 Stretch / 2 Expand / 3 FitWidth / 4 FitHeight
 	void FlushScreen(std::vector<float>& verts, std::vector<SprRun>& runs, IPipelineState* pso,
-	                 IShaderResourceBinding* srb, IShaderResourceVariable* texVar);
+	                 IShaderResourceBinding* srb, IShaderResourceVariable* texVar, const float4x4* vp = nullptr);
 	void FlushScreenPre();                    // at endCamera, before the MSAA resolve (into the scene target)
 	void FlushScreenPost(bool toBackbuffer);  // after post, on the final output
+	// World quads with params.overlay: kept in world space, drawn after post with the camera VP and
+	// no depth test (before the panini remap, so they warp with the world; the HUD comes after).
+	std::vector<float>   spriteOvlVerts;      std::vector<SprRun> spriteOvlRuns;
+	float4x4             spriteOvlVP;
+	void AppendOverlayQuad(Texture* tex, const float center[3], const float right[3], const float up[3], const float uv[4], const float tint[4]);
+	void FlushWorldOverlay(bool toBackbuffer);
 
 	// Screen-space decals (iRender::drawDecal): box volume, surface reconstructed from the gbuf depth,
 	// texture projected along the box +Z. Albedo = alpha blend, LightProjector = additive.
