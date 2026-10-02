@@ -1041,6 +1041,18 @@ struct NukeDiligent::Impl
 	std::vector<float>                  allNrmCPU, allUVCPU, allPosCPU;   // concatenated normals / uvs / positions
 	bool                                allNrmDirty = false;
 	RefCntAutoPtr<IBuffer>              rtNrmBuf;     IBufferView* rtNrmSRV  = nullptr;   // ByteAddressBuffer (all normals)
+	RefCntAutoPtr<IBuffer>              dummyBuf;     // 112-byte structured buffer: stands in for RT pools that do not exist yet
+	IBufferView* DummyBufSRV()
+	{
+		if (!dummyBuf)
+		{
+			BufferDesc d; d.Name = "dummy structured"; d.Size = 112; d.Usage = USAGE_DEFAULT;
+			d.BindFlags = BIND_SHADER_RESOURCE; d.Mode = BUFFER_MODE_STRUCTURED; d.ElementByteStride = 112;
+			std::vector<uint8_t> zero(112, 0); BufferData bd{ zero.data(), 112 };
+			device->CreateBuffer(d, &bd, &dummyBuf);
+		}
+		return dummyBuf ? dummyBuf->GetDefaultView(BUFFER_VIEW_SHADER_RESOURCE) : nullptr;
+	}
 	RefCntAutoPtr<IBuffer>              rtUVBuf;      IBufferView* rtUVSRV   = nullptr;   // ByteAddressBuffer (all uvs)
 	RefCntAutoPtr<IBuffer>              rtPosBuf;     IBufferView* rtPosSRV  = nullptr;   // ByteAddressBuffer (all positions)
 	RefCntAutoPtr<IBuffer>              rtInstBuf;    IBufferView* rtInstSRV = nullptr;   // StructuredBuffer<RTInstanceData>
@@ -1716,8 +1728,35 @@ struct NukeDiligent::Impl
 	                 bool skinned = false;
 	                 RefCntAutoPtr<IBuffer> skinPosPrev;
 	                 RefCntAutoPtr<IBuffer> skinSrcPos, skinSrcNrm, skinIdxBuf, skinWgtBuf, skinMorph;
-	                 int skinMorphCount = 0; };
+	                 int skinMorphCount = 0;
+	                 // GPU-resident (gpuMeshReserve): arena ranges a compute shader fills, no CPU
+	                 // streams ever — never re-uploaded, never rebuilt on a count change.
+	                 bool resident = false; };
 	std::unordered_map<Mesh*, MeshGPU>          meshCache;
+	// Module compute seam (abi 60, NukeDiligent_Gpu.cpp): handle -> resource / pipeline / readback.
+	struct GpuRes { RefCntAutoPtr<IBuffer> buf; RefCntAutoPtr<ITexture> tex; };
+	struct GpuPipe
+	{
+		RefCntAutoPtr<IPipelineState> pso; RefCntAutoPtr<IShaderResourceBinding> srb; RefCntAutoPtr<IBuffer> cb; uint32_t cbCap = 0; std::string name;
+		// Variable lookups cached by name; a variable is re-Set only when its object changes
+		// (a mesher chain re-binds the same 17 resources per dispatch).
+		std::unordered_map<std::string, std::pair<IShaderResourceVariable*, IDeviceObject*>> vars;
+		bool paramsBound = false;
+	};
+	struct GpuRead { RefCntAutoPtr<IBuffer> staging; uint64_t bytes = 0; uint64_t frame = 0; Uint64 fence = 0; };
+	std::vector<RefCntAutoPtr<IBuffer>> gpuStagingPool;   // retired readback buffers, reused by size
+	// Readback completion: a fence signalled after each copy - MAP_FLAG_DO_NOT_WAIT alone does
+	// not report an unfinished copy on every backend (Vulkan mapped stale bytes).
+	RefCntAutoPtr<IFence> gpuFence;
+	Uint64 gpuFenceValue = 0;
+	std::map<uint64_t, GpuRes>  gpuRes;
+	std::map<uint64_t, GpuPipe> gpuPipes;
+	std::map<uint64_t, GpuRead> gpuReads;
+	uint64_t gpuNext = 1;
+	IBuffer* GpuBuffer(uint64_t h) { auto it = gpuRes.find(h); return it == gpuRes.end() ? nullptr : it->second.buf.RawPtr(); }
+	bool GpuBind(GpuPipe& p, const NukeGpuBind* binds, int n, const void* params, uint32_t paramBytes);
+	IBuffer* gpuIndirectBuf = nullptr;   // set around a draw core call: DrawIndexedIndirect from here
+	Uint64   gpuIndirectOff = 0;
 	MeshGPU* GetMeshGPU(Mesh* mesh);   // get-or-build a mesh's GPU vertex buffers; re-uploads in
 	                                   // place when Mesh::version changed (skinned/procedural)
 	// Active LOD by approximate screen coverage (bounding-sphere diameter / camera distance),

@@ -520,20 +520,25 @@ NukeDiligent::Impl::PoolArena* NukeDiligent::Impl::PoolAllocMesh(uint32_t verts,
 	auto a = std::make_unique<PoolArena>();
 	a->vertCap = kArenaVerts;
 	a->idxCap = kArenaIdx;
-	BufferDesc bd; bd.Usage = USAGE_DEFAULT; bd.BindFlags = BIND_VERTEX_BUFFER;
-	BufferDesc pbd = bd; if (rtSupported) pbd.BindFlags = BIND_VERTEX_BUFFER | BIND_RAY_TRACING;
+	// The pos/nrm/col/idx streams are also RAW UAVs: the module compute seam (gpuMeshReserve)
+	// lets a compute shader write a resident mesh's range directly.
+	BufferDesc bd; bd.Usage = USAGE_DEFAULT; bd.BindFlags = BIND_VERTEX_BUFFER | BIND_UNORDERED_ACCESS | BIND_SHADER_RESOURCE;
+	bd.Mode = BUFFER_MODE_RAW; bd.ElementByteStride = 4;
+	BufferDesc pbd = bd; if (rtSupported) pbd.BindFlags |= BIND_RAY_TRACING;
 	pbd.Size = (Uint64)kArenaVerts * 12; pbd.Name = "mesh pool pos"; device->CreateBuffer(pbd, nullptr, &a->pos);
 	bd.Size = (Uint64)kArenaVerts * 12; bd.Name = "mesh pool nrm"; device->CreateBuffer(bd, nullptr, &a->nrm);
 	{
 		// The uv stream must READ as zeros (pooled meshes carry no uvs) — init it explicitly.
 		std::vector<float> zero((size_t)kArenaVerts * 2, 0.0f);
-		bd.Size = (Uint64)kArenaVerts * 8; bd.Name = "mesh pool uv";
-		BufferData zd{ zero.data(), bd.Size };
-		device->CreateBuffer(bd, &zd, &a->uv);
+		BufferDesc ud; ud.Usage = USAGE_DEFAULT; ud.BindFlags = BIND_VERTEX_BUFFER;
+		ud.Size = (Uint64)kArenaVerts * 8; ud.Name = "mesh pool uv";
+		BufferData zd{ zero.data(), ud.Size };
+		device->CreateBuffer(ud, &zd, &a->uv);
 	}
 	bd.Size = (Uint64)kArenaVerts * 16; bd.Name = "mesh pool col"; device->CreateBuffer(bd, nullptr, &a->col);
 	BufferDesc ib; ib.Usage = USAGE_DEFAULT; ib.Name = "mesh pool idx";
-	ib.BindFlags = rtSupported ? (BIND_INDEX_BUFFER | BIND_RAY_TRACING) : BIND_INDEX_BUFFER;
+	ib.BindFlags = BIND_INDEX_BUFFER | BIND_UNORDERED_ACCESS | BIND_SHADER_RESOURCE | (rtSupported ? BIND_RAY_TRACING : BIND_NONE);
+	ib.Mode = BUFFER_MODE_RAW; ib.ElementByteStride = 4;
 	ib.Size = (Uint64)kArenaIdx * 4;
 	device->CreateBuffer(ib, nullptr, &a->idx);
 	if (!a->pos || !a->nrm || !a->uv || !a->col || !a->idx) return nullptr;
@@ -654,6 +659,21 @@ NukeDiligent::Impl::MeshGPU* NukeDiligent::Impl::GetMeshGPU(Mesh* mesh)
 	}
 	MeshGPU& g = it->second;
 	if (!g.PosBuf() || !g.NrmBuf() || !g.UVBuf()) return nullptr;
+	if (g.resident)
+	{
+		// A compute-written range: a version bump means the shader rewrote it - only the BLAS
+		// over it is stale. Counts are the module's business (Mesh::numVerts / numIndices).
+		if (g.version != mesh->version)
+		{
+			auto bit = blasCache.find(mesh);
+			if (bit != blasCache.end()) { Trash(bit->second); blasCache.erase(bit); }
+			for (auto sit = blasSectionCache.lower_bound({mesh, 0ull});
+			     sit != blasSectionCache.end() && sit->first.first == mesh; )
+			{ Trash(sit->second); sit = blasSectionCache.erase(sit); }
+			g.version = mesh->version;
+		}
+		return &g;
+	}
 	if (g.version != mesh->version)
 	{
 		if (g.numVerts != mesh->numVerts || g.numIndices != mesh->numIndices)   // topology changed: rebuild from scratch

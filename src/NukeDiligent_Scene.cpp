@@ -420,8 +420,8 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 	bindIf(wp.cubeVar,   m_impl->shadowCubeSRV, wp.lastBind[7]);
 	bindIf(wp.probeVar,  (m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV, wp.lastBind[8]);
 	bindIf(wp.tlasVar,   (m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr(), wp.lastBind[9]);
-	bindIf(wp.rtInstVar, (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV), wp.lastBind[10]);
-	bindIf(wp.rtDynPosVar, (IDeviceObject*)(m_impl->rtDynPosSRV ? m_impl->rtDynPosSRV : m_impl->rtNrmSRV), wp.lastBind[13 + Impl::kOvTexCount + 10]);
+	bindIf(wp.rtInstVar, (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV ? m_impl->rtNrmSRV : m_impl->DummyBufSRV()), wp.lastBind[10]);
+	bindIf(wp.rtDynPosVar, (IDeviceObject*)(m_impl->rtDynPosSRV ? m_impl->rtDynPosSRV : m_impl->rtNrmSRV ? m_impl->rtNrmSRV : m_impl->DummyBufSRV()), wp.lastBind[13 + Impl::kOvTexCount + 10]);
 	bindIf(wp.wipeVar, wipesrv ? wipesrv : whiteSRV, wp.lastBind[11]);
 	bindIf(wp.heightVar, heightsrv ? heightsrv : whiteSRV, wp.lastBind[12]);
 	{
@@ -521,8 +521,10 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 		TP(SHADER_TYPE_PIXEL, "g_ShadowCube", m_impl->shadowCubeSRV);
 		TP(SHADER_TYPE_PIXEL, "g_Probe",      (m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV);
 		TP(SHADER_TYPE_PIXEL, "g_TLAS",       (m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr());
-		TP(SHADER_TYPE_PIXEL, "g_RTInst",     (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV));
-		TP(SHADER_TYPE_PIXEL, "g_DynPos",     (IDeviceObject*)(m_impl->rtDynPosSRV ? m_impl->rtDynPosSRV : m_impl->rtNrmSRV));
+		// Before the first RT accumulation (a GPU-meshed terrain draws on frame one) the RT pools
+		// do not exist yet: a dummy buffer keeps the variables bound (never read: g_TLAS is empty).
+		TP(SHADER_TYPE_PIXEL, "g_RTInst",     (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV ? m_impl->rtNrmSRV : m_impl->DummyBufSRV()));
+		TP(SHADER_TYPE_PIXEL, "g_DynPos",     (IDeviceObject*)(m_impl->rtDynPosSRV ? m_impl->rtDynPosSRV : m_impl->rtNrmSRV ? m_impl->rtNrmSRV : m_impl->DummyBufSRV()));
 		for (int k = 0; k < Impl::kOvTexCount; ++k)
 			TP(SHADER_TYPE_PIXEL, Impl::OvTexNames()[k].c_str(), ovsrv[k] ? ovsrv[k] : (((k < Impl::kOvSlots * 4 && (k & 3) == 1) || k == Impl::kOvSlots * 4 + 2) ? (IDeviceObject*)flatN : (IDeviceObject*)whiteSRV));
 		TP(SHADER_TYPE_PIXEL, "g_Flow",      (mat && mat->flow) ? (IDeviceObject*)m_impl->GetTexSRV(mat->flow) : (IDeviceObject*)whiteSRV);
@@ -586,6 +588,15 @@ void NukeDiligent::RenderObjectRange(Mesh* mesh, Material* mat,
 			ia.Flags = DRAW_FLAG_VERIFY_STATES; ia.AttribsBufferStateTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
 			ctx->DrawIndirect(ia);
 		}
+	}
+	else if (m_impl->gpuIndirectBuf && g.IdxBuf())
+	{
+		// Module compute seam: this frame's count lives in the args the shader wrote.
+		ctx->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawIndexedIndirectAttribs ia;
+		ia.pAttribsBuffer = m_impl->gpuIndirectBuf; ia.DrawArgsOffset = m_impl->gpuIndirectOff; ia.IndexType = VT_UINT32;
+		ia.Flags = DRAW_FLAG_VERIFY_STATES; ia.AttribsBufferStateTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ctx->DrawIndexedIndirect(ia);
 	}
 	else if (g.IdxBuf())
 	{
@@ -2139,8 +2150,8 @@ void NukeDiligent::renderObjectInstanced(Mesh* mesh, Material* mat, uint64_t ins
 	bindIf(wp.cubeVarI,   m_impl->shadowCubeSRV, wp.lastBindI[7]);
 	bindIf(wp.probeVarI,  (m_impl->probeActive && m_impl->probeCubeSRV) ? m_impl->probeCubeSRV : m_impl->fallbackCubeSRV, wp.lastBindI[8]);
 	bindIf(wp.tlasVarI,   (m_impl->rtSceneReady && m_impl->tlas) ? (IDeviceObject*)m_impl->tlas.RawPtr() : (IDeviceObject*)m_impl->fallbackTLAS.RawPtr(), wp.lastBindI[9]);
-	bindIf(wp.rtInstVarI, (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV), wp.lastBindI[10]);
-	bindIf(wp.rtDynPosVarI, (IDeviceObject*)(m_impl->rtDynPosSRV ? m_impl->rtDynPosSRV : m_impl->rtNrmSRV), wp.lastBindI[13 + Impl::kOvTexCount + 10]);
+	bindIf(wp.rtInstVarI, (IDeviceObject*)(m_impl->rtInstSRV ? m_impl->rtInstSRV : m_impl->rtNrmSRV ? m_impl->rtNrmSRV : m_impl->DummyBufSRV()), wp.lastBindI[10]);
+	bindIf(wp.rtDynPosVarI, (IDeviceObject*)(m_impl->rtDynPosSRV ? m_impl->rtDynPosSRV : m_impl->rtNrmSRV ? m_impl->rtNrmSRV : m_impl->DummyBufSRV()), wp.lastBindI[13 + Impl::kOvTexCount + 10]);
 	bindIf(wp.wipeVarI, wipesrv ? wipesrv : whiteSRV, wp.lastBindI[11]);
 	bindIf(wp.heightVarI, heightsrv ? heightsrv : whiteSRV, wp.lastBindI[12]);
 	// Overlay slots: the whole-set draw context (source atom's values + painted mask) was pushed

@@ -160,6 +160,26 @@ public:
 	void getFogFluidCpu(std::vector<std::shared_ptr<const NukeFogFluidCpu>>& out) override;   // fluid fog readback (NukeDiligent_Vol.cpp)
 	bool getAdapterInfo(NukeAdapterInfo& out) override;       // PT3 presets: the device's adapter
 	void setTessellationScale(float scale) override;
+	// Module compute seam (abi 60): NukeDiligent_Gpu.cpp.
+	bool     gpuSupported() override;
+	uint64_t gpuCreateBuffer(uint64_t bytes, int usage, uint32_t stride, const void* init) override;
+	void     gpuUpdateBuffer(uint64_t buf, uint64_t offset, const void* data, uint64_t bytes) override;
+	void     gpuCopyBuffer(uint64_t src, uint64_t srcOff, uint64_t dst, uint64_t dstOff, uint64_t bytes) override;
+	uint64_t gpuCreateTexture3D(int w, int h, int d, int format, const void* init) override;
+	void     gpuUpdateTexture3D(uint64_t tex, int x, int y, int z, int w, int h, int d, const void* data, uint32_t rowBytes, uint32_t sliceBytes) override;
+	void     gpuDestroy(uint64_t res) override;
+	uint64_t gpuCreateCompute(const char* name, const char* hlsl, const char* entry) override;
+	void     gpuDispatch(uint64_t pipe, const NukeGpuBind* binds, int bindCount, const void* params, uint32_t paramBytes,
+	                     uint32_t gx, uint32_t gy, uint32_t gz) override;
+	void     gpuDispatchIndirect(uint64_t pipe, const NukeGpuBind* binds, int bindCount, const void* params, uint32_t paramBytes,
+	                             uint64_t argsBuf, uint64_t argsOffset) override;
+	uint64_t gpuReadback(uint64_t buf, uint64_t offset, uint64_t bytes) override;
+	int      gpuReadbackPoll(uint64_t ticket, void* dst, uint64_t bytes) override;
+	bool     gpuMeshReserve(Mesh* mesh, uint32_t verts, uint32_t inds, NukeGpuMeshRange& out) override;
+	void     renderObjectIndirect(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
+	                              uint64_t argsBuf, uint64_t argsOffset) override;
+	void     renderGBufferObjectIndirect(Mesh* mesh, Material* mat, const float pos[3], const float quat[4], const float scale[3],
+	                                     uint64_t argsBuf, uint64_t argsOffset) override;
 	void requestHDRCapture(uint64_t rtId) override;                                        // HDR screenshot (ABI 58)
 	bool captureTargetHDR(uint64_t rtId, int& w, int& h, std::vector<float>& rgbNits) override;
 	bool rtAvailable() override;

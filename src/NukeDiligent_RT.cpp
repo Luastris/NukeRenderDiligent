@@ -111,6 +111,7 @@ IBottomLevelAS* NukeDiligent::Impl::GetMeshBLAS(Mesh* mesh)
 	if (it != blasCache.end()) return it->second;
 	MeshGPU* gp = GetMeshGPU(mesh);
 	if (!gp || !gp->PosBuf() || gp->numVerts < 3) { blasCache[mesh] = {}; return nullptr; }
+	if (gp->resident) { blasCache[mesh] = {}; return nullptr; }   // compute-written ranges are indexed: the range BLAS owns them
 	if (mesh->rtSprite) return GetSpriteBLAS(mesh, gp);
 
 	BLASTriangleDesc tri;

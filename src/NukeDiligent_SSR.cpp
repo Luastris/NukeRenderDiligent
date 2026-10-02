@@ -546,7 +546,15 @@ void NukeDiligent::RenderGBufferRange(Mesh* mesh, Material* mat, const float pos
 		ctx->SetPipelineState(m_impl->gbufPSO);
 		ctx->CommitShaderResources(m_impl->gbufSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 	}
-	if (g.IdxBuf())
+	if (m_impl->gpuIndirectBuf && g.IdxBuf())
+	{
+		ctx->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+		DrawIndexedIndirectAttribs ia;
+		ia.pAttribsBuffer = m_impl->gpuIndirectBuf; ia.DrawArgsOffset = m_impl->gpuIndirectOff; ia.IndexType = VT_UINT32;
+		ia.Flags = DRAW_FLAG_VERIFY_STATES; ia.AttribsBufferStateTransitionMode = RESOURCE_STATE_TRANSITION_MODE_TRANSITION;
+		ctx->DrawIndexedIndirect(ia);
+	}
+	else if (g.IdxBuf())
 	{
 		ctx->SetIndexBuffer(g.IdxBuf(), g.IdxOfs(), RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 		DrawIndexedAttribs da{ (Uint32)indexCount, VT_UINT32, DRAW_FLAG_VERIFY_STATES };

@@ -1,8 +1,7 @@
 diff --git a/Graphics/GraphicsEngineVulkan/src/SwapChainVkImpl.cpp b/Graphics/GraphicsEngineVulkan/src/SwapChainVkImpl.cpp
-index 8b6e5bb30..6811d024d 100644
 --- a/Graphics/GraphicsEngineVulkan/src/SwapChainVkImpl.cpp
 +++ b/Graphics/GraphicsEngineVulkan/src/SwapChainVkImpl.cpp
-@@ -34,6 +34,15 @@
+@@ -34,6 +34,16 @@
  #include "EngineMemory.h"
  #include "GraphicsAccessories.hpp"
  
@@ -14,42 +13,54 @@ index 8b6e5bb30..6811d024d 100644
 +// format — on MoltenVK that maps to a PQ CAMetalLayer with EDR content enabled.
 +extern "C" bool g_NukeVkHDR10        = false;
 +extern "C" bool g_NukeVkHDR10Active  = false;
++extern "C" bool g_NukeVkHDRScRGB     = false;   // the picked HDR surface is scRGB linear (RGBA16F), not ST2084
 +
  namespace Diligent
  {
  
-@@ -406,6 +415,51 @@ void SwapChainVkImpl::CreateVulkanSwapChain()
+@@ -406,6 +416,62 @@
              VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
              VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
          };
-+    // NUKE PATCH: HDR10 output — pick an ST2084 (PQ) surface format when the host asked for
-+    // it and the surface offers one (needs VK_EXT_swapchain_colorspace on the instance).
-+    // Preference mirrors the requested 10-bit backbuffer; RGBA16F EDR is the fallback.
++    // NUKE PATCH: HDR output — pick an HDR surface format when the host asked for it and the
++    // surface offers one (needs VK_EXT_swapchain_colorspace on the instance). Only formats with
++    // a TEXTURE_FORMAT mapping: the 10-bit ST2084 surface is A2B10G10R10, which Diligent does not
++    // map (its RGB10A2 is A2R10G10B10), so in practice the pick is RGBA16F — ST2084 when offered,
++    // else scRGB linear (what Windows drivers offer for the float format; the host encodes for it).
 +    g_NukeVkHDR10Active = false;
++    g_NukeVkHDRScRGB    = false;
 +    if (g_NukeVkHDR10)
 +    {
-+        // Only formats with a TEXTURE_FORMAT mapping — an unmapped pick would flow
-+        // VK_FORMAT_UNDEFINED into every downstream view/render pass.
-+        const VkFormat HdrPreference[] = {
-+            VK_FORMAT_A2B10G10R10_UNORM_PACK32,
-+            VK_FORMAT_R16G16B16A16_SFLOAT,
++        struct HdrPick { VkFormat Fmt; VkColorSpaceKHR Space; bool ScRGB; };
++        const HdrPick HdrPreference[] = {
++            {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT, false},
++            {VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_ST2084_EXT, false},
++            {VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT, true},
 +        };
-+        for (VkFormat Pref : HdrPreference)
++        for (const HdrPick& Pref : HdrPreference)
 +        {
 +            for (const VkSurfaceFormatKHR& SrfFmt : SupportedFormats)
 +            {
-+                if (SrfFmt.format == Pref && SrfFmt.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
++                if (SrfFmt.format == Pref.Fmt && SrfFmt.colorSpace == Pref.Space &&
 +                    VkFormatToTexFormat(SrfFmt.format) != TEX_FORMAT_UNKNOWN)
 +                {
 +                    m_VkColorFormat                   = SrfFmt.format;
 +                    ColorSpace                        = SrfFmt.colorSpace;
 +                    m_SwapChainDesc.ColorBufferFormat = VkFormatToTexFormat(SrfFmt.format);
 +                    g_NukeVkHDR10Active               = true;
++                    g_NukeVkHDRScRGB                  = Pref.ScRGB;
 +                    break;
 +                }
 +            }
 +            if (g_NukeVkHDR10Active)
 +                break;
++        }
++        if (!g_NukeVkHDR10Active)
++        {
++            std::string Offered;
++            for (const VkSurfaceFormatKHR& SrfFmt : SupportedFormats)
++                Offered += " " + std::to_string((int)SrfFmt.format) + "/" + std::to_string((int)SrfFmt.colorSpace);
++            LOG_INFO_MESSAGE("HDR surface format not found; the surface offers (VkFormat/VkColorSpaceKHR):", Offered);
 +        }
 +    }
 +
