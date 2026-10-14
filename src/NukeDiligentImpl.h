@@ -1591,15 +1591,17 @@ struct NukeDiligent::Impl
 	Texture*                              spriteBatchTex = nullptr;
 	bool                                  spriteBatchOpen = false;   // batch live (tex may legally be null -> white 1x1)
 	// SpriteCB layout (sprite.vs/ps + the lit/six/cover variants read a prefix of it).
-	struct SpriteCBData { float4x4 vp; float soft[4]; float soft2[4]; float sdf[4]; float outline[4]; float clip[4]; };
+	struct SpriteCBData { float4x4 vp; float soft[4]; float soft2[4]; float sdf[4]; float outline[4]; float clip[4]; float fill[4]; float fillUv[4]; };
 	// Sticky sprite params (iRender::setSpriteParams): SDF text + clip. The open world batch and
 	// each screen run carry a snapshot; a change closes the batch / starts a run.
 	NukeSpriteParams                      spriteParams;
 	NukeSpriteParams                      spriteBatchParams;
 	static bool SameSpriteParams(const NukeSpriteParams& a, const NukeSpriteParams& b)
 	{ return a.sdf == b.sdf && a.sdfSoft == b.sdfSoft && a.outlineWidth == b.outlineWidth && a.clip == b.clip && a.overlay == b.overlay
+	      && a.weight == b.weight && a.skew == b.skew && memcmp(a.fill, b.fill, sizeof(a.fill)) == 0 && memcmp(a.fillUv, b.fillUv, sizeof(a.fillUv)) == 0
 	      && memcmp(a.outline, b.outline, sizeof(a.outline)) == 0 && memcmp(a.clipRect, b.clipRect, sizeof(a.clipRect)) == 0; }
 	void FillSpriteCB(SpriteCBData& cb, const NukeSpriteParams& p, const float clipPx[4]);   // the params part
+	static float SkewScale(const float right[3], const float up[3]);
 	float                                 spriteSoftDist = 0.f;      // soft-particle fade distance for the CURRENT run (0 = off)
 	float                                 spriteVolLight = 0.f;      // froxel-grid lighting amount for the CURRENT run (0 = off)
 	IShaderResourceVariable*              spriteDepthVar = nullptr;  // PS "g_SceneDepth" (prepass depth; white when absent)

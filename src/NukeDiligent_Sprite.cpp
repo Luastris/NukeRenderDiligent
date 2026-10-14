@@ -287,12 +287,14 @@ void NukeDiligent::drawSprite(Texture* tex, const float center[3], const float r
 	m_impl->spriteBatchTex = tex; m_impl->spriteBatchMask = m_impl->spriteMask; m_impl->spriteBatchParams = m_impl->spriteParams;
 	m_impl->spriteBatchOpen = true;
 
+	const float skw = m_impl->spriteParams.skew * Impl::SkewScale(right, up);
 	auto push = [&](float sx, float sy, float u, float vv)
 	{
 		std::vector<float>& b = m_impl->spriteBatchVerts;
-		b.push_back(center[0] + sx * right[0] + sy * up[0]);
-		b.push_back(center[1] + sx * right[1] + sy * up[1]);
-		b.push_back(center[2] + sx * right[2] + sy * up[2]);
+		const float sxk = sx + sy * skw;   // italic: the top edge leans right
+		b.push_back(center[0] + sxk * right[0] + sy * up[0]);
+		b.push_back(center[1] + sxk * right[1] + sy * up[1]);
+		b.push_back(center[2] + sxk * right[2] + sy * up[2]);
 		b.push_back(u); b.push_back(vv);
 		b.push_back(tint[0]); b.push_back(tint[1]); b.push_back(tint[2]); b.push_back(tint[3]);
 	};
@@ -306,12 +308,14 @@ void NukeDiligent::Impl::AppendOverlayQuad(Texture* tex, const float center[3], 
                                            const float uv[4], const float tint[4])
 {
 	spriteOvlVP = curView * curProj;
+	const float skw = spriteParams.skew * SkewScale(right, up);
 	auto push = [&](float sx, float sy, float u, float vv)
 	{
 		std::vector<float>& b = spriteOvlVerts;
-		b.push_back(center[0] + sx * right[0] + sy * up[0]);
-		b.push_back(center[1] + sx * right[1] + sy * up[1]);
-		b.push_back(center[2] + sx * right[2] + sy * up[2]);
+		const float sxk = sx + sy * skw;
+		b.push_back(center[0] + sxk * right[0] + sy * up[0]);
+		b.push_back(center[1] + sxk * right[1] + sy * up[1]);
+		b.push_back(center[2] + sxk * right[2] + sy * up[2]);
 		b.push_back(u); b.push_back(vv);
 		b.push_back(tint[0]); b.push_back(tint[1]); b.push_back(tint[2]); b.push_back(tint[3]);
 	};
@@ -335,9 +339,20 @@ void NukeDiligent::setSpriteParams(const NukeSpriteParams* p)
 
 // The params part of SpriteCB: g_Sdf = (sdf on, soft, outline width, 0), g_Outline = colour,
 // g_Clip = pixel rect {x0, y0, x1, y1} (x0 >= x1 = no clip).
+// Skew in "right" units per "up" unit: params.skew is per unit of HEIGHT (so a glyph of any aspect
+// leans the same angle); right/up are half-extent vectors.
+float NukeDiligent::Impl::SkewScale(const float right[3], const float up[3])
+{
+	const float rl = std::sqrt(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
+	const float ul = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+	return rl > 1e-6f ? ul / rl : 0.0f;
+}
+
 void NukeDiligent::Impl::FillSpriteCB(SpriteCBData& cb, const NukeSpriteParams& p, const float clipPx[4])
 {
-	cb.sdf[0] = p.sdf ? 1.f : 0.f; cb.sdf[1] = p.sdfSoft; cb.sdf[2] = p.outlineWidth; cb.sdf[3] = 0.f;
+	cb.sdf[0] = p.sdf ? 1.f : 0.f; cb.sdf[1] = p.sdfSoft; cb.sdf[2] = p.outlineWidth; cb.sdf[3] = p.weight;
+	cb.fill[0] = p.fill[0]; cb.fill[1] = p.fill[1]; cb.fill[2] = 0.f; cb.fill[3] = 0.f;
+	memcpy(cb.fillUv, p.fillUv, sizeof(cb.fillUv));
 	memcpy(cb.outline, p.outline, sizeof(cb.outline));
 	if (clipPx) memcpy(cb.clip, clipPx, sizeof(cb.clip));
 	else { cb.clip[0] = 1.f; cb.clip[1] = 0.f; cb.clip[2] = 0.f; cb.clip[3] = 0.f; }
@@ -829,8 +844,10 @@ void NukeDiligent::Impl::AppendScreenSprite(std::vector<float>& verts, std::vect
 	const float cx = rect[0] * sx / (tw * 0.5f), cy = rect[1] * sy / (th * 0.5f);
 	const float hw = rect[2] * 0.5f * sx / (tw * 0.5f), hh = rect[3] * 0.5f * sy / (th * 0.5f);
 	const float u0 = uv[0], v0 = uv[1], u1 = uv[2], v1 = uv[3];
+	const float skw = spriteParams.skew * hh * (th / tw);   // italic: NDC x per NDC y, aspect-corrected
 	auto push = [&](float x, float y, float u, float vv)
 	{
+		x += (y - cy) * (hh > 1e-6f ? skw / hh : 0.0f);
 		verts.push_back(x); verts.push_back(y); verts.push_back(0.0f);
 		verts.push_back(u); verts.push_back(vv);
 		verts.push_back(tint[0]); verts.push_back(tint[1]); verts.push_back(tint[2]); verts.push_back(tint[3]);
@@ -900,6 +917,13 @@ void NukeDiligent::Impl::FlushScreen(std::vector<float>& verts, std::vector<SprR
 void NukeDiligent::Impl::FlushScreenPre()
 {
 	if (!cameraPassActive) { spriteScrPreVerts.clear(); spriteScrPreRuns.clear(); return; }
+	if (spriteScrPreVerts.empty()) return;
+	// The in-scene sprite PSO carries per-draw dynamic textures (alpha mask, depth prepass, froxel
+	// grids) that FlushSprites binds per batch; a frame with no world sprite batch left them unbound
+	// and the WithWorld screen canvas drew nothing (Diligent: no resource bound). Neutral bindings.
+	if (spriteMaskVar) spriteMaskVar->Set(whiteTex ? whiteTex->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr);
+	bool soft = false; float soft2[4];
+	BindSpriteVolume(spriteSRB, spriteVolIntegVar, spriteVolLightVar, spriteDepthVar, soft2, soft);   // grid / depth, or the white fallbacks
 	FlushScreen(spriteScrPreVerts, spriteScrPreRuns, spritePSO, spriteSRB, spriteTexVar);
 }
 
