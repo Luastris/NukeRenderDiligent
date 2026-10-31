@@ -82,7 +82,7 @@ std::string NukeDiligent::Impl::GenChitSource(const std::string& name, const std
 	  << "  float aoM=SampleAO(inst,IN.uv); float3 specM=SampleSpec(inst,IN.uv);\n"
 	  << "  float3 col = ShadeSurface(IN.worldPos,IN.worldNormal,IN.viewDir,O.albedo,O.metallic,O.roughness,O.emissive,aoM,specM);\n"
 	  << "  float3 R=reflect(wdir,IN.worldNormal); float3 env=ReflEnv(R,O.roughness), traced=env;\n"
-	  << "  if (p.depth<(uint)g_RTParams.z){ RayDesc ray; ray.Origin=IN.worldPos+IN.worldNormal*0.08+R*0.05; ray.Direction=R; ray.TMin=0.02; ray.TMax=(g_RTParams.y>0.5)?g_RTParams.y:1000.0; RTPayload p2=RTNewPayload(p.depth+1u,ray.TMax,0.0,0u); TraceRay(g_TLAS,RAY_FLAG_NONE,RT_REFLECT_MASK,0,1,0,ray,p2); RTCompose(p2); traced=p2.color; }\n"
+	  << "  if (p.depth<(uint)g_RTParams.z){ float3 gN=IN.worldNormal; if (dot(R,gN)<0.02) R=normalize(R+gN*(0.02-dot(R,gN))); RayDesc ray; ray.Origin=IN.worldPos+gN*0.02; ray.Direction=R; ray.TMin=0.0; ray.TMax=(g_RTParams.y>0.5)?g_RTParams.y:1000.0; RTPayload p2=RTNewPayload(p.depth+1u,ray.TMax,0.0,0u); TraceRay(g_TLAS,RAY_FLAG_NONE,RT_REFLECT_MASK,0,1,0,ray,p2); RTCompose(p2); traced=p2.color; }\n"
 	  << "  col += SpecFr(IN.worldNormal,IN.viewDir,O.roughness,O.albedo,O.metallic,specM)*lerp(traced,env,O.roughness);\n"
 	  << "  p.color=RTWaterFinish(WorldRayOrigin(),wdir,IN.worldPos,col,p.depth,p.flags);\n}\n";
 	return s.str();
