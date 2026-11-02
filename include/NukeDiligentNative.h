@@ -196,6 +196,17 @@ NUKEDLG_API void SetRTWaterMaps(Diligent::ITextureView* n0, Diligent::ITextureVi
 // it hits with the same caustics the underwater post paints. cau0 = (tile centre xz, uv scale,
 // strength), cau1 = (sharpness, underwater fog on, tint = Scatter Color alpha, 0). Null tile = no caustics in the trace.
 NUKEDLG_API void SetRTWaterCaustic(Diligent::ITextureView* tile, const float cau0[4], const float cau1[4]);
+// The whirlpools for the ray shaders, so a reflection ray meets the funnel the surface really has.
+// 8 floats each (center x z, radius, core radius, rim speed, falloff, pull, height above the plane);
+// deepest = the deepest funnel in metres, time = the water's clock (the swells' phase), swell = their
+// height multiplier. Null / 0 = none.
+NUKEDLG_API void SetRTWaterVortices(const float* pack, int count, float deepest, float time, float swell);
+// The foam for the ray shaders: the wake field (over the ripple window), the baked lace,
+// foam = (tint.rgb, foam cover with its sign = wake field live).
+NUKEDLG_API void SetRTWaterFoam(Diligent::ITextureView* simFoam, Diligent::ITextureView* lace, const float foam[4]);
+// The simulated whirlpools for the ray shaders: state array (h, u, v, foam), carried-coordinates
+// array, grid = (center xz, 1 / extent, side) x 8, phase = the carried detail's blend. Null = analytic.
+NUKEDLG_API void SetRTWaterWhirl(Diligent::ITextureView* state, Diligent::ITextureView* coords, const float grid[32], bool simulated, float phase);
 
 // Wet the CURRENT camera pass's lens (call from onCameraPost): soakSRV = per-pixel soak per
 // second (R16F, screen-sized), amount = the film's composite strength, drain = seconds the film

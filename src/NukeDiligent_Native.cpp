@@ -187,6 +187,35 @@ void SetRTWaterCaustic(ITextureView* tile, const float cau0[4], const float cau1
 	if (cau1) memcpy(d->rtWaterCau + 4, cau1, sizeof(float) * 4);
 }
 
+void SetRTWaterWhirl(ITextureView* state, ITextureView* coords, const float grid[32], bool simulated, float phase)
+{
+	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;
+	if (!d) return;
+	d->rtWaterWhirlState = state; d->rtWaterWhirlUV = coords;
+	d->rtWaterWhirlOn = simulated; d->rtWaterWhirlPhase = phase;
+	if (grid) memcpy(d->rtWaterWhirlGrid, grid, sizeof(float) * 32);
+}
+
+void SetRTWaterFoam(ITextureView* simFoam, ITextureView* lace, const float foam[4])
+{
+	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;
+	if (!d) return;
+	d->rtWaterSimFoam = simFoam; d->rtWaterLace = lace;
+	if (foam) memcpy(d->rtWaterFoam, foam, sizeof(float) * 4);
+}
+
+void SetRTWaterVortices(const float* pack, int count, float deepest, float time, float swell)
+{
+	NukeDiligent::Impl* d = NukeDiligent::nativeImpl;
+	if (!d) return;
+	d->rtWaterTime = time;
+	d->rtWaterSwell = swell;
+	d->rtWaterVortexN = (pack && count > 0) ? std::min(count, 8) : 0;
+	d->rtWaterVortexDeep = deepest;
+	memset(d->rtWaterVortex, 0, sizeof(d->rtWaterVortex));
+	if (d->rtWaterVortexN > 0) memcpy(d->rtWaterVortex, pack, (size_t)d->rtWaterVortexN * 8 * sizeof(float));
+}
+
 void LensFilmInject(ITextureView* soakSRV, float amount, float drainSeconds)
 {
 	if (NukeDiligent::Impl* d = NukeDiligent::nativeImpl) d->LensInject(soakSRV, amount, drainSeconds);

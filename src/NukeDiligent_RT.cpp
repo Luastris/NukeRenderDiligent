@@ -964,6 +964,9 @@ bool NukeDiligent::Impl::BuildRTPipeline()
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterNrm1", wrapS},
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterNrm2", wrapS},
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterRipple", samp},
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterSimFoam", samp},   // the wake foam field
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterLace", wrapS},     // the foam lace
+		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterWhirl", samp},     // simulated whirlpools
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_WaterCaustic", samp},   // the water's photon tile (a submerged ray's caustics)
 		{SHADER_TYPE_ALL_RAY_TRACING, "g_SkyMap", wrapS},   // the sky map (escaped rays, the roughest env)
 	};
@@ -1049,7 +1052,7 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 	if (!rtOutTex) return;
 
 	{   // RTRefCB: clip->view + view->world + camera + (intensity, maxDist, maxDepth) + water
-		struct CB { float4x4 ip, iv; float4 cam; float4 prm; float4 waterOcc; float4 waterCol; float4 waterAbs; float4 waterCasc; float4 waterRip0; float4 waterRip1; float4 waterCau0; float4 waterCau1; float4 clear; };
+		struct CB { float4x4 ip, iv; float4 cam; float4 prm; float4 waterOcc; float4 waterCol; float4 waterAbs; float4 waterCasc; float4 waterRip0; float4 waterRip1; float4 waterCau0; float4 waterCau1; float4 clear; float4 vortexN; float4 vortex[16]; float4 foam; float4 whirl; float4 whirlGrid[8]; };
 		MapHelper<CB> cb(context, rtRefCB, MAP_WRITE, MAP_FLAG_DISCARD);
 		cb->ip  = curProjNoJitter.Inverse(); cb->iv = curView.Inverse();   // unjittered: must match the gbuffer depth
 		cb->cam = float4(curCamPos[0], curCamPos[1], curCamPos[2], (float)std::fmod(lensClock, 4096.0));   // w = the game clock (the water's capillary scroll)
@@ -1072,6 +1075,11 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		cb->waterCau1 = float4(rtWaterCau[4], rtWaterCau[5], rtWaterCau[6], rtWaterCau[7]);
 		// The camera's clear colour: a miss with the sky off shows it, as the raster does.
 		cb->clear = float4(curClear[0], curClear[1], curClear[2], sky.mode == 0 ? 1.0f : 0.0f);
+		cb->vortexN = float4(rtWaterOcc[1] > 0.5f ? (float)rtWaterVortexN : 0.0f, rtWaterVortexDeep, rtWaterTime, rtWaterSwell);
+		cb->foam = float4(rtWaterFoam[0], rtWaterFoam[1], rtWaterFoam[2], rtWaterFoam[3]);
+		cb->whirl = float4((rtWaterOcc[1] > 0.5f && rtWaterWhirlOn) ? 1.0f : 0.0f, rtWaterWhirlPhase, 0.0f, 0.0f);
+		memcpy(cb->whirlGrid, rtWaterWhirlGrid, sizeof(rtWaterWhirlGrid));
+		memcpy(cb->vortex, rtWaterVortex, sizeof(rtWaterVortex));
 	}
 
 	// Bind dynamic resources for every RT stage that references them (null lookups are harmless).
@@ -1111,6 +1119,21 @@ void NukeDiligent::Impl::RunRTReflectPipeline(ITextureView* srcSRV, ITexture* ds
 		setv("g_WaterNrm1",   (on && rtWaterNrm[1]) ? rtWaterNrm[1] : zero);
 		setv("g_WaterNrm2",   (on && rtWaterNrm[2]) ? rtWaterNrm[2] : zero);
 		setv("g_WaterRipple", (on && rtWaterRipple) ? rtWaterRipple : zero);
+		setv("g_WaterSimFoam", (on && rtWaterSimFoam) ? rtWaterSimFoam : zero);
+		setv("g_WaterLace", (on && rtWaterLace) ? rtWaterLace : zero);
+		if (!rtWhirlNone)   // the slot is an array: a plain zero texture would not fit it
+		{
+			TextureDesc td; td.Name = "RT Whirl None"; td.Type = RESOURCE_DIM_TEX_2D_ARRAY;
+			td.Width = 1; td.Height = 1; td.ArraySize = 1; td.Format = TEX_FORMAT_RGBA32_FLOAT; td.MipLevels = 1;
+			td.BindFlags = BIND_SHADER_RESOURCE;
+			const float none[4] = { 0, 0, 0, 0 };
+			TextureSubResData sub; sub.pData = none; sub.Stride = sizeof(none);
+			TextureData init; init.pSubResources = &sub; init.NumSubresources = 1;
+			device->CreateTexture(td, &init, &rtWhirlNone);
+		}
+		ITextureView* whirlNone = rtWhirlNone ? rtWhirlNone->GetDefaultView(TEXTURE_VIEW_SHADER_RESOURCE) : nullptr;
+		setv("g_WaterWhirl", (on && rtWaterWhirlState) ? rtWaterWhirlState : whirlNone);
+		setv("g_WaterWhirlUV", (on && rtWaterWhirlUV) ? rtWaterWhirlUV : whirlNone);
 		setv("g_WaterCaustic", (on && rtWaterCaustic) ? rtWaterCaustic : zero);
 	}
 	{   // bindless albedo array (re-resolve each frame -> animated textures update)

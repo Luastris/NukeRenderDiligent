@@ -1414,6 +1414,20 @@ struct NukeDiligent::Impl
 	float rtWaterRip[8] = { 0, 0, 96.0f, 1.0f / 96.0f, 1.0f, 0.0f, 96.0f / 512.0f, 1.0f };
 	ITextureView* rtWaterCaustic = nullptr;     // the photon tile (SetRTWaterCaustic): a submerged ray's caustics
 	float rtWaterCau[8] = { 0, 0, 2.0f / 96.0f, 0.0f, 1.6f, 0, 0, 0 };   // centre xz, uv scale, strength | sharpness
+	float rtWaterVortex[16 * 4] = {};           // the whirlpools (SetRTWaterVortices), 2 float4 per funnel
+	int   rtWaterVortexN = 0;
+	float rtWaterVortexDeep = 0.0f;             // the deepest funnel (m)
+	float rtWaterTime = 0.0f;                   // the water's clock: the swells' phase
+	float rtWaterSwell = 1.0f;                  // Whirlpool Swell
+	ITextureView* rtWaterSimFoam = nullptr;     // the wake foam field + the lace (SetRTWaterFoam)
+	ITextureView* rtWaterLace = nullptr;
+	float rtWaterFoam[4] = { 1, 1, 1, 0 };      // foam tint.rgb, wake field live
+	ITextureView* rtWaterWhirlState = nullptr;  // simulated whirlpools (SetRTWaterWhirl)
+	ITextureView* rtWaterWhirlUV = nullptr;
+	RefCntAutoPtr<ITexture> rtWhirlNone;        // what those array slots read with no sim
+	float rtWaterWhirlGrid[8 * 4] = {};         // grid center xz, 1 / extent, side
+	bool  rtWaterWhirlOn = false;
+	float rtWaterWhirlPhase = 0.0f;
 
 	// --- Lens film (NukeDiligent_Lens.cpp): the wet camera lens, per camera, two sources ---
 	struct LensCam
